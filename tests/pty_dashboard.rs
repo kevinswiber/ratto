@@ -4716,3 +4716,313 @@ fn a_once_board_on_a_terminal_never_runs_a_binding() {
     }
     assert_counter_settled_at(&counter, 0);
 }
+
+/// The smallest binding board: one steady pane and one counting binding
+/// on `x`. Chrome on when a test needs the status row's needles.
+fn binding_board(counter: &std::path::Path, chrome: bool, extra_keys: &str) -> String {
+    format!(
+        "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome {chrome}\n    shell #true\n}}\n\n\
+         key \"x\" {{\n    description \"count\"\n    command \"{counter_cmd}\"\n}}\n\n{extra_keys}\
+         pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+        chrome = if chrome { "#true" } else { "#false" },
+        counter_cmd = counter_cmd(counter),
+    )
+}
+
+/// Poll until a path exists — the done-file idiom for slow actions.
+fn wait_for_file(path: &std::path::Path, within: Duration) {
+    let deadline = std::time::Instant::now() + within;
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never saw {path:?} appear"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// The presence anchor everything else in this phase leans on: a bound
+/// key spawns its command, exactly once per press.
+#[test]
+fn a_binding_spawns_its_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &binding_board(&counter, false, ""));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"x");
+    wait_for_counter(&counter, 1);
+    assert_counter_settled_at(&counter, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// THE INV-5 test — the one that catches a regression to loop-blocking.
+/// The pane counter is MONOTONIC so "it kept painting" is provable: the
+/// differ writes nothing for an identical frame, so a constant pane
+/// would make a stalled board and a healthy one look the same.
+#[test]
+fn the_board_keeps_repainting_while_a_slow_action_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fast = dir.path().join("fast");
+    let done = dir.path().join("done");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"slow\"\n    command \"sleep 2; touch {done}\"\n}}\n\n\
+             pane \"fast\" {{\n    interval \"100ms\"\n    command \"{fast_cmd}\"\n}}\n",
+            done = done.display(),
+            fast_cmd = labeled_counter_cmd(&fast, "fast"),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"fast-1", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    // One accumulated, DRAINING capture, in order — three sequential
+    // waits would race the differ twice over, and an undrained pty
+    // master would stall the loop's writer and fail this test for a
+    // reason that has nothing to do with the action.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"fast-3", b"fast-5", b"fast-7"],
+        Duration::from_secs(8),
+    );
+    wait_for_file(&done, Duration::from_secs(5));
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The sibling that anchors the INV-5 test from the other side: the
+/// action really ran, exactly once, WHILE the panes advanced — without
+/// this, a board whose binding did nothing at all would pass above.
+#[test]
+fn an_action_and_the_panes_run_at_the_same_time() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fast = dir.path().join("fast");
+    let action = dir.path().join("action");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+             key \"x\" {{\n    description \"count\"\n    command \"{action_cmd}\"\n}}\n\n\
+             pane \"fast\" {{\n    interval \"100ms\"\n    command \"{fast_cmd}\"\n}}\n",
+            action_cmd = counter_cmd(&action),
+            fast_cmd = labeled_counter_cmd(&fast, "fast"),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"fast-1", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"x");
+    wait_for_counter(&action, 1);
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"fast-3", b"fast-5"],
+        Duration::from_secs(8),
+    );
+    assert_counter_settled_at(&action, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Decision 4, pinned: the GATE is serialized, running commands are
+/// not. A second binding fires beside a slow one rather than queueing
+/// behind it — a board that refused every key for a two-minute suite
+/// would have replaced loop-blocking with keyboard-blocking.
+#[test]
+fn a_second_binding_key_runs_beside_a_slow_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let done = dir.path().join("done");
+    let quick = dir.path().join("quick");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"slow\"\n    command \"sleep 1.2; touch {done}\"\n}}\n\n\
+             key \"e\" {{\n    description \"quick\"\n    command \"{quick_cmd}\"\n}}\n\n\
+             pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+            done = done.display(),
+            quick_cmd = counter_cmd(&quick),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    session.write_bytes(b"e");
+    wait_for_counter(&quick, 1);
+    assert!(
+        !done.exists(),
+        "the quick binding finished BEFORE the slow one — they ran beside each other"
+    );
+    wait_for_file(&done, Duration::from_secs(5));
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Phase 2's forwarded pty obligation, first arm: the binding fires
+/// from a FOCUSED pane — and from a zoomed one, since zoom stays on
+/// the firing side of the mode rule.
+#[test]
+fn a_binding_runs_from_a_focused_pane() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &binding_board(&counter, true, ""));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"focus steady",
+            Duration::from_secs(3)
+        ),
+        "the focus segment never appeared"
+    );
+    session.write_bytes(b"x");
+    wait_for_counter(&counter, 1);
+    // The zoomed arm, since it is cheap from here.
+    session.write_bytes(b"z");
+    assert!(
+        wait_for(&session, &mut terminal, b"zoom", Duration::from_secs(3)),
+        "the zoom segment never appeared"
+    );
+    session.write_bytes(b"x");
+    wait_for_counter(&counter, 2);
+    assert_counter_settled_at(&counter, 2);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Phase 2's forwarded pty obligation, second arm — 0026's fixture
+/// blind spot: a binding fires from a FRAME-SCROLLED board, waiting on
+/// the scrolled needle first so this cannot silently press at live
+/// rest.
+#[test]
+fn a_binding_runs_from_a_frame_scrolled_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"x\" {{\n    description \"count\"\n    command \"{counter_cmd}\"\n}}\n\n\
+             pane \"a\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n\
+             pane \"b\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}}\n",
+            counter_cmd = counter_cmd(&counter),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(3)),
+        "the frame never scrolled — the binding would press at live rest"
+    );
+    session.write_bytes(b"x");
+    wait_for_counter(&counter, 1);
+    assert_counter_settled_at(&counter, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The paused arm, handed forward by the dispatch task: a frozen frame
+/// runs no binding, and the resume-and-run tail is the presence anchor
+/// that keeps the absence honest.
+#[test]
+fn a_frozen_frame_runs_no_binding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &binding_board(&counter, true, ""));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"p");
+    // Give the loop its slices to process the freeze before pressing.
+    let _ = drain_for(&session, Duration::from_millis(400));
+    session.write_bytes(b"x");
+    assert_counter_settled_at(&counter, 0);
+    session.write_bytes(b"F");
+    let _ = drain_for(&session, Duration::from_millis(400));
+    session.write_bytes(b"x");
+    wait_for_counter(&counter, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}

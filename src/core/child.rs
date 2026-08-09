@@ -172,6 +172,19 @@ pub enum TickEvent {
     Progress { source: SourceId },
     /// A child ran to completion — the shipped path, unchanged.
     Completed(TickOutcome),
+    /// An activation's variable map is ready, or its derivation failed.
+    /// The gate's FIRST rung: variable derivation is synchronous with a
+    /// five-second bound per variable, so it runs on a worker and
+    /// arrives here rather than blocking the loop.
+    ///
+    /// A separate variant from `ActionDone` for the reason the two
+    /// above are separate: a preparation has no exit status, no
+    /// captured output and no dropped count — those describe a CHILD.
+    /// Folding it in would mean a payload whose fields are meaningful
+    /// half the time.
+    ActionPrepared(PreparedActivation),
+    /// A key-action's child finished.
+    ActionDone(ActionOutcome),
 }
 
 /// One finished tick, as it travels from the worker to the loop.
@@ -352,6 +365,25 @@ fn pump_live<R: Read>(
     }
 }
 
+/// Drain a batch child's two pipes at once — a child filling both
+/// buffers deadlocks a serial reader. ONE implementation for the pane
+/// path and the action path; the helper failing to spawn drops its
+/// pipe, so the child's stderr writes fail fast and the read still
+/// finishes.
+fn drain_batch<O: Read + Send + 'static, E: Read + Send + 'static>(
+    stdout: Option<O>,
+    stderr: Option<E>,
+    retention: Retention,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, usize) {
+    let err_reader = std::thread::Builder::new()
+        .name("rat-watch-stderr".into())
+        .spawn(move || read_all(stderr, retention));
+    let (out, out_dropped) = read_all(stdout, retention);
+    let (err, err_dropped) =
+        err_reader.map_or_else(|_| (Vec::new(), 0), |h| h.join().unwrap_or_default());
+    (out, err, out_dropped + err_dropped)
+}
+
 fn run_parked(
     mut command: std::process::Command,
     source: SourceId,
@@ -380,15 +412,7 @@ fn run_parked(
     // a serial reader. The helper failing to spawn drops its pipe, so
     // the child's stderr writes fail fast and the tick still finishes.
     let (out, err, dropped) = match sink {
-        Sink::Batch(retention) => {
-            let err_reader = std::thread::Builder::new()
-                .name("rat-watch-stderr".into())
-                .spawn(move || read_all(stderr, retention));
-            let (out, out_dropped) = read_all(stdout, retention);
-            let (err, err_dropped) =
-                err_reader.map_or_else(|_| (Vec::new(), 0), |h| h.join().unwrap_or_default());
-            (out, err, out_dropped + err_dropped)
-        }
+        Sink::Batch(retention) => drain_batch(stdout, stderr, retention),
         Sink::Live(emissions, tx) => {
             let (their_emissions, their_tx) = (emissions.clone(), tx.clone());
             let err_reader = std::thread::Builder::new()
@@ -455,6 +479,245 @@ pub fn not_started(source: SourceId, err: std::io::Error) -> TickOutcome {
     }
 }
 
+/// Which rung of one binding's gate this completion belongs to. Not an
+/// `Option<bool>` and not two variants of `TickEvent`: the two rungs
+/// have the SAME shape — an exit status and captured output — and
+/// differ only in what the loop does with them, which is the case a
+/// discriminant field is for.
+///
+/// `Rung` below overlaps this and both earn their place: THIS answers
+/// "what kind of child is this worker running" and has exactly two
+/// members forever, because only two rungs spawn a process. `Rung`
+/// answers "where in the sequence is this activation" and has four,
+/// because `Prepare` and `Confirm` are real rungs that spawn no child.
+/// Merging them would let an `ActionOutcome` claim to be a completion
+/// for the `Confirm` rung, which is not a thing.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ActionRung {
+    /// A `when` precondition. Its exit status decides whether the rest
+    /// of the binding happens; its OUTPUT is diagnostic only.
+    #[allow(dead_code)] // The when rung constructs this next; only tests drive it today.
+    Guard,
+    /// The binding's own command. Its output takes the binding's
+    /// `output` disposition.
+    Command,
+}
+
+/// Where an activation is in its sequence.
+///
+/// Lives HERE, beside the payloads, rather than with the gate that
+/// walks it: the reporting layer names the rung that declined, and it
+/// composes its lines before the gate exists in task order. A type
+/// every layer reads belongs under all of them.
+#[allow(dead_code)] // The gate and the reporting layer consume this next.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Rung {
+    Prepare,
+    When,
+    Confirm,
+    Command,
+}
+
+/// One activation, distinguishable from every other in this run.
+///
+/// A plain monotonic counter minted when the keypress is accepted. It
+/// exists because a binding index is NOT unique: the gate is serialized
+/// but running commands are not, so one binding can have several
+/// activations in flight and every consumer that matches a completion
+/// to something — the gate, the running set — needs to tell them apart.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct ActivationId(pub u64);
+
+/// How one action ended: it ran and exited, or it never started.
+///
+/// A closed enum rather than `Option<ExitStatus>` beside
+/// `Option<io::Error>`, for `TickEvent`'s own stated reason: two
+/// `Option`s admit "exited 0 AND failed to start" and "neither", and
+/// push the question of which field is meaningful onto every reader.
+/// There are exactly two ways an action ends and this says so.
+#[derive(Debug)]
+// The transient allow comes off when the disposition lands and reads these.
+#[allow(dead_code)]
+pub enum ActionResult {
+    Exited(std::process::ExitStatus),
+    /// The command could not be started at all — the OS refused it, a
+    /// worker thread could not be created, or a variable derivation
+    /// failed. Already worded by whoever produced it.
+    NotStarted(std::io::Error),
+}
+
+/// One finished key-action, as it travels from the worker to the loop.
+///
+/// No `SourceId`, no close stamps, no bracket: an action is not a
+/// source. It belongs to no pane, watches no path, and is credited
+/// with nothing — which is what keeps the loop detector's attribution
+/// untouched by bindings.
+// The transient allow comes off when the disposition lands and reads these.
+#[allow(dead_code)]
+pub struct ActionOutcome {
+    /// WHICH ACTIVATION — unique for the life of the run. Not the
+    /// binding index: the same binding may be activated twice
+    /// concurrently (only the GATE is serialized), so an index cannot
+    /// tell two runs apart.
+    pub activation: ActivationId,
+    /// Which binding — an index into the board's declared list, the
+    /// same index `WatchAction::RunBinding` carries. Kept beside the id
+    /// because every reader needs the binding to name it, and looking
+    /// it up from the id would mean a second table.
+    pub binding: usize,
+    pub rung: ActionRung,
+    /// The retained lines of each stream, terminators kept, exactly as
+    /// the child wrote them. BYTES, never `String`, for `TickOutcome`'s
+    /// reason: decoding here would replace invalid UTF-8 irreversibly
+    /// and lose the framing. The consumer decodes the whole stream.
+    pub stdout: Vec<Vec<u8>>,
+    pub stderr: Vec<Vec<u8>>,
+    /// How it ended. A CLOSED enum, never two `Option` fields.
+    pub result: ActionResult,
+    /// How many LINES this action discarded to stay inside its bound,
+    /// summed across both pipes.
+    pub dropped: usize,
+}
+
+/// One activation's prepared variable map, or the derivation failure
+/// that stopped it before anything visible happened.
+// The transient allow comes off when the gate lands and reads these.
+#[allow(dead_code)]
+pub struct PreparedActivation {
+    pub activation: ActivationId,
+    pub binding: usize,
+    /// `Err` carries the already-worded refusal, which NAMES the
+    /// variable that failed. The gate turns it into one decline line;
+    /// nothing downstream runs.
+    pub result: Result<crate::core::template::Bindings, std::io::Error>,
+}
+
+/// The work the preparation rung performs off-thread: resolve one
+/// activation's variable map, or say which variable failed.
+///
+/// BOXED rather than a generic parameter, and that is load-bearing.
+/// The gate's begin-an-activation transition takes the spawner itself
+/// as a parameter so its failure arm is testable, and a spawner bound
+/// has to name the prepare-work type concretely — with a second
+/// generic there, the bound becomes unwriteable at the call site. One
+/// named type, both places.
+pub type PrepareFn =
+    Box<dyn FnOnce() -> Result<crate::core::template::Bindings, std::io::Error> + Send + 'static>;
+
+/// Run one key-action on a worker thread, which posts exactly one
+/// completion and exits. The handle is dropped on purpose: nothing
+/// ever joins an action — the same discipline as `spawn_tick`, and for
+/// a stronger reason. A pane tick is ratto's own cadence; an action is
+/// a side effect on the world, and joining it would make the loop wait
+/// on something it deliberately does not own. No shutdown guard owns
+/// the child either (INV: launch and forget): ratto does not get to
+/// decide that a half-finished side effect should be interrupted
+/// because someone pressed `q` — when the board quits, the process
+/// exits, the read ends close, and the child meets the fate any child
+/// of any pipeline meets when its reader goes away.
+///
+/// Err only when the OS refuses a thread; the caller reports that as a
+/// spawn failure rather than becoming it.
+pub fn spawn_action(
+    spawn: ActionSpawn,
+    activation: ActivationId,
+    binding: usize,
+    rung: ActionRung,
+    tx: std::sync::mpsc::Sender<TickEvent>,
+    retention: Retention,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("rat-action-child".into())
+        .spawn(move || {
+            // On a shutdown race the receiver is already gone; the
+            // failed send is the no-op it should be.
+            let _ = tx.send(TickEvent::ActionDone(run_action(
+                spawn, activation, binding, rung, retention,
+            )));
+        })?;
+    Ok(())
+}
+
+/// Run one action's child to completion on this thread — the batch
+/// drain, a fresh unguarded child, and the script owners dropped only
+/// after the reap.
+fn run_action(
+    spawn: ActionSpawn,
+    activation: ActivationId,
+    binding: usize,
+    rung: ActionRung,
+    retention: Retention,
+) -> ActionOutcome {
+    let ActionSpawn {
+        mut command,
+        script,
+        script_dir,
+    } = spawn;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let not_run = |err: std::io::Error| ActionOutcome {
+        activation,
+        binding,
+        rung,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        result: ActionResult::NotStarted(err),
+        dropped: 0,
+    };
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => return not_run(err),
+    };
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let (out, err, dropped) = drain_batch(stdout, stderr, retention);
+    let result = match child.wait() {
+        Ok(status) => ActionResult::Exited(status),
+        // Practically unreachable after a successful spawn; the honest
+        // bucket is the one that always speaks.
+        Err(err) => ActionResult::NotStarted(err),
+    };
+    // The reap is done; the script owners may go now, not before —
+    // dropping them at the end of the BUILDER would delete the file
+    // between building the command and spawning it.
+    drop(script);
+    drop(script_dir);
+    ActionOutcome {
+        activation,
+        binding,
+        rung,
+        stdout: out,
+        stderr: err,
+        result,
+        dropped,
+    }
+}
+
+/// Derive one activation's variable map on a worker thread, which
+/// posts exactly one `ActionPrepared` and exits. Same discipline as
+/// `spawn_action`: nothing joins it, and a failed send on a shutdown
+/// race is the no-op it should be.
+///
+/// Takes the work as a CLOSURE, so this module stays ignorant of what
+/// "prepare" means — the caller owns that, and this module keeps
+/// knowing only how to run something off-thread and post one event.
+#[allow(dead_code)] // The gate's preparation rung consumes this next; only tests drive it today.
+pub fn spawn_preparation(
+    activation: ActivationId,
+    binding: usize,
+    prepare: PrepareFn,
+    tx: std::sync::mpsc::Sender<TickEvent>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("rat-action-prepare".into())
+        .spawn(move || {
+            let _ = tx.send(TickEvent::ActionPrepared(PreparedActivation {
+                activation,
+                binding,
+                result: prepare(),
+            }));
+        })?;
+    Ok(())
+}
+
 /// Which file, if any, one key-action activation's `#!` body executes —
 /// and the directory that file lives in.
 ///
@@ -462,7 +725,6 @@ pub fn not_started(source: SourceId, err: std::io::Error) -> TickOutcome {
 /// always has a directory owner" is a property of the TYPE rather than
 /// of a caller remembering to pass one. There is no spelling of
 /// `Shared`-without-a-directory to get wrong.
-#[allow(dead_code)] // The activation consumes this next; only tests drive it today.
 pub enum ActionScript {
     /// No `#!` body, or an argv program.
     None,
@@ -489,7 +751,6 @@ pub enum ActionScript {
 /// must outlive `Command::spawn`, which happens on another thread, so a
 /// handle held anywhere but beside the command is a handle that drops
 /// too early. The worker takes this whole value.
-#[allow(dead_code)] // The activation consumes this next; only tests drive it today.
 pub struct ActionSpawn {
     pub command: std::process::Command,
     /// The per-activation file, when the body was templated.
@@ -689,6 +950,12 @@ mod tests {
             match rx.recv_timeout(within) {
                 Ok(TickEvent::Completed(outcome)) => return outcome,
                 Ok(TickEvent::Progress { .. }) => continue,
+                // This helper waits for a CHILD completion, and an
+                // action event is not one — skipped exactly as the
+                // progress wakes are, and named rather than `Ok(_)` so
+                // a reordering that swallowed a Completed would not
+                // compile silently.
+                Ok(TickEvent::ActionPrepared(_)) | Ok(TickEvent::ActionDone(_)) => continue,
                 Err(_) => panic!("no completion arrived within {within:?}"),
             }
         }
@@ -1845,5 +2112,295 @@ mod tests {
         // type annotation IS the assertion.
         let outcome: TickOutcome = run_tick(flooder(1), SourceId(0), Vec::new(), ample());
         assert!(outcome.spawn_error.is_none());
+    }
+    // ─── The action worker ──────────────────────────────────────────
+
+    fn action(command: std::process::Command) -> ActionSpawn {
+        ActionSpawn {
+            command,
+            script: None,
+            script_dir: None,
+        }
+    }
+
+    fn bounded() -> Retention {
+        Retention {
+            max_lines: 5,
+            keep: Keep::Bottom,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_action_posts_exactly_one_completion_and_exits() {
+        let (tx, rx) = mpsc::channel();
+        spawn_action(
+            action(script("echo hi")),
+            ActivationId(1),
+            3,
+            ActionRung::Command,
+            tx,
+            bounded(),
+        )
+        .expect("the worker starts");
+        let TickEvent::ActionDone(outcome) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one completion")
+        else {
+            panic!("an action posts ActionDone");
+        };
+        assert_eq!(outcome.binding, 3);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "exactly one completion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_action_carries_its_exit_status_and_both_streams() {
+        let (tx, rx) = mpsc::channel();
+        spawn_action(
+            action(script("echo out; echo err >&2; exit 3")),
+            ActivationId(1),
+            0,
+            ActionRung::Command,
+            tx,
+            bounded(),
+        )
+        .expect("the worker starts");
+        let TickEvent::ActionDone(outcome) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one completion")
+        else {
+            panic!("an action posts ActionDone");
+        };
+        let ActionResult::Exited(status) = outcome.result else {
+            panic!("the child ran");
+        };
+        assert!(!status.success());
+        assert!(!outcome.stdout.is_empty(), "stdout captured");
+        assert!(!outcome.stderr.is_empty(), "stderr captured");
+    }
+
+    #[test]
+    fn an_action_that_cannot_start_reports_it_instead_of_panicking() {
+        let (tx, rx) = mpsc::channel();
+        spawn_action(
+            action(std::process::Command::new("rat-no-such-program-xyz")),
+            ActivationId(1),
+            0,
+            ActionRung::Command,
+            tx,
+            bounded(),
+        )
+        .expect("the worker starts");
+        let TickEvent::ActionDone(outcome) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one completion")
+        else {
+            panic!("an action posts ActionDone");
+        };
+        assert!(
+            matches!(outcome.result, ActionResult::NotStarted(_)),
+            "the OS refusal reaches the loop as an event"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_actions_capture_is_bounded_and_says_what_it_dropped() {
+        let (tx, rx) = mpsc::channel();
+        spawn_action(
+            action(script("seq 1 50")),
+            ActivationId(1),
+            0,
+            ActionRung::Command,
+            tx,
+            bounded(),
+        )
+        .expect("the worker starts");
+        let TickEvent::ActionDone(outcome) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one completion")
+        else {
+            panic!("an action posts ActionDone");
+        };
+        assert!(outcome.stdout.len() <= 5, "bounded at the retention");
+        assert!(outcome.dropped > 0, "the loss is reported");
+        let body: Vec<u8> = outcome.stdout.concat();
+        let body = String::from_utf8_lossy(&body);
+        // Keep::Bottom: an action's conclusion is its LAST line — the
+        // message a script echoes just before `exit 1`.
+        assert!(body.contains("50"), "the tail survives: {body}");
+        assert!(!body.contains("1\n2\n"), "the head is what drops: {body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_action_rung_round_trips() {
+        let (tx, rx) = mpsc::channel();
+        spawn_action(
+            action(script("true")),
+            ActivationId(1),
+            0,
+            ActionRung::Guard,
+            tx.clone(),
+            bounded(),
+        )
+        .expect("the guard worker starts");
+        spawn_action(
+            action(script("true")),
+            ActivationId(2),
+            1,
+            ActionRung::Command,
+            tx,
+            bounded(),
+        )
+        .expect("the command worker starts");
+        let mut rungs = [None, None];
+        for _ in 0..2 {
+            let TickEvent::ActionDone(outcome) = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a completion")
+            else {
+                panic!("an action posts ActionDone");
+            };
+            rungs[outcome.binding] = Some(outcome.rung);
+        }
+        assert!(matches!(rungs[0], Some(ActionRung::Guard)));
+        assert!(matches!(rungs[1], Some(ActionRung::Command)));
+    }
+
+    #[test]
+    fn a_preparation_posts_its_map_off_thread() {
+        // The property under test is the ASYNCHRONY, not the payload: a
+        // synchronous implementation deadlocks here, because the closure
+        // blocks on a gate the test releases only after
+        // `spawn_preparation` has returned.
+        let (tx, rx) = mpsc::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        spawn_preparation(
+            ActivationId(4),
+            2,
+            Box::new(move || {
+                gate.recv().expect("the test releases the gate");
+                let mut map = crate::core::template::Bindings::new();
+                map.insert("what".to_string(), "the suite".to_string());
+                Ok(map)
+            }),
+            tx,
+        )
+        .expect("the worker starts");
+        release
+            .send(())
+            .expect("the gate is released AFTER the call returned");
+        let TickEvent::ActionPrepared(prepared) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one preparation")
+        else {
+            panic!("a preparation posts ActionPrepared");
+        };
+        assert_eq!(prepared.binding, 2);
+        let map = prepared.result.expect("the map is ready");
+        assert_eq!(map.get("what").map(String::as_str), Some("the suite"));
+    }
+
+    #[test]
+    fn a_preparation_failure_arrives_as_an_event_not_a_panic() {
+        let (tx, rx) = mpsc::channel();
+        spawn_preparation(
+            ActivationId(4),
+            0,
+            Box::new(|| Err(std::io::Error::other("variable \"head\" failed to derive"))),
+            tx,
+        )
+        .expect("the worker starts");
+        let TickEvent::ActionPrepared(prepared) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one preparation")
+        else {
+            panic!("a preparation posts ActionPrepared");
+        };
+        let err = prepared.result.expect_err("the failure travels as data");
+        // The wording survives verbatim: the gate quotes it, and it
+        // names the variable that failed.
+        assert!(err.to_string().contains("head"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_await_completion_helper_ignores_action_events() {
+        // F10 made behavioural instead of merely compilable: widening
+        // the helper's match to `Ok(_) => continue` would satisfy the
+        // compiler AND silently swallow a Completed if the arms were
+        // ever reordered; this fails if that happens.
+        let (tx, rx) = mpsc::channel();
+        tx.send(TickEvent::ActionPrepared(PreparedActivation {
+            activation: ActivationId(1),
+            binding: 0,
+            result: Ok(crate::core::template::Bindings::new()),
+        }))
+        .expect("send");
+        tx.send(TickEvent::ActionDone(ActionOutcome {
+            activation: ActivationId(2),
+            binding: 0,
+            rung: ActionRung::Command,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            result: ActionResult::NotStarted(std::io::Error::other("x")),
+            dropped: 0,
+        }))
+        .expect("send");
+        tx.send(TickEvent::Completed(not_started(
+            SourceId(7),
+            std::io::Error::other("marker"),
+        )))
+        .expect("send");
+        let outcome = await_completion(&rx, Duration::from_secs(2));
+        assert_eq!(outcome.source, SourceId(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_activation_id_round_trips_through_both_workers() {
+        // BOTH events, because the gate matches both kinds of completion
+        // by id. Uniqueness is NOT tested here — both workers accept a
+        // caller-supplied id, so asserting two spawns differ would only
+        // re-read what this test passed in; the loop-owned allocator
+        // owns that property.
+        let (tx, rx) = mpsc::channel();
+        spawn_preparation(
+            ActivationId(7),
+            1,
+            Box::new(|| Ok(crate::core::template::Bindings::new())),
+            tx.clone(),
+        )
+        .expect("the preparation starts");
+        spawn_action(
+            action(script("true")),
+            ActivationId(9),
+            2,
+            ActionRung::Command,
+            tx,
+            bounded(),
+        )
+        .expect("the action starts");
+        let (mut prepared_id, mut done_id) = (None, None);
+        for _ in 0..2 {
+            match rx.recv_timeout(Duration::from_secs(5)).expect("an event") {
+                TickEvent::ActionPrepared(prepared) => {
+                    assert_eq!(prepared.binding, 1);
+                    prepared_id = Some(prepared.activation);
+                }
+                TickEvent::ActionDone(outcome) => {
+                    assert_eq!(outcome.binding, 2);
+                    done_id = Some(outcome.activation);
+                }
+                _ => panic!("only action events were posted"),
+            }
+        }
+        assert_eq!(prepared_id, Some(ActivationId(7)));
+        assert_eq!(done_id, Some(ActivationId(9)));
     }
 }

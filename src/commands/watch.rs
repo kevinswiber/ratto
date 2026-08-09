@@ -21,10 +21,10 @@ use crossterm::tty::IsTty;
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
 use crate::core::child::{
-    ActionScript, ActionSpawn, ChildSlot, ShutdownGuard, TickEvent, not_started, run_tick,
-    spawn_live_tick, spawn_tick,
+    ActionOutcome, ActionResult, ActionRung, ActionScript, ActionSpawn, ActivationId, ChildSlot,
+    ShutdownGuard, TickEvent, not_started, run_tick, spawn_action, spawn_live_tick, spawn_tick,
 };
-use crate::core::dashboard_file::KeyBinding;
+use crate::core::dashboard_file::{BindingProgram, KeyBinding};
 use crate::core::duration::{brief_duration, parse_interval};
 use crate::core::layout::{
     PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
@@ -314,6 +314,10 @@ pub(crate) fn run_registry(
     // shutdown guards so it drops after them: children die first, then
     // the files they were running.
     let mut scripts = ScriptFiles::materialize(&registry, &session.bindings)?;
+    // The next activation's id: a plain monotonic counter minted when a
+    // keypress is accepted, so two in-flight activations of one binding
+    // stay distinguishable in every consumer.
+    let mut next_activation: u64 = 0;
     let _raw_guard = if interactive {
         Some(RawModeGuard::enable().context("enabling raw mode")?)
     } else {
@@ -791,7 +795,11 @@ pub(crate) fn run_registry(
         // 3. Drain EVERY queued event, then compose ONCE. The drain
         // terminates in at most N iterations: one source can have at
         // most one tick in flight, so it can post at most one outcome
-        // per iteration. Only per-source state is touched in here;
+        // per iteration — and an ACTIVATION posts exactly one
+        // completion and then its worker exits, so the action events
+        // an iteration can drain are bounded by the activations that
+        // finished since the last drain, a finite set that shrinks as
+        // it is consumed. Only per-source state is touched in here;
         // painting inside this loop would put an intermediate
         // composition on screen — the one thing the iteration order
         // exists to prevent.
@@ -823,9 +831,24 @@ pub(crate) fn run_registry(
         // speak nor update prev_exit (exit_badge(None) would read as a
         // clean exit and fake a recovery).
         let mut plain_exit: Option<Option<String>> = None;
+        // The action events, collected and never applied here: a
+        // disposition can paint, page, or suspend, and doing any of
+        // that mid-drain would put an intermediate composition on
+        // screen. They are applied where the iteration's one-shot rows
+        // are already batched.
+        let mut prepared_activations: Vec<crate::core::child::PreparedActivation> = Vec::new();
+        let mut actions: Vec<crate::core::child::ActionOutcome> = Vec::new();
         while let Ok(event) = rx.try_recv() {
             let outcome = match event {
                 TickEvent::Completed(outcome) => outcome,
+                TickEvent::ActionPrepared(prepared) => {
+                    prepared_activations.push(prepared);
+                    continue;
+                }
+                TickEvent::ActionDone(outcome) => {
+                    actions.push(outcome);
+                    continue;
+                }
                 TickEvent::Progress { source } => {
                     // At most one body per source per iteration by
                     // construction: the outbox is one slot and the wake
@@ -2676,11 +2699,49 @@ pub(crate) fn run_registry(
                             )?);
                         }
                         // Answered by `resolve_binding` once the key
-                        // table has declined. Still inert: the runner —
-                        // the activation, its gates, and the spawn — is
-                        // the next phase's, and the disposition is
-                        // applied where the renderer is in hand.
-                        WatchAction::RunBinding(_) => {}
+                        // table has declined. The gate — when, confirm
+                        // — arrives with the later runner tasks and
+                        // will enclose this spawn; today the arm does
+                        // the simplest thing that can work: resolve,
+                        // build, launch, forget.
+                        WatchAction::RunBinding(index) => {
+                            let binding = &session.bindings[index];
+                            let activation = ActivationId(next_activation);
+                            next_activation += 1;
+                            let spawned = resolve_action(
+                                binding,
+                                index,
+                                activation,
+                                &session.variables,
+                                &scripts,
+                                palette.appearance,
+                            )
+                            .and_then(|spawn| {
+                                spawn_action(
+                                    spawn,
+                                    activation,
+                                    index,
+                                    ActionRung::Command,
+                                    tx.clone(),
+                                    retention_for_action(),
+                                )
+                            });
+                            if let Err(err) = spawned {
+                                // The failure reaches a reader through
+                                // the disposition path rather than
+                                // vanishing — the same shape a live
+                                // worker the OS refused takes.
+                                let _ = tx.send(TickEvent::ActionDone(ActionOutcome {
+                                    activation,
+                                    binding: index,
+                                    rung: ActionRung::Command,
+                                    stdout: Vec::new(),
+                                    stderr: Vec::new(),
+                                    result: ActionResult::NotStarted(err),
+                                    dropped: 0,
+                                }));
+                            }
+                        }
                         WatchAction::Ignore => {}
                     }
                 }
@@ -4615,6 +4676,86 @@ fn resolve_spawn<'a>(
     Ok(ResolvedSpawn { program, script })
 }
 
+/// Resolve one activation's program — the binding sibling of
+/// `resolve_spawn`: derive the deferred variables this activation
+/// actually references, expand every element against that map, write a
+/// TEMPLATED `#!` body to its own per-activation file, and build the
+/// command through the one construction point. A template-free binding
+/// takes the arm that cannot fail — no map, no derivation, the
+/// author's bytes.
+///
+/// The synchronous derivation here is interim: the preparation rung
+/// moves it onto a worker when the gate lands, because a deferred
+/// variable's five-second bound must never ride a keypress.
+fn resolve_action(
+    binding: &KeyBinding,
+    index: usize,
+    activation: ActivationId,
+    vars: &SpawnVariables,
+    scripts: &ScriptFiles,
+    appearance: Appearance,
+) -> std::io::Result<ActionSpawn> {
+    let needed: Vec<&str> = match &binding.program {
+        BindingProgram::Argv(argv) => argv
+            .iter()
+            .flat_map(|word| word.refs())
+            .map(String::as_str)
+            .collect(),
+        BindingProgram::Script(body) => body.refs().iter().map(String::as_str).collect(),
+    };
+    let program = if needed.is_empty() {
+        match &binding.program {
+            BindingProgram::Argv(argv) => {
+                ResolvedProgram::Argv(argv.iter().map(|word| word.as_str().to_string()).collect())
+            }
+            BindingProgram::Script(body) => ResolvedProgram::Script(body.as_str().to_string()),
+        }
+    } else {
+        let map = vars.for_spawn(&needed)?;
+        let expand = |template: &Template| {
+            template.expand(&map).map_err(|missing| {
+                std::io::Error::other(format!(
+                    "expanding this binding's program: {missing} — a load-validated \
+                     board cannot reach this, so load validation has regressed"
+                ))
+            })
+        };
+        match &binding.program {
+            BindingProgram::Argv(argv) => {
+                ResolvedProgram::Argv(argv.iter().map(expand).collect::<Result<_, _>>()?)
+            }
+            BindingProgram::Script(body) => ResolvedProgram::Script(expand(body)?),
+        }
+    };
+    let script = match (&binding.program, &program) {
+        (BindingProgram::Script(template), ResolvedProgram::Script(body))
+            if shebang(body).is_some() =>
+        {
+            let dir = scripts
+                .dir_handle()
+                .ok_or_else(|| std::io::Error::other("no script directory exists for this run"))?;
+            if template.refs().is_empty() {
+                // Written once at load; this activation borrows the
+                // path and holds the directory share.
+                let path = scripts
+                    .binding_path(index)
+                    .expect("a static shebang binding was materialized at load")
+                    .to_path_buf();
+                ActionScript::Shared { path, dir }
+            } else {
+                activation_script(&dir, &format!("key-{index}-{}", activation.0), body)?
+            }
+        }
+        _ => ActionScript::None,
+    };
+    Ok(build_action_command(
+        &program,
+        &binding.shell,
+        script,
+        appearance,
+    ))
+}
+
 fn build_source_command(
     program: &ResolvedProgram,
     shell: &ShellMode,
@@ -4687,7 +4828,6 @@ fn build_source_command(
 /// unconditional here — which is what makes "no key is ever forwarded
 /// to a child, no stdin plumbing of any kind" a property of the type
 /// rather than a rule to remember.
-#[allow(dead_code)] // The activation consumes this next; only tests drive it today.
 fn build_action_command(
     program: &ResolvedProgram,
     shell: &ShellMode,
@@ -4761,7 +4901,6 @@ fn build_action_command(
 /// activation silently executing another's bytes. Never rewrite a file
 /// in place: a file a child may be executing is ETXTBSY on unix and a
 /// sharing violation on Windows.
-#[allow(dead_code)] // The activation consumes this next; only tests drive it today.
 fn activation_script(
     dir: &std::sync::Arc<tempfile::TempDir>,
     stem: &str,
@@ -4826,6 +4965,20 @@ fn dropped_badge(dropped: usize) -> Option<String> {
 /// is printing now, and its frame is already a tail with scrollback
 /// behind it. Note that this is a visible change for a watch whose
 /// command floods: it used to retain everything.
+/// One action's retention. The pane path's bound, the LOG end.
+///
+/// `Keep::Bottom` and not the pane default `Keep::Top`: a pane leads
+/// with its headline, but an action's conclusion is its LAST line —
+/// the message a script echoes just before `exit 1`, or the final line
+/// of a build. The completion line quotes that tail, so the tail is
+/// what has to survive.
+fn retention_for_action() -> Retention {
+    Retention {
+        max_lines: MAX_RETAINED_LINES,
+        keep: Keep::Bottom,
+    }
+}
+
 fn retention_for(registry: &Registry, id: SourceId) -> Retention {
     let keep = match registry.pane(id).map(|pane| pane.overflow) {
         Some(Overflow::KeepTop) => Keep::Top,
@@ -6013,15 +6166,17 @@ impl ScriptFiles {
                 SourceProgram::Argv(_) => None,
             })
             .collect();
-        let binding_bodies: Vec<(usize, Shebang, &str)> = bindings
+        // A TEMPLATED binding body forces the directory into existence
+        // even though nothing is written for it at load — its
+        // activations write their own files into this directory, so a
+        // board whose ONLY shebang body is a templated binding one
+        // still needs the directory.
+        let binding_bodies: Vec<(usize, Shebang, &str, bool)> = bindings
             .iter()
             .enumerate()
             .filter_map(|(index, binding)| match &binding.program {
-                crate::core::dashboard_file::BindingProgram::Script(body)
-                    if body.refs().is_empty() =>
-                {
-                    shebang(body.as_str()).map(|line| (index, line, body.as_str()))
-                }
+                BindingProgram::Script(body) => shebang(body.as_str())
+                    .map(|line| (index, line, body.as_str(), body.refs().is_empty())),
                 _ => None,
             })
             .collect();
@@ -6071,7 +6226,10 @@ impl ScriptFiles {
             paths[id.0] = Some(path);
         }
         let mut binding_paths = vec![None; bindings.len()];
-        for (index, line, body) in binding_bodies {
+        for (index, line, body, template_free) in binding_bodies {
+            if !template_free {
+                continue;
+            }
             // The `key-` prefix is namespace separation, not decor: a
             // binding index and a source index both start at 0, and a
             // shared stem would hand one board's binding a pane's body.
@@ -6110,14 +6268,12 @@ impl ScriptFiles {
     /// The static `#!` body one binding executes, by binding index —
     /// `None` for an argv binding, a shebang-less body, or a templated
     /// one (which writes per activation instead).
-    #[allow(dead_code)] // The activation consumes this next; only tests drive it today.
     fn binding_path(&self, index: usize) -> Option<&std::path::Path> {
         self.binding_paths.get(index)?.as_deref()
     }
 
     /// The directory handle an activation must hold while it runs a
     /// script from here. `None` when this board materialized nothing.
-    #[allow(dead_code)] // The activation consumes this next; only tests drive it today.
     fn dir_handle(&self) -> Option<std::sync::Arc<tempfile::TempDir>> {
         self.dir.clone()
     }
