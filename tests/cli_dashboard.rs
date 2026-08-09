@@ -1594,7 +1594,19 @@ fn a_board_with_no_variables_renders_byte_identically() {
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
-    let expected = format!("{:<80}\n{:<80}\n{:<80}\n", "witness", "", "");
+    // The environment owns the width — a piped run has no terminal to ask
+    // on unix and falls back to 80, while a Windows console reports its
+    // own size — so read W off the frame and pin the frame's shape and
+    // bytes AT that W: three rows, every one of them W wide, the first
+    // carrying "witness" and the rest blank.
+    let rows: Vec<&str> = stdout
+        .strip_suffix('\n')
+        .unwrap_or(&stdout)
+        .split('\n')
+        .collect();
+    assert_eq!(rows.len(), 3, "the frame is three rows: {stdout:?}");
+    let width = rows[0].chars().count();
+    let expected = format!("{:<width$}\n{:<width$}\n{:<width$}\n", "witness", "", "");
     assert_eq!(stdout, expected, "the frame's exact bytes moved");
 }
 
