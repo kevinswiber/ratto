@@ -567,6 +567,22 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
         .iter()
         .map(|node| key_block(node, default_shell, &load))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // `declared_once`'s rule across nodes rather than within one: a
+    // second `key "r"` is not a refinement of the first, it is a
+    // declaration that never runs. Parsed KEYS are compared, not
+    // spellings — there is one canonical spelling per key today, and
+    // comparing the key is what keeps this true if an alias is ever
+    // added.
+    let mut bound: Vec<Key> = Vec::with_capacity(file.bindings.len());
+    for binding in &file.bindings {
+        if bound.contains(&binding.key) {
+            bail!(
+                "key {:?} is declared twice — a board binds each key once",
+                binding.spelling
+            );
+        }
+        bound.push(binding.key);
+    }
     file.variables = variables;
     file.panes = panes;
     // Placement is STRUCTURAL, so the layout is never absent — the top
@@ -826,6 +842,22 @@ struct BindingDraft {
     confirm: Option<Template>,
 }
 
+/// `prompt` is not an unknown node — it is a node that is coming, and
+/// the generic miss would tell the author to pick a different key,
+/// which is the wrong advice. Reserving the name here is what keeps
+/// the later work from touching this grammar at all: it replaces this
+/// refusal with a real row rather than widening the node. NOT a
+/// `BINDING_KEYS` row, so the accepted-set lists never advertise it.
+fn refuse_reserved(name: &str, at: &str) -> anyhow::Result<()> {
+    if name == "prompt" {
+        bail!(
+            "{at}: `prompt` is reserved — a binding cannot ask a question yet. \
+             Use `confirm` for a yes/no gate, or read the answer inside the command"
+        );
+    }
+    Ok(())
+}
+
 /// A binding's key: exactly one unannotated string, and NOT a
 /// template. The spelling is identity — it is the key a reader
 /// presses, and the conflict check decides at LOAD whether it
@@ -908,6 +940,7 @@ fn key_block(
                 ty.value()
             );
         }
+        refuse_reserved(prop, &at)?;
         let Some(k) = lookup(BINDING_KEYS, prop) else {
             bail!(
                 "{at}: unknown property {prop:?} — a binding's keys with a property spelling are {}",
@@ -934,6 +967,7 @@ fn key_block(
         .unwrap_or_default()
     {
         let name = child.name().value();
+        refuse_reserved(name, &at)?;
         let Some(k) = lookup(BINDING_KEYS, name) else {
             bail!(
                 "{at}: unknown node {name:?} — a binding's keys are {}",
@@ -4836,5 +4870,64 @@ key "r" {{
             "unknown node \"panes\" — a dashboard's top level takes \
              title, gap, row-gap, variables, defaults, key, pane, row, or column"
         );
+    }
+
+    #[test]
+    fn a_board_binds_each_key_once() {
+        assert_eq!(
+            binding_err(&format!(
+                "key \"a\" {{ description \"one\"\ncommand \"x\" }}\n\
+                 key \"a\" {{ description \"two\"\ncommand \"y\" }}\n{ONE_PANE}"
+            )),
+            "key \"a\" is declared twice — a board binds each key once"
+        );
+        // Two different keys running the same command is fine: the
+        // conflict is over the KEY, never the action.
+        assert_eq!(
+            declared(&format!(
+                "key \"a\" {{ description \"one\"\ncommand \"x\" }}\n\
+                 key \"e\" {{ description \"two\"\ncommand \"x\" }}\n{ONE_PANE}"
+            ))
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn prompt_is_reserved_and_says_so_rather_than_bailing_generically() {
+        // The spelling a real board uses: a positional name plus a kind
+        // property.
+        for body in [
+            "description \"x\"\ncommand \"y\"\nprompt \"title\" input=\"What?\"",
+            "description \"x\"\ncommand \"y\"\nprompt \"verdict\" choose=\"a,b\"",
+        ] {
+            let err = binding_err(&format!("key \"a\" {{ {body} }}\n{ONE_PANE}"));
+            assert_eq!(
+                err,
+                "key \"a\": `prompt` is reserved — a binding cannot ask a question yet. \
+                 Use `confirm` for a yes/no gate, or read the answer inside the command"
+            );
+            // NOT the generic miss, whose advice — pick one of these
+            // instead — is exactly wrong for a name that is coming.
+            assert!(!err.contains("a binding's keys are"), "{err}");
+        }
+        // The property spelling reaches the same sentence: the house
+        // accepts both positions, so a reservation that covered one would
+        // leave a hole for the later work to trip on.
+        assert!(
+            binding_err(&format!(
+                "key \"a\" prompt=\"x\" {{ description \"d\"\ncommand \"y\" }}\n{ONE_PANE}"
+            ))
+            .contains("`prompt` is reserved")
+        );
+    }
+
+    #[test]
+    fn the_walk_refuses_before_the_command_layer_ever_looks() {
+        // Deterministic ordering across the two homes: a board that is
+        // both ungrammatical and conflicting reports the grammar, because
+        // the parse fails first and the refusal never runs.
+        let err = binding_err(&format!("key \"j\" {{ command \"x\" }}\n{ONE_PANE}"));
+        assert!(err.contains("needs a `description`"), "{err}");
     }
 }

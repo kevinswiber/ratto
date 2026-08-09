@@ -3075,6 +3075,100 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
     }
 }
 
+/// Every mode a key can arrive in. Hand-written because `FrameMode` is
+/// a plain enum with nothing to iterate; the test
+/// `every_frame_mode_is_listed` is the compile-time half — its
+/// wildcard-free match stops building the moment a fourth mode exists.
+const FRAME_MODES: [FrameMode; 3] = [FrameMode::Live, FrameMode::LiveScrolled, FrameMode::Paused];
+
+/// What one of rat's own gestures already does with this key, in the
+/// words a refusal uses — or `None` when nothing does.
+///
+/// **THE derivation of the claimed set, and there is no second one.**
+/// It reads `action_for` rather than restating it, so a key stops
+/// being free the moment the loop starts using it, with no list to
+/// remember.
+///
+/// Claimed means claimed in ANY mode: `>` scrubs forward only while
+/// paused and `Tab` cycles focus in every mode but paused. A binding
+/// that worked on a live frame and died on a paused one is worse than
+/// a refusal.
+///
+/// This is complete because the two resolvers at the dispatch can only
+/// REWRITE a non-`Ignore` answer — `resolve_esc` touches `ClearFocus`,
+/// `resolve_page_or_zoom` touches `PageOrZoom`/`ToggleZoom` — so
+/// nothing turns `Ignore` into a built-in later.
+///
+/// **Where it must be called:** every entry point that validates a
+/// board, through `refuse_claimed_bindings` in `commands/dashboard.rs`.
+/// It cannot live in `core` — `core` never names `commands` — and it
+/// must not be shadowed by a second table: a future built-in that
+/// reaches the loop some other way has to become visible here, or a
+/// board's binding will be silently shadowed by it.
+///
+/// Returns a phrase rather than a `WatchAction` so the action
+/// vocabulary stays private to this module.
+pub(crate) fn builtin_key(key: Key) -> Option<&'static str> {
+    FRAME_MODES
+        .into_iter()
+        .map(|mode| action_for(key, mode))
+        .find(|action| *action != WatchAction::Ignore)
+        .map(describes)
+}
+
+/// What an action does, for the one error that has to explain a
+/// built-in to a board author. A total match with no `_` arm: a new
+/// action must say what it is before it can collide with a binding.
+/// The phrases follow `help_lines`' own vocabulary, because the
+/// refusal points the author at `?` next.
+fn describes(action: WatchAction) -> &'static str {
+    match action {
+        WatchAction::Abort => "aborts",
+        WatchAction::Quit => "quits",
+        WatchAction::Page => "views the full frame in the pager",
+        WatchAction::PageOrZoom => "zooms the focused pane, or pages the frame",
+        WatchAction::Help => "opens the key reference",
+        WatchAction::Snapshot => "snapshots the viewed frame to a file",
+        WatchAction::Resume => "resumes the live tail",
+        WatchAction::Freeze => "freezes the frame in place",
+        WatchAction::ScrubBack => "steps back through distinct frames",
+        WatchAction::ScrubForward => "steps forward through distinct frames",
+        WatchAction::Scroll(step) | WatchAction::ScrollN(step, _) => scroll_phrase(step),
+        WatchAction::ToggleWrap => "wraps or chops long lines",
+        WatchAction::ShiftLeft => "shifts the view left",
+        WatchAction::ShiftRight => "shifts the view right",
+        WatchAction::ToggleGutter => "toggles the change gutter",
+        WatchAction::ToggleHighlight => "toggles the change highlights",
+        WatchAction::ToggleTime => "switches the time style",
+        WatchAction::ToggleMouse => "captures or releases the mouse",
+        WatchAction::FocusNext => "cycles the focus forward",
+        WatchAction::FocusPrev => "cycles the focus backward",
+        WatchAction::FocusJump(_) => "jumps the focus to a numbered pane",
+        WatchAction::FocusMove(_) => "moves the focus between panes",
+        WatchAction::ClearFocus => "drops the pane focus",
+        WatchAction::ToggleZoom => "zooms the focused pane",
+        WatchAction::ToggleCollapse => "collapses or restores the focused pane",
+        // Unreachable through `builtin_key` (filtered out), but the
+        // match stays total, so it gets the honest phrase.
+        WatchAction::Ignore => "does nothing",
+    }
+}
+
+/// The scroll half of [`describes`], destructured because "one line"
+/// and "half a window" are different answers. Total, like its caller.
+fn scroll_phrase(step: ScrollStep) -> &'static str {
+    match step {
+        ScrollStep::LineDown => "scrolls down one line",
+        ScrollStep::LineUp => "scrolls up one line",
+        ScrollStep::HalfDown => "scrolls down half a window",
+        ScrollStep::HalfUp => "scrolls up half a window",
+        ScrollStep::PageDown => "scrolls down a full window",
+        ScrollStep::PageUp => "scrolls up a full window",
+        ScrollStep::Top => "jumps to the top of the frame",
+        ScrollStep::Bottom => "jumps to the bottom of the frame",
+    }
+}
+
 /// Esc's ladder, resolved where the pane state is visible: leave the
 /// zoom first, then drop the focus — the frame scroll HOLDS its place
 /// through both — and only with nothing pane-side left to peel does
@@ -5967,59 +6061,19 @@ mod tests {
     use crate::core::shell::{command_flags, platform_flags, platform_shell};
     use crate::term::scroll::max_offset;
 
-    const ALL_MODES: [FrameMode; 3] = [FrameMode::Live, FrameMode::LiveScrolled, FrameMode::Paused];
-
     #[test]
     fn the_append_key_table_answers_only_the_four_keys() {
-        // ENUMERATED over every key action_for binds — a checklist of
-        // remembered keys is not proof that no other key is live.
-        let bound = [
-            Key::CtrlC,
-            Key::Char('q'),
-            Key::Char('v'),
-            Key::Enter,
-            Key::Char('?'),
-            Key::Char('S'),
-            Key::Char('j'),
-            Key::Down,
-            Key::Char('k'),
-            Key::Up,
-            Key::Char('d'),
-            Key::Char('u'),
-            Key::Char('f'),
-            Key::PageDown,
-            Key::Char('b'),
-            Key::PageUp,
-            Key::Char('g'),
-            Key::Home,
-            Key::Char('G'),
-            Key::End,
-            Key::Char('w'),
-            Key::Char('h'),
-            Key::Left,
-            Key::Char('l'),
-            Key::Right,
-            Key::Char('D'),
-            Key::Char('c'),
-            Key::Char('t'),
-            Key::Char('m'),
-            Key::Esc,
-            Key::Char('F'),
-            Key::Char('p'),
-            Key::Char('<'),
-            Key::Char(','),
-            Key::Char('>'),
-            Key::Char('.'),
-            Key::Tab,
-            Key::BackTab,
-            Key::Alt('h'),
-            Key::Alt('j'),
-            Key::Alt('k'),
-            Key::Alt('l'),
-            Key::Char('z'),
-            Key::Space,
-        ];
-        for key in bound {
+        // ENUMERATED over the whole spellable universe rather than a
+        // hand-typed list of remembered keys — the list this replaces
+        // silently omitted Alt-1..9 when the numbered jump landed, and
+        // nothing failed. PLUS the one live key no board can name:
+        // `Ctrl-c` reaches this table but is not spellable, so walking
+        // only the spellable universe would stop exercising the
+        // `Abort` arm.
+        let wire = crate::core::key_spelling::ascii_spellable()
+            .into_iter()
+            .chain([Key::CtrlC]);
+        for key in wire {
             let expect = match key {
                 Key::CtrlC => AppendAction::Abort,
                 Key::Char('q') => AppendAction::Quit,
@@ -6152,7 +6206,7 @@ mod tests {
 
     #[test]
     fn todays_keys_mean_the_same_thing_in_every_mode() {
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(action_for(Key::CtrlC, mode), WatchAction::Abort);
             assert_eq!(action_for(Key::Char('q'), mode), WatchAction::Quit);
             assert_eq!(action_for(Key::Char('v'), mode), WatchAction::Page);
@@ -6206,7 +6260,7 @@ mod tests {
     fn navigation_keys_scroll() {
         use crate::term::scroll::ScrollStep;
 
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             for (key, step) in [
                 (Key::Char('j'), ScrollStep::LineDown),
                 (Key::Down, ScrollStep::LineDown),
@@ -6318,7 +6372,7 @@ mod tests {
                 WatchAction::Ignore
             );
         }
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             // An unbound meta spelling stays inert, and the plain keys
             // keep the whole-frame meanings they have always had.
             assert_eq!(action_for(Key::Alt('x'), mode), WatchAction::Ignore);
@@ -6591,11 +6645,11 @@ mod tests {
 
     #[test]
     fn shift_d_toggles_the_gutter_in_every_mode() {
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(action_for(Key::Char('D'), mode), WatchAction::ToggleGutter);
         }
         // The half-page scroll is untouched by its shifted neighbour.
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(
                 action_for(Key::Char('d'), mode),
                 WatchAction::Scroll(ScrollStep::HalfDown)
@@ -6605,7 +6659,7 @@ mod tests {
 
     #[test]
     fn c_toggles_the_highlight_in_every_mode() {
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(
                 action_for(Key::Char('c'), mode),
                 WatchAction::ToggleHighlight
@@ -6615,14 +6669,14 @@ mod tests {
 
     #[test]
     fn t_toggles_the_time_display_in_every_mode() {
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(action_for(Key::Char('t'), mode), WatchAction::ToggleTime);
         }
     }
 
     #[test]
     fn view_keys_are_view_actions_in_every_mode() {
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(action_for(Key::Char('w'), mode), WatchAction::ToggleWrap);
             assert_eq!(action_for(Key::Char('h'), mode), WatchAction::ShiftLeft);
             assert_eq!(action_for(Key::Left, mode), WatchAction::ShiftLeft);
@@ -6633,7 +6687,7 @@ mod tests {
 
     #[test]
     fn unbound_keys_are_ignored() {
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(action_for(Key::Char('x'), mode), WatchAction::Ignore);
             assert_eq!(action_for(Key::Alt('x'), mode), WatchAction::Ignore);
             assert_eq!(action_for(Key::Backspace, mode), WatchAction::Ignore);
@@ -6642,7 +6696,7 @@ mod tests {
 
     #[test]
     fn scrub_keys_walk_history() {
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(action_for(Key::Char('<'), mode), WatchAction::ScrubBack);
             assert_eq!(action_for(Key::Char(','), mode), WatchAction::ScrubBack);
         }
@@ -6665,7 +6719,7 @@ mod tests {
 
     #[test]
     fn s_is_the_snapshot_key() {
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(action_for(Key::Char('S'), mode), WatchAction::Snapshot);
             assert_eq!(action_for(Key::Char('s'), mode), WatchAction::Ignore);
         }
@@ -8357,7 +8411,7 @@ mod tests {
             WatchAction::Ignore
         );
         // One spelling: `Z` is not a second key.
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(action_for(Key::Char('Z'), mode), WatchAction::Ignore);
         }
     }
@@ -8674,7 +8728,7 @@ mod tests {
         // Not a second spelling: both input paths deliver 0x20 as
         // Key::Space (the crossterm map and the scanner), so the space
         // CHARACTER stays unbound and cannot drift into a second binding.
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(action_for(Key::Char(' '), mode), WatchAction::Ignore);
         }
     }
@@ -10245,7 +10299,7 @@ mod tests {
 
     #[test]
     fn question_mark_pages_the_key_help() {
-        for mode in ALL_MODES {
+        for mode in FRAME_MODES {
             assert_eq!(action_for(Key::Char('?'), mode), WatchAction::Help);
         }
     }
@@ -10881,5 +10935,144 @@ mod tests {
             // if the name is missing the bug is there, not here.
             assert!(err.to_string().contains(r#"variable "n""#), "{err}");
         }
+    }
+    // ─── The claimed-key derivation ─────────────────────────────────
+
+    #[test]
+    fn every_frame_mode_is_listed() {
+        // A wildcard-free match over `FrameMode`: a fourth mode makes this
+        // arm non-exhaustive and the test stops COMPILING, which is what
+        // keeps `FRAME_MODES` complete. A `const` array cannot say this
+        // about a plain enum on its own.
+        assert_eq!(FRAME_MODES.len(), 3);
+        for mode in FRAME_MODES {
+            let named = match mode {
+                FrameMode::Live => "live",
+                FrameMode::LiveScrolled => "live-scrolled",
+                FrameMode::Paused => "paused",
+            };
+            assert!(!named.is_empty());
+            assert_eq!(FRAME_MODES.iter().filter(|m| **m == mode).count(), 1);
+        }
+    }
+
+    #[test]
+    fn a_key_claimed_in_any_mode_is_claimed() {
+        // The three guard shapes, one witness each: `>` scrubs forward
+        // ONLY while paused, `Tab` cycles focus in every mode BUT
+        // paused, and `F` resumes in every mode but live. Each answers
+        // `Ignore` somewhere, and a derivation that asked one mode
+        // would hand a board the other two.
+        for (key, blind) in [
+            (Key::Char('>'), FrameMode::Live),
+            (Key::Tab, FrameMode::Paused),
+            (Key::Char('F'), FrameMode::Live),
+        ] {
+            assert_eq!(action_for(key, blind), WatchAction::Ignore, "{key:?}");
+            assert!(builtin_key(key).is_some(), "{key:?} is still claimed");
+        }
+        // `Esc`'s two arms cover all three modes between them, so it is
+        // the control case: claimed everywhere, blind nowhere.
+        for mode in FRAME_MODES {
+            assert_ne!(action_for(Key::Esc, mode), WatchAction::Ignore);
+        }
+    }
+
+    #[test]
+    fn the_mode_conditional_spellings_are_the_reason_one_mode_is_not_enough() {
+        // The size of the hole a single-mode derivation would leave,
+        // asserted rather than described. If a guard is added or dropped
+        // this number moves, and the dispatch gate's second clause is
+        // what the mover needs to re-read.
+        let blind_somewhere: Vec<Key> = crate::core::key_spelling::ascii_spellable()
+            .into_iter()
+            .filter(|key| {
+                builtin_key(*key).is_some()
+                    && FRAME_MODES
+                        .into_iter()
+                        .any(|mode| action_for(*key, mode) == WatchAction::Ignore)
+            })
+            .collect();
+        assert_eq!(blind_somewhere.len(), 21);
+        assert!(blind_somewhere.contains(&Key::Char('F')));
+        assert!(blind_somewhere.contains(&Key::Alt('9')));
+        assert!(!blind_somewhere.contains(&Key::Esc));
+    }
+
+    #[test]
+    fn a_claimed_key_says_what_it_already_does() {
+        assert_eq!(builtin_key(Key::Char('j')), Some("scrolls down one line"));
+        assert_eq!(builtin_key(Key::Char('q')), Some("quits"));
+        assert_eq!(
+            builtin_key(Key::Enter),
+            Some("zooms the focused pane, or pages the frame")
+        );
+        assert_eq!(
+            builtin_key(Key::Alt('1')),
+            Some("jumps the focus to a numbered pane")
+        );
+        assert_eq!(builtin_key(Key::CtrlC), Some("aborts"));
+        assert_eq!(builtin_key(Key::Char('a')), None);
+    }
+
+    #[test]
+    fn the_claimed_set_is_exactly_the_keys_the_loop_uses() {
+        // The matrix this rests on: an enumeration over the WHOLE
+        // spellable space, not a sample. It fails whenever a built-in is
+        // added or removed, which is the point — the free keyspace is a
+        // budget, and spending it should require looking at this line.
+        let claimed: Vec<String> = crate::core::key_spelling::ascii_spellable()
+            .into_iter()
+            .filter(|key| builtin_key(*key).is_some())
+            .map(crate::core::key_spelling::spelling_of)
+            .collect();
+        let mut expected: Vec<String> = Vec::new();
+        // Every spellable named key — all thirteen. `Ctrl-c` is claimed on
+        // the wire but is NOT spellable, so it cannot collide and is not
+        // in the universe; the spelling parser refuses it earlier.
+        expected.extend(
+            [
+                "Enter", "Esc", "Tab", "BackTab", "Space", "Up", "Down", "Left", "Right", "Home",
+                "End", "PageUp", "PageDown",
+            ]
+            .map(str::to_string),
+        );
+        expected.extend(
+            [
+                "b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "p", "q", "t", "u", "v", "w",
+                "z", "D", "F", "G", "S", "?", "<", ",", ">", ".",
+            ]
+            .map(str::to_string),
+        );
+        expected.extend(["h", "j", "k", "l"].map(|c| format!("Alt-{c}")));
+        expected.extend((1..=9).map(|n| format!("Alt-{n}")));
+        expected.sort();
+        let mut claimed = claimed;
+        claimed.sort();
+        assert_eq!(claimed, expected);
+    }
+
+    #[test]
+    fn the_free_lowercase_range_is_nine_letters() {
+        // The ceiling, as an assertion rather than a paragraph. The
+        // cursor work takes `s` and this becomes eight; that edit is the
+        // record of the spend, and it belongs in a diff.
+        let free: String = ('a'..='z')
+            .filter(|c| builtin_key(Key::Char(*c)).is_none())
+            .collect();
+        assert_eq!(free, "aeinorsxy");
+        // Bare digits are all free — only ALT-digits are bound.
+        assert!(('0'..='9').all(|c| builtin_key(Key::Char(c)).is_none()));
+        // Every spellable NAMED key is claimed — the two that were free,
+        // `Backspace` and `Delete`, are exactly the two the unix tap does
+        // not deliver, so the spelling parser refuses them first and they
+        // are not in this universe at all.
+        assert!(
+            crate::core::key_spelling::ascii_spellable()
+                .into_iter()
+                .filter(|key| !matches!(key, Key::Char(_) | Key::Alt(_)))
+                .all(|key| builtin_key(key).is_some()),
+            "a board's real keyspace in v1 is characters and Alt-characters"
+        );
     }
 }

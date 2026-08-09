@@ -7,7 +7,9 @@ use anyhow::{Context, bail};
 use crate::cli::{CheckArgs, DashboardAction, DashboardArgs, InitArgs};
 use crate::color::ColorProfile;
 use crate::commands::watch::{SessionArgs, run_registry};
-use crate::core::dashboard_file::{DashboardFile, SiteAudit, UncheckedSite, load, read_and_parse};
+use crate::core::dashboard_file::{
+    Board, DashboardFile, KeyBindingDecl, SiteAudit, UncheckedSite, finish_load, read_and_parse,
+};
 use crate::core::registry::Registry;
 use crate::core::template::{Bindings, is_reference_name};
 use crate::exit::AppResult;
@@ -34,7 +36,9 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
     // one color authority it gets: anything above Ascii earns the
     // colored snippet theme.
     let overrides = parse_overrides(&args.variable)?;
-    let (registry, variables) = load(&file, profile != ColorProfile::Ascii, &overrides)?;
+    let board = validated(&file, profile != ColorProfile::Ascii, &overrides)?;
+    let registry = board.registry;
+    let variables = board.variables;
     let once_timeout = args
         .once_timeout
         .as_deref()
@@ -76,6 +80,60 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
         variables,
     };
     run_registry(registry, session, profile, palette)
+}
+
+/// Read, parse, refuse a claimed key, then finish loading — the path
+/// every `Board`-producing route in this command takes.
+///
+/// **What this does and does not guarantee.** It removes the ordering
+/// question from any route that wants a loaded board: `run` cannot
+/// obtain one without passing the refusal. It does NOT make the
+/// refusal unskippable in general — `finish_load` is reachable on its
+/// own, and `check` deliberately bypasses this function because it
+/// must never build a `Registry`. A route that does not want a
+/// `Board` has to invoke the refusal itself and carry a test for it.
+///
+/// The order is the point. The refusal sits between a parsed board and
+/// a loaded one — it needs the declarations, and a board that cannot
+/// have its key should not pay to derive a single variable. It lives
+/// here rather than in core because it reads the loop's key table.
+pub(crate) fn validated(
+    path: &std::path::Path,
+    colored: bool,
+    overrides: &Bindings,
+) -> anyhow::Result<Board> {
+    let (text, file) = read_and_parse(path, colored, overrides)?;
+    refuse_claimed_bindings(&file.bindings).with_context(|| format!("in {}", path.display()))?;
+    finish_load(path, &text, file, overrides)
+}
+
+/// Built-ins always win, and they win loudly. A board author who
+/// writes `key "j"` gets an error naming what `j` already does — the
+/// alternative is a binding that quietly never fires, which is the
+/// worst outcome this grammar can produce.
+///
+/// Takes the DECLARED form, and runs before the load step expands
+/// anything: it needs only the key and the spelling, both of which
+/// survive the walk, and a board whose key is not its to bind should
+/// not pay for expansion first.
+///
+/// Called from every entry point that validates a board. It is here,
+/// and not in `into_registry`, because its two inputs sit on opposite
+/// sides of the layering: the loop's table and the board's
+/// declaration.
+pub(crate) fn refuse_claimed_bindings(bindings: &[KeyBindingDecl]) -> anyhow::Result<()> {
+    for binding in bindings {
+        if let Some(does) = crate::commands::watch::builtin_key(binding.key) {
+            // The author's own bytes, not a re-rendering: the error
+            // quotes the line they wrote.
+            let spelling = &binding.spelling;
+            bail!(
+                "key {spelling:?}: `{spelling}` is one of rat's own keys — it {does}. \
+                 Press `?` on any board for the full list, then pick a key it does not name"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The run-constant tail of every live row — the same rule as watch's
@@ -387,10 +445,17 @@ fn check_board(args: CheckArgs, profile: ColorProfile) -> AppResult {
     let colored = profile != ColorProfile::Ascii;
     let overrides = parse_overrides(&args.variable)?;
     // The shared prefix — read + parse + `-v` validation — with BOTH
-    // context strings attached exactly once. `load()` calls this same
-    // function; inlining the steps here is how the byte-identity with
-    // a run's stderr would quietly stop being true.
+    // context strings attached exactly once. `validated()` composes
+    // this same function; inlining the steps here is how the
+    // byte-identity with a run's stderr would quietly stop being true.
     let (_text, file) = read_and_parse(&args.file, colored, &overrides)?;
+    // The claimed-key refusal, ahead of the branch — `check` cannot go
+    // through `validated()` because that ends in a `Registry` this
+    // command must never build. A future board-validating route
+    // carries the same two obligations: invoke the refusal, and add an
+    // arm to the two-route integration test.
+    refuse_claimed_bindings(&file.bindings)
+        .with_context(|| format!("in {}", args.file.display()))?;
     // NOT resolve_variables: no command runs. The partial resolver
     // walks the same graph and returns Known for constants, -v
     // overrides, and chains of those — so a malformed CONSTANT still
@@ -1109,5 +1174,72 @@ mod tests {
             parse_overrides(&["plan=a".to_string(), "plan=b".to_string()]).expect_err("twice")
         );
         assert!(err.contains("-v plan is given twice"), "got {err}");
+    }
+    // ─── The claimed-key refusal ────────────────────────────────────
+
+    fn binding(key: crate::ui::key::Key) -> crate::core::dashboard_file::KeyBindingDecl {
+        use crate::core::template::Template;
+        crate::core::dashboard_file::KeyBindingDecl {
+            key,
+            spelling: crate::core::key_spelling::spelling_of(key),
+            description: Template::extract("x"),
+            program: crate::core::dashboard_file::BindingProgram::Argv(vec![Template::extract(
+                "true",
+            )]),
+            shell: None,
+            when: None,
+            output: None,
+            confirm: None,
+        }
+    }
+
+    #[test]
+    fn a_binding_on_one_of_rats_own_keys_is_refused_by_name() {
+        use crate::ui::key::Key;
+        let err = format!(
+            "{:#}",
+            refuse_claimed_bindings(&[binding(Key::Char('j'))]).unwrap_err()
+        );
+        assert_eq!(
+            err,
+            "key \"j\": `j` is one of rat's own keys — it scrolls down one line. \
+             Press `?` on any board for the full list, then pick a key it does not name"
+        );
+    }
+
+    #[test]
+    fn a_binding_on_a_free_key_is_accepted() {
+        use crate::ui::key::Key;
+        refuse_claimed_bindings(&[binding(Key::Char('a')), binding(Key::Alt('x'))])
+            .expect("both free");
+    }
+
+    #[test]
+    fn the_refusal_fires_for_exactly_the_keys_the_derivation_claims() {
+        // The matrix again, through the surface a board actually hits —
+        // so a refusal that reads the derivation correctly but applies it
+        // to the wrong field cannot pass.
+        for key in crate::core::key_spelling::ascii_spellable() {
+            assert_eq!(
+                refuse_claimed_bindings(&[binding(key)]).is_err(),
+                crate::commands::watch::builtin_key(key).is_some(),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_claimed_binding_in_declaration_order_is_the_one_reported() {
+        use crate::ui::key::Key;
+        let err = format!(
+            "{:#}",
+            refuse_claimed_bindings(&[
+                binding(Key::Char('a')),
+                binding(Key::Char('q')),
+                binding(Key::Char('j'))
+            ])
+            .unwrap_err()
+        );
+        assert!(err.starts_with("key \"q\":"), "{err}");
     }
 }

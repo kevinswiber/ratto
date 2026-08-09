@@ -2805,3 +2805,29 @@ fn a_binding_without_a_description_names_itself_and_the_file() {
         ))
         .stderr(predicates::str::contains("board.kdl"));
 }
+
+#[test]
+fn a_binding_that_names_one_of_rats_own_keys_is_refused_at_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "key \"j\" {\n    description \"rerun\"\n    command \"true\"\n}\n\n\
+         pane \"a\" {\n    command \"true\"\n    height 3\n}\n",
+    );
+    // Both board-validating routes: a refusal that fired on one and not
+    // the other is the failure mode the shared prefix exists to close.
+    for args in [
+        vec!["dashboard", &file, "--once"],
+        vec!["dashboard", "check", &file],
+    ] {
+        rat()
+            .env("NO_COLOR", "1")
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("`j` is one of rat's own keys"))
+            .stderr(predicates::str::contains("scrolls down one line"))
+            .stderr(predicates::str::contains("board.kdl"));
+    }
+}

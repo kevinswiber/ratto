@@ -1453,19 +1453,6 @@ pub(crate) fn read_and_parse(
     Ok((text, file))
 }
 
-pub fn load(
-    path: &std::path::Path,
-    colored: bool,
-    // `Bindings` lives in `core::template`, NOT in the walk —
-    // `dashboard_file.rs` may not name `dashboard_kdl.rs`, which
-    // imports it.
-    overrides: &Bindings,
-) -> anyhow::Result<(Registry, crate::core::shell::SpawnVariables)> {
-    let (text, file) = read_and_parse(path, colored, overrides)?;
-    let board = finish_load(path, &text, file, overrides)?;
-    Ok((board.registry, board.variables))
-}
-
 /// What loading a board produces — this module's product, beside the
 /// two binding records above.
 pub struct Board {
@@ -1476,7 +1463,7 @@ pub struct Board {
     /// the argv already checked. Every consumer past this point reads
     /// text and calls no substitution function of its own.
     #[allow(dead_code)]
-    // The command layer's load pipeline consumes this next; only tests read it today.
+    // The loop consumes this next (via SessionArgs); only tests read it today.
     pub bindings: Vec<KeyBinding>,
 }
 
