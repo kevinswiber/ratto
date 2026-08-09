@@ -23,9 +23,10 @@ use anyhow::{Context, anyhow, bail};
 use crate::core::box_model::{BorderPreset, Sides, parse_sides};
 use crate::core::duration::parse_interval;
 use crate::core::registry::{
-    LayoutNode, Overflow, PaneBox, PaneWidth, Registry, ShellMode, SourceId, SourceProgram,
-    SourceSpec, TitleSource, shebang,
+    LayoutNode, Overflow, PaneBox, PaneWidth, Registry, ShellDecl, ShellMode, SourceId,
+    SourceProgram, SourceSpec, TitleSource, shebang,
 };
+use crate::core::template::Template;
 use crate::core::trigger::parse_trigger;
 
 /// `rat watch --trigger-debounce`'s default, reused verbatim so a pane
@@ -40,8 +41,12 @@ const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// one of the two is present.
 #[derive(Clone, PartialEq, Debug)]
 pub struct TitleDecl {
-    pub text: Option<String>,
+    /// A string an author writes, so it is a template like any other
+    /// string site. Expansion is load-time (INV-7).
+    pub text: Option<Template>,
     /// The referenced pane id — the fragment with its `#` removed.
+    /// A `String`, not a `Template`: an id is identity (INV-3), and
+    /// the walk refuses a reference here.
     pub reference: Option<String>,
 }
 
@@ -101,31 +106,36 @@ impl LayoutDecl {
 }
 
 /// One pane's declaration (or the `defaults` block), tokens unparsed.
+/// Every string an author writes is a [`Template`] — recorded as
+/// written, its references validated at load, expanded only at its use
+/// moment (INV-2).
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct PaneDecl {
     pub id: Option<String>,
     /// Split argv, or one raw script string under `shell`.
-    pub command: Option<Vec<String>>,
+    pub command: Option<Vec<Template>>,
     /// A multi-line body declared with `script`. A leading `#!` names
     /// the body's own interpreter; without one the body runs through
     /// the pane's resolved shell, exactly as unix ENOEXEC does.
-    pub script: Option<String>,
-    /// `None` inherits; `Some(ShellMode::Direct)` is an explicit
-    /// `shell=#false`.
-    pub shell: Option<ShellMode>,
+    pub script: Option<Template>,
+    /// `None` inherits; `Some(ShellDecl::Direct)` is an explicit
+    /// `shell=#false`. The DECLARED form: a templated dialect name
+    /// keeps its references and its flavor instead of being flattened
+    /// into a `ShellMode::Named(String)`.
+    pub shell: Option<ShellDecl>,
     /// "5s" | "never".
-    pub interval: Option<String>,
-    pub trigger: Option<Vec<String>>,
-    pub trigger_debounce: Option<String>,
+    pub interval: Option<Template>,
+    pub trigger: Option<Vec<Template>>,
+    pub trigger_debounce: Option<Template>,
     pub height: Option<u16>,
     /// "40" | "2fr" | "auto".
-    pub width: Option<String>,
+    pub width: Option<Template>,
     /// "keep-top" | "keep-bottom".
-    pub overflow: Option<String>,
-    pub border: Option<String>,
+    pub overflow: Option<Template>,
+    pub border: Option<Template>,
     /// `parse_sides` shorthand.
-    pub padding: Option<String>,
-    pub title: Option<String>,
+    pub padding: Option<Template>,
+    pub title: Option<Template>,
     pub chrome: Option<bool>,
     /// Whether pane-navigation gestures may target this pane.
     pub focusable: Option<bool>,
@@ -182,7 +192,11 @@ impl DashboardFile {
             Some(TitleDecl {
                 text,
                 reference: None,
-            }) => TitleSource::Static(text.expect("the parser requires text or ref")),
+            }) => TitleSource::Static(
+                text.expect("the parser requires text or ref")
+                    .as_str()
+                    .to_string(),
+            ),
             Some(TitleDecl {
                 text,
                 reference: Some(wanted),
@@ -199,7 +213,7 @@ impl DashboardFile {
                     })?;
                 TitleSource::Pane {
                     source,
-                    fallback: text,
+                    fallback: text.map(|fallback| fallback.as_str().to_string()),
                 }
             }
         })
@@ -249,11 +263,30 @@ fn at(name: &str) -> String {
 
 /// How a mode reads inside an error: the thing the author would
 /// recognise from what they wrote.
-fn shell_label(mode: &ShellMode) -> String {
-    match mode {
-        ShellMode::Direct => "no shell".to_string(),
-        ShellMode::Platform => "the platform shell".to_string(),
-        ShellMode::Named(name) => format!("`{name}`"),
+fn shell_label(decl: &ShellDecl) -> String {
+    match decl {
+        ShellDecl::Direct => "no shell".to_string(),
+        ShellDecl::Platform => "the platform shell".to_string(),
+        ShellDecl::Named(name) => format!("`{}`", name.as_str()),
+    }
+}
+
+/// The Phase-1 bridge from the declared shell to the resolved mode a
+/// [`SourceSpec`] carries: nothing expands yet, so a templated dialect
+/// name passes through as its written bytes — byte-identical to the
+/// old behavior for every template-free board. Load-time expansion
+/// replaces this with `ShellDecl::resolve(bindings)`; when it does,
+/// the inherit-guards in `resolve_source`/`resolve_script` must move
+/// from comparing DECLARED shells to comparing RESOLVED modes in the
+/// same change — `shell="{{sh}}"` with `sh = "fish"` beside
+/// `defaults { shell "fish" }` compares unequal as written and equal
+/// as run, and the guard's own justification is about the dialect the
+/// command was written for.
+fn shell_mode(decl: &ShellDecl) -> ShellMode {
+    match decl {
+        ShellDecl::Direct => ShellMode::Direct,
+        ShellDecl::Platform => ShellMode::Platform,
+        ShellDecl::Named(name) => ShellMode::Named(name.as_str().to_string()),
     }
 }
 
@@ -271,10 +304,10 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
     // The effective program: own beats inherited, even across kinds (a
     // pane's `command` overrides a defaults `script`).
     let inherits_program = decl.command.is_none() && decl.script.is_none();
-    let script = decl.script.as_deref().or_else(|| {
+    let script = decl.script.as_ref().map(Template::as_str).or_else(|| {
         decl.command
             .is_none()
-            .then_some(defaults.script.as_deref())
+            .then_some(defaults.script.as_ref().map(Template::as_str))
             .flatten()
     });
     let (program, shell) = if let Some(body) = script {
@@ -311,7 +344,15 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
             .or_else(|| defaults.command.clone())
             .filter(|words| !words.is_empty())
             .ok_or_else(|| anyhow!("{}: needs a `command` or a `script`", at(id)))?;
-        (SourceProgram::Argv(command), shell)
+        (
+            SourceProgram::Argv(
+                command
+                    .iter()
+                    .map(|word| word.as_str().to_string())
+                    .collect(),
+            ),
+            shell,
+        )
     };
 
     let triggers = decl
@@ -320,10 +361,14 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
         .or_else(|| defaults.trigger.clone())
         .unwrap_or_default()
         .iter()
-        .map(|spec| parse_trigger(spec).with_context(|| at(id)))
+        .map(|spec| parse_trigger(spec.as_str()).with_context(|| at(id)))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let token = decl.interval.as_deref().or(defaults.interval.as_deref());
+    let token = decl
+        .interval
+        .as_ref()
+        .or(defaults.interval.as_ref())
+        .map(Template::as_str);
     let interval = match (token, triggers.is_empty()) {
         (Some("never"), _) => None,
         (Some(token), _) => Some(parse_interval(token).with_context(|| at(id))?),
@@ -333,8 +378,9 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
 
     let debounce = match decl
         .trigger_debounce
-        .as_deref()
-        .or(defaults.trigger_debounce.as_deref())
+        .as_ref()
+        .or(defaults.trigger_debounce.as_ref())
+        .map(Template::as_str)
     {
         Some(token) => parse_interval(token).with_context(|| at(id))?,
         None => DEFAULT_DEBOUNCE,
@@ -346,7 +392,7 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
         // round-trips through split-then-join, and a body's bytes are
         // the author's.
         program,
-        shell,
+        shell: shell_mode(&shell),
         interval,
         triggers,
         debounce,
@@ -369,11 +415,11 @@ fn resolve_script(
     body: &str,
     decl: &PaneDecl,
     defaults: &PaneDecl,
-    shell: &ShellMode,
-    defaults_shell: &ShellMode,
+    shell: &ShellDecl,
+    defaults_shell: &ShellDecl,
     inherited: bool,
     id: &str,
-) -> anyhow::Result<(SourceProgram, ShellMode)> {
+) -> anyhow::Result<(SourceProgram, ShellDecl)> {
     if body.trim().is_empty() {
         bail!(
             "{}: `script` has no body — write the script inside a `\"\"\"` \
@@ -415,7 +461,7 @@ fn resolve_script(
                 );
             }
             let explicit = decl.shell.as_ref().or(defaults.shell.as_ref());
-            if matches!(explicit, Some(ShellMode::Direct)) {
+            if matches!(explicit, Some(ShellDecl::Direct)) {
                 bail!(
                     "{}: `script` runs through a shell, but this pane \
                      declares `shell #false` — a body has no argv to execute \
@@ -436,7 +482,7 @@ fn resolve_script(
                 );
             }
             let shell = match shell {
-                ShellMode::Direct => ShellMode::Platform,
+                ShellDecl::Direct => ShellDecl::Platform,
                 other => other.clone(),
             };
             Ok((SourceProgram::Script(body.to_string()), shell))
@@ -451,7 +497,12 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result
             at(id)
         )
     })?;
-    let width = match decl.width.as_deref().or(defaults.width.as_deref()) {
+    let width = match decl
+        .width
+        .as_ref()
+        .or(defaults.width.as_ref())
+        .map(Template::as_str)
+    {
         None | Some("auto") => PaneWidth::Weight(1),
         Some(token) => parse_width(token, id)?,
     };
@@ -461,7 +512,11 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result
     // keeping the head on one silently kills the `D` and `c` change
     // marks, so declaring it is an error rather than a preference.
     let live = decl.live.or(defaults.live).unwrap_or(false);
-    let declared_overflow = decl.overflow.as_deref().or(defaults.overflow.as_deref());
+    let declared_overflow = decl
+        .overflow
+        .as_ref()
+        .or(defaults.overflow.as_ref())
+        .map(Template::as_str);
     let overflow = match (declared_overflow, live) {
         (None, true) => Overflow::KeepBottom,
         (None, false) => Overflow::KeepTop,
@@ -479,11 +534,21 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result
             at(id)
         ),
     };
-    let border = match decl.border.as_deref().or(defaults.border.as_deref()) {
+    let border = match decl
+        .border
+        .as_ref()
+        .or(defaults.border.as_ref())
+        .map(Template::as_str)
+    {
         None => BorderPreset::None,
         Some(token) => parse_border(token, id)?,
     };
-    let padding = match decl.padding.as_deref().or(defaults.padding.as_deref()) {
+    let padding = match decl
+        .padding
+        .as_ref()
+        .or(defaults.padding.as_ref())
+        .map(Template::as_str)
+    {
         None => Sides::default(),
         Some(token) => parse_sides(token).with_context(|| at(id))?,
     };
@@ -493,7 +558,11 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result
         overflow,
         border,
         padding,
-        title: decl.title.clone().or_else(|| defaults.title.clone()),
+        title: decl
+            .title
+            .as_ref()
+            .or(defaults.title.as_ref())
+            .map(|title| title.as_str().to_string()),
         chrome: decl.chrome.or(defaults.chrome).unwrap_or(true),
         focusable: decl.focusable.or(defaults.focusable).unwrap_or(true),
     })
@@ -642,7 +711,7 @@ mod tests {
     fn pane(id: &str, command: &[&str]) -> PaneDecl {
         PaneDecl {
             id: Some(id.to_string()),
-            command: Some(command.iter().map(|s| s.to_string()).collect()),
+            command: Some(command.iter().map(|&s| Template::from(s)).collect()),
             height: Some(3),
             ..PaneDecl::default()
         }
@@ -678,12 +747,12 @@ mod tests {
 
         let decl = DashboardFile {
             defaults: PaneDecl {
-                command: Some(vec!["true".to_string()]),
+                command: Some(vec!["true".into()]),
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
                 id: Some("b".to_string()),
-                shell: Some(ShellMode::Platform),
+                shell: Some(ShellDecl::Platform),
                 height: Some(3),
                 ..PaneDecl::default()
             }],
@@ -704,9 +773,9 @@ mod tests {
     fn defaults_fall_through_to_every_pane() {
         let decl = DashboardFile {
             defaults: PaneDecl {
-                interval: Some("30s".to_string()),
-                border: Some("rounded".to_string()),
-                padding: Some("0 1".to_string()),
+                interval: Some("30s".into()),
+                border: Some("rounded".into()),
+                padding: Some("0 1".into()),
                 height: Some(5),
                 ..PaneDecl::default()
             },
@@ -747,13 +816,13 @@ mod tests {
     fn a_pane_overrides_a_default() {
         let decl = DashboardFile {
             defaults: PaneDecl {
-                interval: Some("30s".to_string()),
+                interval: Some("30s".into()),
                 height: Some(5),
                 ..PaneDecl::default()
             },
             panes: vec![
                 PaneDecl {
-                    interval: Some("2s".to_string()),
+                    interval: Some("2s".into()),
                     height: Some(9),
                     ..pane("fast", &["date"])
                 },
@@ -781,7 +850,7 @@ mod tests {
         // grammar stays exactly as shipped, or `rat watch -n never` would
         // silently become a legal flag.
         let decl = file(vec![PaneDecl {
-            interval: Some("never".to_string()),
+            interval: Some("never".into()),
             ..pane("manual", &["date"])
         }]);
         let registry = decl.into_registry().expect("registry");
@@ -803,7 +872,7 @@ mod tests {
     #[test]
     fn no_interval_with_a_trigger_is_trigger_only() {
         let decl = file(vec![PaneDecl {
-            trigger: Some(vec!["file:./state".to_string()]),
+            trigger: Some(vec!["file:./state".into()]),
             ..pane("watched", &["date"])
         }]);
         let registry = decl.into_registry().expect("registry");
@@ -916,7 +985,7 @@ mod tests {
         // worse than a load error.
         let err = err_of(file(vec![PaneDecl {
             live: Some(true),
-            overflow: Some("keep-top".to_string()),
+            overflow: Some("keep-top".into()),
             ..pane("log", &["date"])
         }]));
         assert!(err.contains("log"), "names the pane: {err}");
@@ -933,7 +1002,7 @@ mod tests {
             live: Some(true),
             ..pane("log", &["date"])
         }]);
-        decl.defaults.overflow = Some("keep-top".to_string());
+        decl.defaults.overflow = Some("keep-top".into());
         let err = err_of(decl);
         assert!(err.contains("log"), "{err}");
     }
@@ -943,7 +1012,7 @@ mod tests {
         // The refusal is about the COMBINATION. keep-top is the shipped
         // default and must not become an error.
         let registry = file(vec![PaneDecl {
-            overflow: Some("keep-top".to_string()),
+            overflow: Some("keep-top".into()),
             ..pane("p", &["date"])
         }])
         .into_registry()
@@ -958,7 +1027,7 @@ mod tests {
     fn live_with_keep_bottom_declared_is_accepted() {
         let registry = file(vec![PaneDecl {
             live: Some(true),
-            overflow: Some("keep-bottom".to_string()),
+            overflow: Some("keep-bottom".into()),
             ..pane("log", &["date"])
         }])
         .into_registry()
@@ -1015,7 +1084,7 @@ mod tests {
     #[test]
     fn an_unknown_overflow_names_the_two_values() {
         let err = err_of(file(vec![PaneDecl {
-            overflow: Some("keep-middle".to_string()),
+            overflow: Some("keep-middle".into()),
             ..pane("log", &["date"])
         }]));
         assert!(err.contains("log"), "{err}");
@@ -1028,7 +1097,7 @@ mod tests {
         // parse_trigger already teaches the schemes; the declaration
         // layer only has to say WHICH pane wrote it.
         let err = err_of(file(vec![PaneDecl {
-            trigger: Some(vec!["/tmp/state.json".to_string()]),
+            trigger: Some(vec!["/tmp/state.json".into()]),
             ..pane("build", &["date"])
         }]));
         assert!(err.contains("build"), "{err}");
@@ -1078,8 +1147,8 @@ mod tests {
         // quoting is destroyed. into_registry copies the vec.
         let script = "date +%H:%M | tr -d '\\n'";
         let decl = file(vec![PaneDecl {
-            shell: Some(ShellMode::Platform),
-            command: Some(vec![script.to_string()]),
+            shell: Some(ShellDecl::Platform),
+            command: Some(vec![script.into()]),
             ..pane("stamp", &["unused"])
         }]);
         let registry = decl.into_registry().expect("registry");
@@ -1092,7 +1161,7 @@ mod tests {
     fn script_pane(id: &str, body: &str) -> PaneDecl {
         PaneDecl {
             id: Some(id.to_string()),
-            script: Some(body.to_string()),
+            script: Some(body.into()),
             height: Some(3),
             ..PaneDecl::default()
         }
@@ -1101,7 +1170,7 @@ mod tests {
     #[test]
     fn a_pane_with_both_command_and_script_is_rejected() {
         let mut decl = pane("x", &["date"]);
-        decl.script = Some("#!/bin/sh\necho hi".to_string());
+        decl.script = Some("#!/bin/sh\necho hi".into());
         let err = err_of(file(vec![decl]));
         assert!(err.contains("pane \"x\""), "{err}");
         assert!(err.contains("both `command` and `script`"), "{err}");
@@ -1112,8 +1181,8 @@ mod tests {
     fn defaults_with_both_command_and_script_are_rejected() {
         let decl = DashboardFile {
             defaults: PaneDecl {
-                command: Some(vec!["date".to_string()]),
-                script: Some("#!/bin/sh\necho hi".to_string()),
+                command: Some(vec!["date".into()]),
+                script: Some("#!/bin/sh\necho hi".into()),
                 height: Some(3),
                 ..PaneDecl::default()
             },
@@ -1161,7 +1230,7 @@ mod tests {
     #[test]
     fn a_panes_own_running_shell_under_a_shebang_body_is_rejected() {
         // `#true` and a name both: the declared shell would never run.
-        for shell in [ShellMode::Platform, ShellMode::Named("fish".to_string())] {
+        for shell in [ShellDecl::Platform, ShellDecl::Named("fish".into())] {
             let mut decl = script_pane("x", "#!/usr/bin/env python3\nprint(1)");
             decl.shell = Some(shell);
             let err = err_of(file(vec![decl]));
@@ -1174,13 +1243,13 @@ mod tests {
         // that pane's shell is exactly as dead.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                script: Some("#!/bin/sh\necho hi".to_string()),
+                script: Some("#!/bin/sh\necho hi".into()),
                 height: Some(3),
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
                 id: Some("x".to_string()),
-                shell: Some(ShellMode::Named("fish".to_string())),
+                shell: Some(ShellDecl::Named("fish".into())),
                 ..PaneDecl::default()
             }],
             ..DashboardFile::default()
@@ -1193,7 +1262,7 @@ mod tests {
     fn shell_false_under_a_shebangless_body_is_rejected() {
         // Own `#false`.
         let mut decl = script_pane("x", "echo hi");
-        decl.shell = Some(ShellMode::Direct);
+        decl.shell = Some(ShellDecl::Direct);
         let err = err_of(file(vec![decl]));
         assert!(err.contains("pane \"x\""), "{err}");
         assert!(err.contains("shell #false"), "{err}");
@@ -1202,7 +1271,7 @@ mod tests {
         // resolved.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                shell: Some(ShellMode::Direct),
+                shell: Some(ShellDecl::Direct),
                 height: Some(3),
                 ..PaneDecl::default()
             },
@@ -1219,7 +1288,7 @@ mod tests {
         // is true, and refusing it would deadlock a defaults-wide
         // `shell #false` with any shebang pane.
         let mut decl = script_pane("x", "#!/bin/sh\necho hi");
-        decl.shell = Some(ShellMode::Direct);
+        decl.shell = Some(ShellDecl::Direct);
         let registry = file(vec![decl]).into_registry().expect("registry");
         assert_eq!(
             registry.spec(SourceId(0)).program,
@@ -1228,7 +1297,7 @@ mod tests {
         // Inherited #false likewise.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                shell: Some(ShellMode::Direct),
+                shell: Some(ShellDecl::Direct),
                 height: Some(3),
                 ..PaneDecl::default()
             },
@@ -1244,7 +1313,7 @@ mod tests {
         // the id reaches each child as RAT_PANE.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                script: Some("#!/bin/sh\necho $RAT_PANE".to_string()),
+                script: Some("#!/bin/sh\necho $RAT_PANE".into()),
                 height: Some(3),
                 ..PaneDecl::default()
             },
@@ -1275,14 +1344,14 @@ mod tests {
         // belongs to the shell it was written under.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                shell: Some(ShellMode::Platform),
-                script: Some("echo inherited".to_string()),
+                shell: Some(ShellDecl::Platform),
+                script: Some("echo inherited".into()),
                 height: Some(3),
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
                 id: Some("x".to_string()),
-                shell: Some(ShellMode::Named("fish".to_string())),
+                shell: Some(ShellDecl::Named("fish".into())),
                 ..PaneDecl::default()
             }],
             ..DashboardFile::default()
@@ -1298,7 +1367,7 @@ mod tests {
         // wins silently — nothing pane-local is dead.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                shell: Some(ShellMode::Named("fish".to_string())),
+                shell: Some(ShellDecl::Named("fish".into())),
                 height: Some(3),
                 ..PaneDecl::default()
             },
@@ -1326,7 +1395,7 @@ mod tests {
     fn a_panes_own_command_overrides_an_inherited_script() {
         let decl = DashboardFile {
             defaults: PaneDecl {
-                script: Some("#!/bin/sh\necho hi".to_string()),
+                script: Some("#!/bin/sh\necho hi".into()),
                 height: Some(3),
                 ..PaneDecl::default()
             },
@@ -1348,14 +1417,14 @@ mod tests {
         // modes so the author sees the mismatch, and the fix.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                shell: Some(ShellMode::Platform),
-                command: Some(vec!["printf inherited".to_string()]),
+                shell: Some(ShellDecl::Platform),
+                command: Some(vec!["printf inherited".into()]),
                 height: Some(3),
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
                 id: Some("fishy".to_string()),
-                shell: Some(ShellMode::Named("fish".to_string())),
+                shell: Some(ShellDecl::Named("fish".into())),
                 ..PaneDecl::default()
             }],
             ..DashboardFile::default()
@@ -1373,14 +1442,14 @@ mod tests {
         // was written under.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                shell: Some(ShellMode::Named("fish".to_string())),
-                command: Some(vec!["printf inherited".to_string()]),
+                shell: Some(ShellDecl::Named("fish".into())),
+                command: Some(vec!["printf inherited".into()]),
                 height: Some(3),
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
                 id: Some("same".to_string()),
-                shell: Some(ShellMode::Named("fish".to_string())),
+                shell: Some(ShellDecl::Named("fish".into())),
                 ..PaneDecl::default()
             }],
             ..DashboardFile::default()
@@ -1400,14 +1469,14 @@ mod tests {
         // bug; it is not one.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                shell: Some(ShellMode::Platform),
-                command: Some(vec!["printf inherited".to_string()]),
+                shell: Some(ShellDecl::Platform),
+                command: Some(vec!["printf inherited".into()]),
                 height: Some(3),
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
                 id: Some("pedantic".to_string()),
-                shell: Some(ShellMode::Named("sh".to_string())),
+                shell: Some(ShellDecl::Named("sh".into())),
                 ..PaneDecl::default()
             }],
             ..DashboardFile::default()
@@ -1421,13 +1490,13 @@ mod tests {
     fn a_named_shell_in_defaults_reaches_a_pane_with_its_own_command() {
         let decl = DashboardFile {
             defaults: PaneDecl {
-                shell: Some(ShellMode::Named("fish".to_string())),
+                shell: Some(ShellDecl::Named("fish".into())),
                 height: Some(3),
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
                 id: Some("own".to_string()),
-                command: Some(vec!["date".to_string()]),
+                command: Some(vec!["date".into()]),
                 ..PaneDecl::default()
             }],
             ..DashboardFile::default()
@@ -1447,14 +1516,14 @@ mod tests {
         // wrongly-shaped argv. Both directions error, teaching the fix.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                shell: Some(ShellMode::Platform),
-                command: Some(vec!["printf inherited".to_string()]),
+                shell: Some(ShellDecl::Platform),
+                command: Some(vec!["printf inherited".into()]),
                 height: Some(3),
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
                 id: Some("plain".to_string()),
-                shell: Some(ShellMode::Direct),
+                shell: Some(ShellDecl::Direct),
                 ..PaneDecl::default()
             }],
             ..DashboardFile::default()
@@ -1466,13 +1535,13 @@ mod tests {
 
         let reverse = DashboardFile {
             defaults: PaneDecl {
-                command: Some(vec!["git".to_string(), "status".to_string()]),
+                command: Some(vec!["git".into(), "status".into()]),
                 height: Some(3),
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
                 id: Some("shelly".to_string()),
-                shell: Some(ShellMode::Platform),
+                shell: Some(ShellDecl::Platform),
                 ..PaneDecl::default()
             }],
             ..DashboardFile::default()
@@ -1482,7 +1551,7 @@ mod tests {
         // Matching modes inherit fine.
         let ok = DashboardFile {
             defaults: PaneDecl {
-                command: Some(vec!["date".to_string()]),
+                command: Some(vec!["date".into()]),
                 height: Some(3),
                 ..PaneDecl::default()
             },

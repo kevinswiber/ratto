@@ -155,6 +155,14 @@ pub struct Template {
 }
 
 impl Template {
+    /// The bytes as written. Deliberately NOT a `Deref<Target = str>`:
+    /// a template that silently reads as a `&str` is a template
+    /// someone will hand to `substitute` after raw strings made a raw
+    /// value's bytes indistinguishable from a normal one's.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
     /// Record a RAW KDL string: literal end to end, `{{` not even
     /// recognized (INV-1). Records zero references, which is what
     /// makes raw-ness a property of the RECORD rather than a re-scan

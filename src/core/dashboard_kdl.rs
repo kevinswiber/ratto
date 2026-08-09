@@ -16,11 +16,30 @@
 //! rule that is real, uniform and mechanically enforced still reads as
 //! arbitrary to someone who has only ever met it as an error message
 //! (zellij shipped this exact seam undocumented — their #3629).
+//!
+//! # Site accounting (INV-6)
+//!
+//! "Every string site is validated" is only checkable if the sites are
+//! enumerated. Every row is either validated against the declared
+//! variables or has a stated reason it cannot hold a reference:
+//!
+//! | Key | Shape | Reaches | String site? |
+//! |---|---|---|---|
+//! | `command`, `trigger` | `List` | `many_text` | yes |
+//! | `script`, `interval`, `trigger-debounce`, `width`, `overflow`, `border`, `padding`, `title` | `Text` | `prop_text` / `one_text` | yes |
+//! | `shell` | `FlagOrText` | `shell_decl` → `ShellDecl::Named(Template)` | yes, in its string arm |
+//! | `height` | `Count` | `prop_count` / `one_count` | no — integers never reach a string (INV-3) |
+//! | `chrome`, `focusable`, `live` | `Flag` | `prop_flag` / `one_flag` | no |
+//! | document `title` text | — | `title_field` | yes |
+//! | document `title` `ref` | — | `title_field` | **refused** — an id is identity (INV-3) |
+//! | document `gap`, `row-gap` | — | `usize_field` | no — integers |
+//! | pane id positional | — | `one_id` | **refused** by the existing charset check |
+//! | `variables` values | — | `variables_block` | yes — validated by `classify` |
 
 use anyhow::{anyhow, bail};
 
 use crate::core::dashboard_file::{DashboardFile, LayoutDecl, PaneDecl};
-use crate::core::registry::{ShellDecl, ShellMode};
+use crate::core::registry::ShellDecl;
 use crate::core::template::{Template, is_reference_name};
 use crate::core::variables::{Tier, VarSource, Variable, VariableBlock};
 
@@ -29,15 +48,15 @@ use crate::core::variables::{Tier, VarSource, Variable, VariableBlock};
 /// therefore where it may be written — a KDL property holds exactly one
 /// value, so only `List` lacks a property spelling.
 enum Set {
-    Text(fn(&mut PaneDecl, String)),
+    Text(fn(&mut PaneDecl, Template)),
     Count(fn(&mut PaneDecl, i128, &Ctx<'_>) -> anyhow::Result<()>),
     Flag(fn(&mut PaneDecl, bool)),
-    List(fn(&mut PaneDecl, Vec<String>, &Ctx<'_>) -> anyhow::Result<()>),
+    List(fn(&mut PaneDecl, Vec<Template>, &Ctx<'_>) -> anyhow::Result<()>),
     /// `#true`, `#false`, or one string naming the choice — a switch
     /// and a choice in one key. `shell` is the only key with this
     /// shape, so the payload is its own type; a second such key would
     /// earn a shape-neutral one.
-    FlagOrText(fn(&mut PaneDecl, ShellMode)),
+    FlagOrText(fn(&mut PaneDecl, ShellDecl)),
 }
 
 impl Set {
@@ -157,14 +176,21 @@ struct Ctx<'a> {
     shell: bool,
 }
 
-fn set_command(decl: &mut PaneDecl, argv: Vec<String>, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+fn set_command(decl: &mut PaneDecl, argv: Vec<Template>, ctx: &Ctx<'_>) -> anyhow::Result<()> {
     decl.command = Some(match argv.as_slice() {
         // One word under `shell` stays one word.
         [script] if ctx.shell => vec![script.clone()],
         // An unbalanced string is a parse error naming the pane — never
         // a one-word fallback that survives to a spawn.
-        [line] => shell_words::split(line)
-            .map_err(|err| anyhow!("{}: command has unbalanced quoting ({err})", ctx.at))?,
+        //
+        // The split happens at PARSE, on TEMPLATE text, and each word
+        // is re-recorded under the whole value's flavor — so an
+        // expansion lands INSIDE the word that held it and never
+        // creates a new argv element (INV-7 sub-rule 1).
+        [line] => line.reslice(
+            shell_words::split(&line.text)
+                .map_err(|err| anyhow!("{}: command has unbalanced quoting ({err})", ctx.at))?,
+        ),
         argv => argv.to_vec(),
     });
     Ok(())
@@ -416,6 +442,8 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
     let mut tree: Vec<&kdl::KdlNode> = Vec::new();
     let mut settings: Vec<&'static str> = Vec::new();
     let mut variables_node: Option<&kdl::KdlNode> = None;
+    let mut defaults_node: Option<&kdl::KdlNode> = None;
+    let mut title_node: Option<&kdl::KdlNode> = None;
     for node in doc.nodes() {
         match node.name().value() {
             "variables" => {
@@ -424,8 +452,10 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
             }
             "title" => {
                 declared_once("title", &mut settings)?;
-                file.title = Some(title_field(node)?);
+                title_node = Some(node);
             }
+            // `gap` / `row-gap` hold integers and can never hold a
+            // reference (INV-3), so they stay in the pass.
             "gap" => {
                 declared_once("gap", &mut settings)?;
                 file.gap = Some(usize_field(node, "gap")?);
@@ -436,23 +466,7 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
             }
             "defaults" => {
                 declared_once("defaults", &mut settings)?;
-                refuse_annotation(node.ty(), "defaults", "defaults")?;
-                let values = positional(node);
-                if !values.is_empty() {
-                    // A bare argument that names a key gets the
-                    // spelling the author was reaching for; one that
-                    // names a document setting gets sent to the top
-                    // level. Only a string naming neither keeps the
-                    // positional refusal.
-                    if let Some(k) = stray_key(&values) {
-                        return Err(stray_key_err("defaults", k, &values));
-                    }
-                    if let Some(name) = stray_setting(&values) {
-                        return Err(stray_setting_err("defaults", name, &values));
-                    }
-                    bail!("defaults takes no id — it holds the keys every pane inherits");
-                }
-                file.defaults = pane_block(node, None, false)?;
+                defaults_node = Some(node);
             }
             "pane" | "row" | "column" => tree.push(node),
             // Placement used to live in its own block, so a reader who
@@ -470,23 +484,53 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
             }
         }
     }
-    // Built after the whole first pass, like `defaults`: a `variables`
-    // node anywhere in the document still declares the board's names.
-    if let Some(node) = variables_node {
-        file.variables = variables_block(node, text, colored)?;
+    // The block is built BEFORE any string site is read: position
+    // carries no meaning in this format (INV-3), so a `variables`
+    // block written at the BOTTOM must answer for a `{{name}}` written
+    // at the top.
+    let variables = match variables_node {
+        Some(node) => variables_block(node, text, colored)?,
+        None => VariableBlock::default(),
+    };
+    let load = Load {
+        text,
+        colored,
+        vars: &variables,
+    };
+    if let Some(node) = title_node {
+        file.title = Some(title_field(node, &load)?);
+    }
+    if let Some(node) = defaults_node {
+        refuse_annotation(node.ty(), "defaults", "defaults")?;
+        let values = positional(node);
+        if !values.is_empty() {
+            // A bare argument that names a key gets the spelling the
+            // author was reaching for; one that names a document
+            // setting gets sent to the top level. Only a string naming
+            // neither keeps the positional refusal.
+            if let Some(k) = stray_key(&values) {
+                return Err(stray_key_err("defaults", k, &values));
+            }
+            if let Some(name) = stray_setting(&values) {
+                return Err(stray_setting_err("defaults", name, &values));
+            }
+            bail!("defaults takes no id — it holds the keys every pane inherits");
+        }
+        file.defaults = pane_block(node, None, false, &load)?;
     }
     // The split cares whether a shell is involved, never which one.
     let default_shell = file
         .defaults
         .shell
         .as_ref()
-        .is_some_and(ShellMode::runs_a_shell);
+        .is_some_and(ShellDecl::runs_a_shell);
     let mut panes = Vec::new();
     let mut items = Vec::with_capacity(tree.len());
     for (index, node) in tree.iter().enumerate() {
         let label = cell_label(None, node, index);
-        items.push(inline_node(node, &label, default_shell, &mut panes)?.normalized());
+        items.push(inline_node(node, &label, default_shell, &mut panes, &load)?.normalized());
     }
+    file.variables = variables;
     file.panes = panes;
     // Placement is STRUCTURAL, so the layout is never absent — the top
     // level IS the dashboard's column, and a file of bare panes states
@@ -515,13 +559,14 @@ fn inline_node(
     label: &str,
     default_shell: bool,
     panes: &mut Vec<PaneDecl>,
+    load: &Load<'_>,
 ) -> anyhow::Result<LayoutDecl> {
     let kind = node.name().value();
     if kind == "pane" {
         // The same name reader the flat list used: a name is not an
         // internal handle, so exactly one string, unannotated.
         let name = one_id(node, label)?;
-        panes.push(pane_block(node, Some(name.clone()), default_shell)?);
+        panes.push(pane_block(node, Some(name.clone()), default_shell, load)?);
         return Ok(LayoutDecl::Pane(name));
     }
     refuse_annotation(node.ty(), kind, label)?;
@@ -568,7 +613,7 @@ fn inline_node(
                 container_kind(node)
             );
         }
-        decls.push(inline_node(cell, &inner, default_shell, panes)?);
+        decls.push(inline_node(cell, &inner, default_shell, panes, load)?);
     }
     Ok(if kind == "row" {
         LayoutDecl::Row(decls)
@@ -584,6 +629,7 @@ fn pane_block(
     node: &kdl::KdlNode,
     id: Option<String>,
     default_shell: bool,
+    load: &Load<'_>,
 ) -> anyhow::Result<PaneDecl> {
     let at = match id.as_deref() {
         Some(name) => format!("pane {name:?}"),
@@ -594,7 +640,7 @@ fn pane_block(
         at: &at,
         shell: shell
             .as_ref()
-            .map_or(default_shell, ShellMode::runs_a_shell),
+            .map_or(default_shell, ShellDecl::runs_a_shell),
     };
     let mut decl = PaneDecl {
         id,
@@ -628,10 +674,10 @@ fn pane_block(
                 k.name,
                 k.example
             ),
-            Set::Text(set) => set(&mut decl, prop_text(entry.value(), k, &at)?),
+            Set::Text(set) => set(&mut decl, prop_text(entry, k, &at, load)?),
             Set::Count(set) => set(&mut decl, prop_count(entry.value(), k, &at)?, &ctx)?,
             Set::Flag(set) => set(&mut decl, prop_flag(entry.value(), k, &at)?),
-            Set::FlagOrText(set) => set(&mut decl, prop_mode(entry.value(), k, &at)?),
+            Set::FlagOrText(set) => set(&mut decl, prop_mode(entry, k, &at, load)?),
         }
     }
 
@@ -650,11 +696,11 @@ fn pane_block(
         record(&mut seen, k, &at)?;
         only_a_value(child, k, &at)?;
         match k.set {
-            Set::Text(set) => set(&mut decl, one_text(child, k, &at)?),
+            Set::Text(set) => set(&mut decl, one_text(child, k, &at, load)?),
             Set::Count(set) => set(&mut decl, one_count(child, k, &at)?, &ctx)?,
             Set::Flag(set) => set(&mut decl, one_flag(child, k, &at)?),
-            Set::List(set) => set(&mut decl, many_text(child, k, &at)?, &ctx)?,
-            Set::FlagOrText(set) => set(&mut decl, one_mode(child, k, &at)?),
+            Set::List(set) => set(&mut decl, many_text(child, k, &at, load)?, &ctx)?,
+            Set::FlagOrText(set) => set(&mut decl, one_mode(child, k, &at, load)?),
         }
     }
     Ok(decl)
@@ -664,22 +710,43 @@ fn pane_block(
 /// split depends on it. A peek only: if `shell` is written in both
 /// positions the pass raises the duplicate error, so the peek's choice
 /// never reaches a spawn.
-fn peek_shell(node: &kdl::KdlNode, at: &str) -> anyhow::Result<Option<ShellMode>> {
+fn peek_shell(node: &kdl::KdlNode, at: &str) -> anyhow::Result<Option<ShellDecl>> {
     let k = key("shell").expect("`shell` is a pane key");
     if let Some(entry) = node.entry("shell") {
-        return prop_mode(entry.value(), k, at).map(Some);
+        return shell_decl(entry)
+            .map(Some)
+            .ok_or_else(|| prop_shape_err(k, at));
     }
     match node.children().and_then(|doc| doc.get("shell")) {
-        Some(child) => one_mode(child, k, at).map(Some),
+        Some(child) => match positional_entries(child).as_slice() {
+            [entry] => shell_decl(entry).map(Some).ok_or_else(|| shape_err(k, at)),
+            _ => Err(shape_err(k, at)),
+        },
         None => Ok(None),
     }
 }
 
-fn prop_text(value: &kdl::KdlValue, k: &Key, at: &str) -> anyhow::Result<String> {
-    value
+/// What a string site needs beyond its own bytes: the declared
+/// variables to hold its references to, the document text an error is
+/// placed into, and the caller's color verdict (never an env sniff —
+/// `--color` and `NO_COLOR` keep their one authority).
+struct Load<'a> {
+    text: &'a str,
+    colored: bool,
+    vars: &'a VariableBlock,
+}
+
+fn prop_text(
+    entry: &kdl::KdlEntry,
+    k: &Key,
+    at: &str,
+    load: &Load<'_>,
+) -> anyhow::Result<Template> {
+    let text = entry
+        .value()
         .as_string()
-        .map(str::to_string)
-        .ok_or_else(|| prop_shape_err(k, at))
+        .ok_or_else(|| prop_shape_err(k, at))?;
+    template_of(text, entry, load)
 }
 
 fn prop_count(value: &kdl::KdlValue, k: &Key, at: &str) -> anyhow::Result<i128> {
@@ -710,14 +777,71 @@ fn positional(node: &kdl::KdlNode) -> Vec<&kdl::KdlValue> {
         .collect()
 }
 
-fn one_text(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<String> {
-    match positional(node).as_slice() {
-        [value] => value
-            .as_string()
-            .map(str::to_string)
-            .ok_or_else(|| shape_err(k, at)),
+fn one_text(node: &kdl::KdlNode, k: &Key, at: &str, load: &Load<'_>) -> anyhow::Result<Template> {
+    match positional_entries(node).as_slice() {
+        [entry] => {
+            let text = entry.value().as_string().ok_or_else(|| shape_err(k, at))?;
+            template_of(text, entry, load)
+        }
         _ => Err(shape_err(k, at)),
     }
+}
+
+/// Record a string and hold every name it references to the declared
+/// set (INV-6). The ONE place validation happens for pane and
+/// `defaults` values, which is what makes a new string-valued key
+/// inherit both for free — the point of chokepointing here.
+fn template_of(text: &str, entry: &kdl::KdlEntry, load: &Load<'_>) -> anyhow::Result<Template> {
+    // The raw-string rule (INV-1) replaces this with the flavor-aware
+    // pick between `extract` and `Template::literal`.
+    let template = Template::extract(text);
+    validate_refs(&template.refs, entry, load)?;
+    Ok(template)
+}
+
+/// Hold a recorded string's references to the declared set (INV-6).
+/// Split out of `template_of` because `shell`'s dialect name needs the
+/// same check without being a `PaneDecl` string field — one rule, two
+/// callers, rather than two spellings that drift.
+fn validate_refs(refs: &[String], entry: &kdl::KdlEntry, load: &Load<'_>) -> anyhow::Result<()> {
+    for name in refs {
+        if !load.vars.contains(name) {
+            let at = reference_offset(load.text, entry, name);
+            return Err(unknown_variable_err(
+                load.text,
+                &(at..at + name.len() + 4),
+                name,
+                load.vars,
+                load.colored,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where a reference sits in the source: the entry's own span
+/// (`KdlEntry::span()`, populated by `KdlDocument::parse` and starting
+/// AFTER leading trivia), walked to the value's verbatim repr
+/// (`KdlEntryFormat::value_repr`) and then to the `{{name}}` inside
+/// it.
+///
+/// Every step is a `find` that may miss — an escaped spelling, an
+/// absent `format()` on a programmatically built entry — and each miss
+/// falls back to the enclosing span's start. A COARSER point, never a
+/// wrong one: a column that points at the wrong byte is worse than one
+/// that points at the value.
+fn reference_offset(text: &str, entry: &kdl::KdlEntry, name: &str) -> usize {
+    let start = entry.span().offset();
+    let Some(source) = text.get(start..start + entry.span().len()) else {
+        return start;
+    };
+    let Some(repr) = entry.format().map(|f| f.value_repr.as_str()) else {
+        return start;
+    };
+    let Some(value_at) = source.find(repr) else {
+        return start;
+    };
+    start + value_at + repr.find(&format!("{{{{{name}}}}}")).unwrap_or(0)
 }
 
 fn one_count(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<i128> {
@@ -734,46 +858,46 @@ fn one_flag(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<bool> {
     }
 }
 
-/// `#true` is the platform's shell, `#false` no shell at all, and a
-/// string names the program. An EMPTY string names nothing: a shape
-/// error, never a spawn of `""`.
-fn shell_value(value: &kdl::KdlValue) -> Option<ShellMode> {
-    if let Some(flag) = value.as_bool() {
-        return Some(if flag {
-            ShellMode::Platform
-        } else {
-            ShellMode::Direct
-        });
-    }
-    value
-        .as_string()
-        .filter(|name| !name.trim().is_empty())
-        .map(|name| ShellMode::Named(name.to_string()))
+/// A pane's `shell`, property spelling: the crate's one shell reader
+/// (`shell_decl`) plus what a PANE's shell needs on top of it —
+/// validation of a templated dialect name against the declared set.
+fn prop_mode(
+    entry: &kdl::KdlEntry,
+    k: &Key,
+    at: &str,
+    load: &Load<'_>,
+) -> anyhow::Result<ShellDecl> {
+    let decl = shell_decl(entry).ok_or_else(|| prop_shape_err(k, at))?;
+    validate_refs(decl.refs(), entry, load)?;
+    Ok(decl)
 }
 
-fn prop_mode(value: &kdl::KdlValue, k: &Key, at: &str) -> anyhow::Result<ShellMode> {
-    shell_value(value).ok_or_else(|| prop_shape_err(k, at))
-}
-
-fn one_mode(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<ShellMode> {
-    match positional(node).as_slice() {
-        [value] => shell_value(value).ok_or_else(|| shape_err(k, at)),
+fn one_mode(node: &kdl::KdlNode, k: &Key, at: &str, load: &Load<'_>) -> anyhow::Result<ShellDecl> {
+    match positional_entries(node).as_slice() {
+        [entry] => {
+            let decl = shell_decl(entry).ok_or_else(|| shape_err(k, at))?;
+            validate_refs(decl.refs(), entry, load)?;
+            Ok(decl)
+        }
         _ => Err(shape_err(k, at)),
     }
 }
 
-fn many_text(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<Vec<String>> {
-    let values = positional(node);
-    if values.is_empty() {
+fn many_text(
+    node: &kdl::KdlNode,
+    k: &Key,
+    at: &str,
+    load: &Load<'_>,
+) -> anyhow::Result<Vec<Template>> {
+    let entries = positional_entries(node);
+    if entries.is_empty() {
         return Err(shape_err(k, at));
     }
-    values
+    entries
         .into_iter()
-        .map(|value| {
-            value
-                .as_string()
-                .map(str::to_string)
-                .ok_or_else(|| shape_err(k, at))
+        .map(|entry| {
+            let text = entry.value().as_string().ok_or_else(|| shape_err(k, at))?;
+            template_of(text, entry, load)
         })
         .collect()
 }
@@ -823,10 +947,13 @@ fn stray_key_err(at: &str, k: &Key, values: &[&kdl::KdlValue]) -> anyhow::Error 
         Set::List(_) => false,
         // A value that names ANOTHER key is the next stray, not this
         // key's choice — echoing it would teach `shell="height"`.
-        Set::FlagOrText(_) => shell_value(value).is_some_and(|mode| match mode {
-            ShellMode::Named(name) => key(&name).is_none(),
-            _ => true,
-        }),
+        Set::FlagOrText(_) => match value.as_bool() {
+            Some(_) => true,
+            None => value
+                .as_string()
+                .filter(|name| !name.trim().is_empty())
+                .is_some_and(|name| key(name).is_none()),
+        },
     };
     let spelling = values
         .iter()
@@ -968,7 +1095,10 @@ fn one_id(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
 /// rules: a ref is a URI FRAGMENT, so a bare string is refused (the
 /// whole non-`#` value space stays reserved for URI-references), and
 /// the empty fragment (the document itself, per RFC 3986) is refused.
-fn title_field(node: &kdl::KdlNode) -> anyhow::Result<crate::core::dashboard_file::TitleDecl> {
+fn title_field(
+    node: &kdl::KdlNode,
+    load: &Load<'_>,
+) -> anyhow::Result<crate::core::dashboard_file::TitleDecl> {
     if let Some(ty) = node.ty() {
         bail!(
             "the ({}) type annotation on `title` has no meaning here — remove it",
@@ -998,6 +1128,16 @@ fn title_field(node: &kdl::KdlNode) -> anyhow::Result<crate::core::dashboard_fil
         if fragment.is_empty() {
             bail!("title ref \"#\" is the whole document — name a pane id, like `ref=\"#header\"`");
         }
+        // A pane id is IDENTITY (INV-3), so a reference here is
+        // refused rather than expanded — a computed id would make
+        // `ref` unresolvable by reading the file.
+        if !Template::extract(fragment).refs.is_empty() {
+            bail!(
+                "title ref \"#{fragment}\": a pane's id is not substitutable — it is the \
+                 `RAT_PANE` value, the anchor a `ref` binds to, and a URI fragment. \
+                 Display text belongs in `title`, which IS substitutable"
+            );
+        }
         if reference.replace(fragment.to_string()).is_some() {
             bail!("`title` is declared twice — a dashboard declares it once");
         }
@@ -1005,14 +1145,16 @@ fn title_field(node: &kdl::KdlNode) -> anyhow::Result<crate::core::dashboard_fil
     if node.children().is_some() {
         bail!("title holds no block — write `title \"Deploy status\"` or `title ref=\"#header\"`");
     }
-    let text =
-        match positional(node).as_slice() {
-            [] => None,
-            [value] => Some(value.as_string().map(str::to_string).ok_or_else(|| {
+    let text = match positional_entries(node).as_slice() {
+        [] => None,
+        [entry] => {
+            let text = entry.value().as_string().ok_or_else(|| {
                 anyhow!("title takes one string — write `title \"Deploy status\"`")
-            })?),
-            _ => bail!("title takes one string — write `title \"Deploy status\"`"),
-        };
+            })?;
+            Some(template_of(text, entry, load)?)
+        }
+        _ => bail!("title takes one string — write `title \"Deploy status\"`"),
+    };
     if text.is_none() && reference.is_none() {
         bail!(
             "title takes a text, a ref=\"#id\", or both — write `title \"Deploy status\"` or `title ref=\"#header\"`"
@@ -1698,15 +1840,11 @@ row {
         assert_eq!(from_kdl.panes.len(), 3);
         assert_eq!(
             from_kdl.panes[0].command,
-            Some(vec!["date".to_string(), "+%H:%M:%S".to_string()])
+            Some(vec!["date".into(), "+%H:%M:%S".into()])
         );
         assert_eq!(
             from_kdl.panes[1].command,
-            Some(vec![
-                "git".to_string(),
-                "branch".to_string(),
-                "--show-current".to_string()
-            ])
+            Some(vec!["git".into(), "branch".into(), "--show-current".into()])
         );
         assert_eq!(from_kdl.defaults.height, Some(7));
         use crate::core::dashboard_file::LayoutDecl;
@@ -1839,13 +1977,16 @@ pane "nested" {
         assert_eq!(
             inline.panes[0].command,
             Some(vec![
-                "git".to_string(),
-                "log".to_string(),
-                "--oneline".to_string(),
-                "-3".to_string(),
+                "git".into(),
+                "log".into(),
+                "--oneline".into(),
+                "-3".into(),
             ])
         );
-        assert_eq!(inline.panes[0].interval.as_deref(), Some("15s"));
+        assert_eq!(
+            inline.panes[0].interval.as_ref().map(Template::as_str),
+            Some("15s")
+        );
         assert_eq!(inline.panes[2].height, Some(4));
         assert_eq!(inline.defaults.height, Some(7));
         assert_eq!(inline.gap, Some(1));
@@ -2072,23 +2213,29 @@ pane "all" {
         .expect("parses");
         let pane = &file.panes[0];
         assert_eq!(pane.id.as_deref(), Some("all"));
-        assert_eq!(
-            pane.command,
-            Some(vec!["git".to_string(), "log".to_string()])
-        );
-        assert_eq!(pane.shell, Some(ShellMode::Direct));
-        assert_eq!(pane.interval.as_deref(), Some("5s"));
+        assert_eq!(pane.command, Some(vec!["git".into(), "log".into()]));
+        assert_eq!(pane.shell, Some(ShellDecl::Direct));
+        assert_eq!(pane.interval.as_ref().map(Template::as_str), Some("5s"));
         assert_eq!(
             pane.trigger,
-            Some(vec!["file:./stamp".to_string(), "file:./notes".to_string()])
+            Some(vec!["file:./stamp".into(), "file:./notes".into()])
         );
-        assert_eq!(pane.trigger_debounce.as_deref(), Some("250ms"));
+        assert_eq!(
+            pane.trigger_debounce.as_ref().map(Template::as_str),
+            Some("250ms")
+        );
         assert_eq!(pane.height, Some(7));
-        assert_eq!(pane.width.as_deref(), Some("2fr"));
-        assert_eq!(pane.overflow.as_deref(), Some("keep-bottom"));
-        assert_eq!(pane.border.as_deref(), Some("rounded"));
-        assert_eq!(pane.padding.as_deref(), Some("0 1"));
-        assert_eq!(pane.title.as_deref(), Some("Recent commits"));
+        assert_eq!(pane.width.as_ref().map(Template::as_str), Some("2fr"));
+        assert_eq!(
+            pane.overflow.as_ref().map(Template::as_str),
+            Some("keep-bottom")
+        );
+        assert_eq!(pane.border.as_ref().map(Template::as_str), Some("rounded"));
+        assert_eq!(pane.padding.as_ref().map(Template::as_str), Some("0 1"));
+        assert_eq!(
+            pane.title.as_ref().map(Template::as_str),
+            Some("Recent commits")
+        );
         assert_eq!(pane.chrome, Some(false));
         assert_eq!(pane.focusable, Some(false));
     }
@@ -2099,7 +2246,10 @@ pane "all" {
         // refusal (into_registry), not a grammar one — the walk reads
         // both.
         let file = parse("pane \"log\" {\n    script \"#!/bin/sh\"\n}\n").expect("parses");
-        assert_eq!(file.panes[0].script.as_deref(), Some("#!/bin/sh"));
+        assert_eq!(
+            file.panes[0].script.as_ref().map(Template::as_str),
+            Some("#!/bin/sh")
+        );
     }
 
     #[test]
@@ -2112,7 +2262,7 @@ pane "all" {
         )
         .expect("parses");
         assert_eq!(
-            file.panes[0].script.as_deref(),
+            file.panes[0].script.as_ref().map(Template::as_str),
             Some("#!/usr/bin/env fish\necho hi")
         );
     }
@@ -2120,7 +2270,10 @@ pane "all" {
     #[test]
     fn a_script_body_may_be_written_as_a_property() {
         let file = parse(r##"pane "log" script="#!/bin/sh\necho hi""##).expect("parses");
-        assert_eq!(file.panes[0].script.as_deref(), Some("#!/bin/sh\necho hi"));
+        assert_eq!(
+            file.panes[0].script.as_ref().map(Template::as_str),
+            Some("#!/bin/sh\necho hi")
+        );
     }
 
     #[test]
@@ -2130,7 +2283,11 @@ pane "all" {
             "pane \"log\" {\n    script #\"\"\"\n        #!/bin/sh\n        printf '%s\\n' hi\n        \"\"\"#\n}\n",
         )
         .expect("parses");
-        let body = file.panes[0].script.as_deref().expect("script");
+        let body = file.panes[0]
+            .script
+            .as_ref()
+            .map(Template::as_str)
+            .expect("script");
         assert!(body.contains("%s\\n"), "{body:?}");
     }
 
@@ -2202,7 +2359,7 @@ pane "all" {
         )
         .expect("parses");
         let title = file.title.expect("declared");
-        assert_eq!(title.text.as_deref(), Some("Fallback"));
+        assert_eq!(title.text.as_ref().map(Template::as_str), Some("Fallback"));
         assert_eq!(title.reference.as_deref(), Some("header"));
     }
 
@@ -2233,9 +2390,15 @@ pane "all" {
         )
         .expect("parses");
         let declared = file.title.expect("declared");
-        assert_eq!(declared.text.as_deref(), Some("Deploy status"));
+        assert_eq!(
+            declared.text.as_ref().map(Template::as_str),
+            Some("Deploy status")
+        );
         assert_eq!(declared.reference, None);
-        assert_eq!(file.panes[0].title.as_deref(), Some("Build log"));
+        assert_eq!(
+            file.panes[0].title.as_ref().map(Template::as_str),
+            Some("Build log")
+        );
         // Undeclared stays absent — the row is not rendered from an
         // empty string.
         let bare = parse("pane \"a\" {\n    height 3\n    command \"date\"\n}\n").expect("parses");
@@ -2475,7 +2638,7 @@ pane "all" {
         )
         .expect("parses");
         assert_eq!(file.panes[0].interval, None);
-        assert_eq!(file.panes[0].command, Some(vec!["date".to_string()]));
+        assert_eq!(file.panes[0].command, Some(vec!["date".into()]));
     }
 
     /// The boundary the "holds no block" rule must not cross: a block
@@ -2487,7 +2650,10 @@ pane "all" {
             "pane \"log\" {\n    height 3\n    interval \"5s\" /-{ junk \"x\" }\n    command \"date\"\n}\n",
         )
         .expect("a slashdashed block is not a block");
-        assert_eq!(file.panes[0].interval.as_deref(), Some("5s"));
+        assert_eq!(
+            file.panes[0].interval.as_ref().map(Template::as_str),
+            Some("5s")
+        );
     }
 
     #[test]
@@ -2526,7 +2692,13 @@ pane "log" {
         )
         .expect("children parse");
         assert_eq!(as_properties, as_children);
-        assert_eq!(as_properties.panes[0].interval.as_deref(), Some("15s"));
+        assert_eq!(
+            as_properties.panes[0]
+                .interval
+                .as_ref()
+                .map(Template::as_str),
+            Some("15s")
+        );
         assert_eq!(as_properties.panes[0].height, Some(7));
     }
 
@@ -2540,7 +2712,10 @@ pane "log" {
         )
         .expect("parses");
         assert_eq!(one_line, block);
-        assert_eq!(one_line.defaults.border.as_deref(), Some("rounded"));
+        assert_eq!(
+            one_line.defaults.border.as_ref().map(Template::as_str),
+            Some("rounded")
+        );
     }
 
     /// A KDL property holds exactly one value, so the two list keys
@@ -2609,23 +2784,20 @@ pane "log" {
     fn a_property_holds_the_same_shell_the_command_split_reads() {
         let file = parse("pane \"x\" shell=#true {\n    command \"date +%H | tr -d x\"\n}\n")
             .expect("parses");
-        assert_eq!(file.panes[0].shell, Some(ShellMode::Platform));
+        assert_eq!(file.panes[0].shell, Some(ShellDecl::Platform));
         assert_eq!(
             file.panes[0].command,
-            Some(vec!["date +%H | tr -d x".to_string()]),
+            Some(vec!["date +%H | tr -d x".into()]),
             "one word under shell stays one word"
         );
         // The split follows runs_a_shell, never WHICH shell: a named
         // shell keeps its script one word exactly as #true does.
         let file = parse("pane \"x\" shell=\"fish\" {\n    command \"date +%H | tr -d x\"\n}\n")
             .expect("parses");
-        assert_eq!(
-            file.panes[0].shell,
-            Some(ShellMode::Named("fish".to_string()))
-        );
+        assert_eq!(file.panes[0].shell, Some(ShellDecl::Named("fish".into())));
         assert_eq!(
             file.panes[0].command,
-            Some(vec!["date +%H | tr -d x".to_string()]),
+            Some(vec!["date +%H | tr -d x".into()]),
             "one word under a named shell stays one word"
         );
     }
@@ -2637,23 +2809,23 @@ pane "log" {
         for (text, wanted) in [
             (
                 "pane \"x\" shell=#true {\n    command \"date\"\n}\n",
-                ShellMode::Platform,
+                ShellDecl::Platform,
             ),
             (
                 "pane \"x\" {\n    shell #true\n    command \"date\"\n}\n",
-                ShellMode::Platform,
+                ShellDecl::Platform,
             ),
             (
                 "pane \"x\" shell=#false {\n    command \"date\"\n}\n",
-                ShellMode::Direct,
+                ShellDecl::Direct,
             ),
             (
                 "pane \"x\" shell=\"fish\" {\n    command \"date\"\n}\n",
-                ShellMode::Named("fish".to_string()),
+                ShellDecl::Named("fish".into()),
             ),
             (
                 "pane \"x\" {\n    shell \"fish\"\n    command \"date\"\n}\n",
-                ShellMode::Named("fish".to_string()),
+                ShellDecl::Named("fish".into()),
             ),
         ] {
             let file = parse(text).expect("parses");
@@ -3281,5 +3453,187 @@ variables {{
         })
         .expect("resolves");
         assert_eq!(out.keys().collect::<Vec<_>>(), vec!["p"]);
+    }
+
+    // ─── Name validation at every string site ───────────────────────
+
+    #[test]
+    fn an_unknown_variable_refuses_the_board_and_points_at_the_reference() {
+        let err = vars_err(
+            "variables {\n    plan \"/tmp/x\"\n}\n\npane \"a\" {\n    command \"true\"\n    height 3\n    title \"plan {{plna}}\"\n}\n",
+        );
+        assert!(err.starts_with("line 8, column "), "placed: {err}");
+        assert!(
+            err.contains("unknown variable `plna`"),
+            "names the variable: {err}"
+        );
+        assert!(
+            err.contains("declared variables are plan"),
+            "lists the declared set: {err}"
+        );
+        // The house's rustc-style echo, the same contract
+        // `a_kdl_syntax_error_carries_its_line_and_column` pins.
+        assert!(
+            err.contains("title \"plan {{plna}}\""),
+            "echoes the line: {err}"
+        );
+    }
+
+    #[test]
+    fn a_board_with_no_variables_block_says_so_rather_than_listing_nothing() {
+        let err = vars_err(
+            "pane \"a\" {\n    command \"true\"\n    height 3\n    title \"{{plan}}\"\n}\n",
+        );
+        assert!(err.contains("unknown variable `plan`"), "got {err}");
+        assert!(
+            err.contains("this board declares no variables"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn the_column_points_inside_the_value_at_the_reference_itself() {
+        // Not at the key, not at the line: at the `{{`. The property
+        // spelling and the child-node spelling both.
+        let err =
+            vars_err("pane \"a\" title=\"ok {{nope}}\" {\n    command \"true\"\n    height 3\n}\n");
+        assert!(err.starts_with("line 1, column 20: "), "got {err}");
+        // `    border "x{{nope}}"` — four spaces, `border` (5-10), a
+        // space, the opening quote at 12, `x` at 13, so the `{{` opens at
+        // column 14. `line_column` counts columns from 1.
+        let err = vars_err(
+            "pane \"a\" {\n    command \"true\"\n    height 3\n    border \"x{{nope}}\"\n}\n",
+        );
+        assert!(err.starts_with("line 4, column 14: "), "got {err}");
+    }
+
+    #[test]
+    fn every_value_shape_route_records_and_validates() {
+        // The three routes the schema's own design forces: a property
+        // (`prop_text`), a child node (`one_text`), and a list
+        // (`many_text` — the ONLY spelling `command` and `trigger` have).
+        let file = parse(
+            "variables {\n    p \"0028\"\n}\n\npane \"a\" title=\"t {{p}}\" {\n    command \"git\" \"log\" \"{{p}}\"\n    trigger \"file:{{p}}/stamp\"\n    interval \"5s\"\n    height 3\n}\n",
+        )
+        .expect("parses");
+        let pane = &file.panes[0];
+        assert_eq!(
+            pane.title.as_ref().map(|t| t.refs.as_slice()),
+            Some(&["p".to_string()][..])
+        );
+        assert_eq!(
+            pane.command.as_ref().unwrap()[2].refs,
+            vec!["p".to_string()]
+        );
+        assert_eq!(
+            pane.trigger.as_ref().unwrap()[0].refs,
+            vec!["p".to_string()]
+        );
+        // And the walk NEVER expands (INV-2) — the bytes are the author's.
+        assert_eq!(pane.title.as_ref().unwrap().text, "t {{p}}");
+        // A template-free value records nothing: the common case, and
+        // the path spawn-time expansion short-circuits.
+        assert!(pane.interval.as_ref().unwrap().refs.is_empty());
+
+        for bad in [
+            "pane \"a\" title=\"{{q}}\" { command \"true\"\nheight 3 }",
+            "pane \"a\" { command \"true\"\nheight 3\ntitle \"{{q}}\" }",
+            "pane \"a\" { command \"git\" \"{{q}}\"\nheight 3 }",
+            "pane \"a\" { command \"true\"\nheight 3\ntrigger \"file:{{q}}\" }",
+        ] {
+            let err = vars_err(&format!("variables {{\n    p \"x\"\n}}\n{bad}\n"));
+            assert!(err.contains("unknown variable `q`"), "{bad} → {err}");
+        }
+    }
+
+    #[test]
+    fn a_declaration_position_route_validates_inside_defaults_too() {
+        // INV-2 claims a `{{name}}` in `defaults` and one on a pane are
+        // identical, because expansion happens after inheritance either
+        // way. That identity is the claim under test — here on the
+        // validation half.
+        let err = vars_err(
+            "variables {\n    p \"x\"\n}\n\ndefaults {\n    height 3\n    border \"{{q}}\"\n}\n\npane \"a\" { command \"true\" }\n",
+        );
+        assert!(err.contains("unknown variable `q`"), "got {err}");
+        let file = parse(
+            "variables {\n    p \"x\"\n}\n\ndefaults {\n    height 3\n    border \"{{p}}\"\n}\n\npane \"a\" { command \"true\" }\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            file.defaults.border.as_ref().map(|t| t.refs.as_slice()),
+            Some(&["p".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn a_variables_block_written_below_its_first_reference_still_answers() {
+        // Position carries no meaning anywhere in this format (INV-3).
+        // The block is built before ANY string site is read, so a board
+        // that declares its variables at the bottom behaves identically.
+        parse("pane \"a\" {\n    command \"true\"\n    height 3\n    title \"{{p}}\"\n}\n\nvariables {\n    p \"x\"\n}\n")
+            .expect("the block is found wherever it is written");
+    }
+
+    #[test]
+    fn a_shell_dialect_name_is_a_string_site_like_any_other() {
+        let err = vars_err(
+            "variables {\n    p \"fish\"\n}\n\npane \"a\" shell=\"{{q}}\" { command \"true\"\nheight 3 }\n",
+        );
+        assert!(err.contains("unknown variable `q`"), "got {err}");
+        // A declared one is accepted, and the SPLIT is unaffected: any
+        // non-empty string is `ShellDecl::Named`, and `runs_a_shell()` is
+        // true for it whatever the name expands to later.
+        let file = parse(
+            "variables {\n    p \"fish\"\n}\n\npane \"a\" shell=\"{{p}}\" { command \"git log -3\"\nheight 3 }\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            file.panes[0].command.as_ref().unwrap().len(),
+            1,
+            "one word under a shell"
+        );
+    }
+
+    #[test]
+    fn the_dashboards_own_title_is_a_string_site_and_its_ref_is_not() {
+        let err = vars_err(
+            "variables {\n    p \"x\"\n}\ntitle \"board {{q}}\"\npane \"a\" { command \"true\"\nheight 3 }\n",
+        );
+        assert!(err.contains("unknown variable `q`"), "got {err}");
+        // INV-3: a pane id is IDENTITY — the `RAT_PANE` value, the anchor
+        // a `ref` binds to, a URI fragment. A computed one would make
+        // `ref` unresolvable by reading the file, so a reference in a
+        // `ref` is refused rather than expanded.
+        let err = vars_err(
+            "variables {\n    p \"a\"\n}\ntitle ref=\"#{{p}}\"\npane \"a\" { command \"true\"\nheight 3 }\n",
+        );
+        assert!(
+            err.contains("a pane's id is not substitutable"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_pane_id_keeps_the_refusal_it_already_had() {
+        // No new rule needed: the RFC 3986 charset check in `one_id`
+        // already refuses `{` and `}`, and its message already sends
+        // display text to `title`, which IS substitutable.
+        let err = vars_err("pane \"{{p}}\" { command \"true\"\nheight 3 }\n");
+        assert!(
+            err.contains("a pane's id sticks to letters, digits"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_brace_run_that_is_no_reference_never_reaches_validation() {
+        // The awk body that made `$name` unusable. It parses, records no
+        // references, and keeps its bytes.
+        let file = parse(
+            "pane \"a\" {\n    command \"awk '{{print $1}}' f\"\n    shell #true\n    height 3\n}\n",
+        )
+        .expect("an awk body is not a template");
+        assert!(file.panes[0].command.as_ref().unwrap()[0].refs.is_empty());
     }
 }

@@ -1191,3 +1191,21 @@ fn an_env_shebang_finds_its_interpreter_on_the_path() {
         .success()
         .stdout(predicates::str::contains("found-on-path"));
 }
+
+#[test]
+fn an_unknown_variable_names_itself_and_the_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    plan \"/tmp/x\"\n}\n\npane \"a\" {\n    command \"true\"\n    height 3\n    title \"{{plna}}\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown variable `plna`"))
+        .stderr(predicates::str::contains("declared variables are plan"))
+        .stderr(predicates::str::contains("board.kdl"));
+}
