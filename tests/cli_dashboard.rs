@@ -1555,13 +1555,23 @@ fn the_same_content_under_shell_runs_as_a_command_line() {
     assert!(stdout.contains("hi"), "{stdout}");
 }
 
+/// The reference sits in a command the body's head never reaches, and
+/// the platform shell spells "then run this too" its own way: `sh -c`
+/// takes a newline, while `cmd /C` takes ONE command line — a second
+/// LINE handed to cmd is simply never run — so cmd sequences with `&`.
 #[test]
 fn a_script_body_expands_at_spawn() {
     let dir = tempfile::tempdir().expect("tempdir");
+    #[cfg(unix)]
+    let then = "\\n";
+    #[cfg(windows)]
+    let then = " & ";
     let file = fixture(
         dir.path(),
         "board.kdl",
-        "variables {\n    msg \"expanded-at-spawn\"\n}\n\npane \"p\" {\n    height 2\n    chrome #false\n    border \"none\"\n    shell #true\n    script \"echo start\\necho {{msg}}\"\n}\n",
+        &format!(
+            "variables {{\n    msg \"expanded-at-spawn\"\n}}\n\npane \"p\" {{\n    height 2\n    chrome #false\n    border \"none\"\n    shell #true\n    script \"echo start{then}echo {{{{msg}}}}\"\n}}\n"
+        ),
     );
     let assert = rat()
         .env("NO_COLOR", "1")
