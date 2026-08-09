@@ -534,6 +534,16 @@ it every time. The same applies to a nested `rat dashboard … --once`:
 the inner panes all run once per outer tick, and an inner `interval`
 has nothing to schedule.
 
+**A key action is where a side effect belongs.** None of the above is
+a rule against a board doing things — it is a rule about cadence. A
+pane's command is a bad place for a write because it re-runs on events
+that have nothing to do with it; a binding has no cadence at all. It
+runs once, on demand, exactly when someone pressed the key. So the
+write a pane must not make — stage the change, run the migration,
+rerun the suite — belongs in a `key` node, and the panes find out the
+way they find out about everything else: on their next interval or
+trigger. See Key actions below.
+
 **A deferred variable is a command on the pane's schedule.** A
 `variables` entry with `defer=#true` re-runs its command at every spawn
 of every pane that references it — that is what deferred means, and
@@ -682,6 +692,85 @@ a raw string that stays literal — and
 paths derive at load, so the same file works in a primary checkout, a
 linked worktree, or a clone. Every one of these ships inside the
 binary too: `rat dashboard init --list`.
+
+#### Key actions
+
+A board can bind a key to a command. Press it and the command runs
+once.
+
+```kdl
+key "r" {
+    description "rerun the suite"
+    command "cargo" "test" "--all"
+}
+```
+
+`description` is required. `?` is the only place a board's own keys
+are listed, so a binding nothing advertises is one nobody finds.
+
+The positional is the key's spelling: a printable character (`"r"`,
+`"R"`, `"7"`), or `"Alt-"` and one of those (`"Alt-r"`) — apart from
+`Alt-[`, `Alt-]` and `Alt-O`, three that rat's key reader spends on
+escape sequences and so can never see as an Alt key. Case matters —
+`r` and `R` are two different bindings. The named keys rat can read
+the same way on every platform are all taken by built-ins already, so
+in practice a binding names a character or an `Alt-` chord. Anything
+else — a function key, a `Ctrl` chord, a character outside ASCII — is
+refused when the board loads, with the list of what is spellable,
+because the ceiling is not visible from the file. A key the dashboard
+already uses is refused the same way: a built-in wins, and it wins
+with an error rather than by quietly swallowing the binding.
+
+`command` and `script` are a pane's own two program forms, unchanged,
+and `shell` inherits from `defaults` exactly as a pane's does. What a
+binding adds is what happens around the command:
+
+```kdl
+key "R" {
+    description "release the current branch"
+    when "git diff --quiet"        // decline if the tree is dirty
+    confirm "Release this branch?" // ask before running
+    output "status"                // hide | status | pager
+    command "./release.sh"
+}
+```
+
+`output` defaults to `status`: one line on the status row naming the
+binding and how it exited. `hide` is quiet when the command worked — a
+failure still says so, naming the binding, because a silent failure is
+a key that looks broken. `pager` hands the command's output to the
+pager, the way `v` hands it a pane's body.
+
+**`when` decides before anything else happens.** The order is fixed:
+`when`, then `confirm`, then the command. A non-zero exit from `when`
+declines the binding — no question is asked, no command is spawned,
+and one status line names the key, so a guarded binding reads as a
+decision rather than a dead key. Write the guard in `when` rather than
+at the top of the command: a guard inside the command fires after the
+question has already been answered, which is the wrong end of the
+interaction. The convention is the shell's own, the one `test` and
+`if` already use — zero runs it, non-zero does not.
+
+**Actions are asynchronous unless they need the screen.** A binding's
+command runs on a worker, exactly the way a pane's child does, so the
+board keeps ticking and repainting while a slow one runs: a
+five-minute test run does not freeze the frame. The exception is the
+disposition that needs the terminal itself — `output "pager"`
+suspends the frame, runs, and resumes, because a pager and a
+dashboard cannot both own the screen. Everything else stays live.
+
+**Keys exist only where a key can arrive.** A piped board, a `--once`
+board, and a board whose output is not a terminal have no bindings and
+no binding help; they render exactly as the same board with its `key`
+nodes deleted.
+
+**rat keeps nothing about what the command did.** There is no action
+result, no output buffer that outlives the status line, no "last
+action". A key action changes the world, and the board finds out the
+way it finds out about everything else — its panes re-run, on their
+intervals and on their triggers.
+
+`?` lists every key the board declares, with its description.
 
 ### `rat frame` — flicker-free repaint for script-owned loops
 
