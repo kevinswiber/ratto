@@ -178,9 +178,6 @@ impl Template {
 
     /// The recorded flavor: `true` for a normal string, `false` for a
     /// raw one (and for `literal`-constructed values generally).
-    // The site rule's positional guard is this accessor's production
-    // caller; until it lands only tests read it.
-    #[allow(dead_code)]
     pub fn interpolates(&self) -> bool {
         self.interpolates
     }

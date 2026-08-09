@@ -26,8 +26,9 @@ use crate::core::registry::{
     LayoutNode, Overflow, PaneBox, PaneWidth, Registry, ShellDecl, ShellMode, SourceId,
     SourceProgram, SourceSpec, TitleSource, shebang,
 };
-use crate::core::template::Template;
+use crate::core::template::{Template, reference_at};
 use crate::core::trigger::parse_trigger;
+use crate::core::variables::{Tier, VariableBlock};
 
 /// `rat watch --trigger-debounce`'s default, reused verbatim so a pane
 /// and a watch behave the same when neither says otherwise.
@@ -174,8 +175,8 @@ impl DashboardFile {
         let mut sources = Vec::with_capacity(self.panes.len());
         let mut boxes = Vec::with_capacity(self.panes.len());
         for (decl, name) in self.panes.iter().zip(&names) {
-            sources.push(resolve_source(decl, &self.defaults, name)?);
-            boxes.push(resolve_box(decl, &self.defaults, name)?);
+            sources.push(resolve_source(decl, &self.defaults, &self.variables, name)?);
+            boxes.push(resolve_box(decl, &self.defaults, &self.variables, name)?);
         }
         let layout = resolve_layout(self.layout.as_deref(), &names)?;
         Ok(Registry::panes(
@@ -194,6 +195,14 @@ impl DashboardFile {
     /// follow everywhere); an id nothing declares is a load error
     /// that lists what exists.
     fn resolve_title(&self, names: &[String]) -> anyhow::Result<TitleSource> {
+        if let Some(TitleDecl {
+            text: Some(text), ..
+        }) = &self.title
+        {
+            // The dashboard's own title is a render decision made
+            // once — a load-time site like the pane's.
+            refuse_deferred_at_load_site(text, "title", false, &self.variables, "the dashboard")?;
+        }
         Ok(match self.title.clone() {
             None => TitleSource::None,
             Some(TitleDecl {
@@ -297,9 +306,133 @@ fn shell_mode(decl: &ShellDecl) -> ShellMode {
     }
 }
 
-fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result<SourceSpec> {
+/// The effective value AND where it was written. Replaces the bare
+/// `decl.X.or(defaults.X)` at every site the INV-7 check touches,
+/// because a refusal that cannot say "inherited from `defaults`" sends
+/// the author to the wrong line.
+///
+/// The origin bit is read ONLY by the refusal messages, so most call
+/// sites discard it — that is not a licence to simplify this back to
+/// `.or()`: passing a literal `false` compiles fine and merely turns
+/// every inherited refusal into one that points at the wrong line.
+/// Later consumers (load-time expansion's messages, the check
+/// command's site report) read the same bit; check them before
+/// "tidying" this away.
+fn inherit<'a, T>(own: Option<&'a T>, defaults: Option<&'a T>) -> Option<(&'a T, bool)> {
+    own.map(|v| (v, false))
+        .or_else(|| defaults.map(|v| (v, true)))
+}
+
+/// INV-7: a site whose value is parsed into a typed thing at load must
+/// be complete at load, because a hole cannot be parsed.
+///
+/// The check is ONE LEVEL DEEP — "is any name this string directly
+/// references deferred?" — and that is sufficient only because the
+/// block's tier check refused the load-time-references-deferred case
+/// (INV-9 clause 2), pinned by
+/// `an_effective_tier_never_outruns_its_declared_form`. If clause 2 is
+/// ever relaxed to auto-promotion, this must become a transitive walk
+/// on the same day; the two are a matched pair.
+///
+/// It reads `Template::refs` and NEVER re-scans the bytes, so a raw
+/// string — whose record says it references nothing (INV-1) — is
+/// accepted here without the function ever asking whether the value
+/// was raw. That absence of a special case is the design working, and
+/// `Template`'s deliberately missing `Deref<Target = str>` is what
+/// enforces it: reaching for the bytes costs a visible `.as_str()`.
+fn refuse_deferred_at_load_site(
+    value: &Template,
+    site: &str,
+    inherited: bool,
+    block: &VariableBlock,
+    subject: &str,
+) -> anyhow::Result<()> {
+    if let Some(name) = value
+        .refs()
+        .iter()
+        .find(|name| block.tier(name) == Some(Tier::Spawn))
+    {
+        let origin = if inherited {
+            " (inherited from `defaults`)"
+        } else {
+            ""
+        };
+        bail!(
+            "{subject}: `{site}`{origin} is read when the dashboard loads, but its \
+             value references `{{{{{name}}}}}`, and `{name}` is declared `defer=#true` \
+             — a deferred variable is re-derived at each spawn, and a value parsed \
+             once at load has nowhere to put a hole. Drop `defer` from `{name}`, or \
+             move the value into the pane's `command`, which IS read at spawn"
+        );
+    }
+    Ok(())
+}
+
+/// INV-7's first sub-rule, exactly as narrow as its justification
+/// (NEW-1): the shebang classifier reads a body's first TWO bytes, and
+/// consumes the rest of the first line only when they are `#!`. So a
+/// body may not BEGIN with a `{{` reference, and a `#!` first line
+/// must be template-free — nothing more. A body starting with `[ "` or
+/// `echo` is already classified correctly at load, so a `{{rev}}`
+/// guard on line 1 is fine.
+fn script_first_bytes(body: &Template, subject: &str) -> anyhow::Result<()> {
+    // A raw body is literal end to end (INV-1), so nothing here can
+    // apply. THIS GUARD IS `reference_at`'s DOCUMENTED PRECONDITION,
+    // not a local optimization: it reads bytes, and a raw body's bytes
+    // are indistinguishable from a normal one's — asking it about a
+    // raw string finds a reference INV-1 says is not there.
+    if !body.interpolates() {
+        return Ok(());
+    }
+    let text = body.as_str();
+    if text.starts_with("#!") {
+        // The classifier reads this whole line — including the one
+        // optional argument — so this whole line must be literal, and
+        // nothing beyond it.
+        let first = text.split('\n').next().unwrap_or(text);
+        if let Some(name) = Template::extract(first).refs().first() {
+            bail!(
+                "{subject}: this `script` body's `#!` line references `{{{{{name}}}}}` — \
+                 the `#!` line names the body's interpreter and is read at load, before \
+                 any variable expands, so it must be written out in full. Write the \
+                 interpreter literally, or drop the `#!` line to run the body through \
+                 the pane's shell"
+            );
+        }
+        return Ok(());
+    }
+    // TWO BYTES, not a line — and "begins with a REFERENCE", not
+    // "begins with `{{`": the one reference scanner decides, so a
+    // jq-shaped `{{ }` or an inner-whitespace `{{ rev }}` stays
+    // literal text.
+    if let Some((name, _)) = reference_at(text, 0) {
+        bail!(
+            "{subject}: this `script` body begins with `{{{{{name}}}}}` — rat reads a \
+             body's first two bytes at load to see whether it names its own \
+             interpreter (`#!`), and it cannot read a hole. Begin the body with \
+             literal text: `echo {{{{{name}}}}}` rather than `{{{{{name}}}}}`"
+        );
+    }
+    Ok(())
+}
+
+fn resolve_source(
+    decl: &PaneDecl,
+    defaults: &PaneDecl,
+    block: &VariableBlock,
+    id: &str,
+) -> anyhow::Result<SourceSpec> {
     let defaults_shell = defaults.shell.clone().unwrap_or_default();
     let shell = decl.shell.clone().unwrap_or_else(|| defaults_shell.clone());
+    // The dialect name is a string an author writes, read once at load
+    // to make a dispatch decision — a load-time site like any other.
+    // The row destructures `Named` and uses the one generic site
+    // function; no row gets a bespoke check.
+    if let Some((ShellDecl::Named(name), inherited)) =
+        inherit(decl.shell.as_ref(), defaults.shell.as_ref())
+    {
+        refuse_deferred_at_load_site(name, "shell", inherited, block, &at(id))?;
+    }
     let live = decl.live.or(defaults.live).unwrap_or(false);
     if decl.command.is_some() && decl.script.is_some() {
         bail!(
@@ -311,10 +444,10 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
     // The effective program: own beats inherited, even across kinds (a
     // pane's `command` overrides a defaults `script`).
     let inherits_program = decl.command.is_none() && decl.script.is_none();
-    let script = decl.script.as_ref().map(Template::as_str).or_else(|| {
+    let script = decl.script.as_ref().or_else(|| {
         decl.command
             .is_none()
-            .then_some(defaults.script.as_ref().map(Template::as_str))
+            .then_some(defaults.script.as_ref())
             .flatten()
     });
     let (program, shell) = if let Some(body) = script {
@@ -362,20 +495,26 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
         )
     };
 
-    let triggers = decl
-        .trigger
-        .clone()
-        .or_else(|| defaults.trigger.clone())
+    let picked_triggers = inherit(decl.trigger.as_ref(), defaults.trigger.as_ref());
+    if let Some((specs, inherited)) = &picked_triggers {
+        // Each element, so a board with four triggers is told which
+        // one is wrong.
+        for spec in specs.iter() {
+            refuse_deferred_at_load_site(spec, "trigger", *inherited, block, &at(id))?;
+        }
+    }
+    let triggers = picked_triggers
+        .map(|(specs, _)| specs.clone())
         .unwrap_or_default()
         .iter()
         .map(|spec| parse_trigger(spec.as_str()).with_context(|| at(id)))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let token = decl
-        .interval
-        .as_ref()
-        .or(defaults.interval.as_ref())
-        .map(Template::as_str);
+    let picked_interval = inherit(decl.interval.as_ref(), defaults.interval.as_ref());
+    if let Some((value, inherited)) = picked_interval {
+        refuse_deferred_at_load_site(value, "interval", inherited, block, &at(id))?;
+    }
+    let token = picked_interval.map(|(value, _)| value.as_str());
     let interval = match (token, triggers.is_empty()) {
         (Some("never"), _) => None,
         (Some(token), _) => Some(parse_interval(token).with_context(|| at(id))?),
@@ -383,12 +522,14 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
         (None, true) => Some(DEFAULT_INTERVAL),
     };
 
-    let debounce = match decl
-        .trigger_debounce
-        .as_ref()
-        .or(defaults.trigger_debounce.as_ref())
-        .map(Template::as_str)
-    {
+    let picked_debounce = inherit(
+        decl.trigger_debounce.as_ref(),
+        defaults.trigger_debounce.as_ref(),
+    );
+    if let Some((value, inherited)) = picked_debounce {
+        refuse_deferred_at_load_site(value, "trigger-debounce", inherited, block, &at(id))?;
+    }
+    let debounce = match picked_debounce.map(|(value, _)| value.as_str()) {
         Some(token) => parse_interval(token).with_context(|| at(id))?,
         None => DEFAULT_DEBOUNCE,
     };
@@ -419,7 +560,7 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
 /// `#false` is refused, absence promotes to the platform's shell, and
 /// the inherit-guard applies exactly as it does to a `command`.
 fn resolve_script(
-    body: &str,
+    body: &Template,
     decl: &PaneDecl,
     defaults: &PaneDecl,
     shell: &ShellDecl,
@@ -427,14 +568,15 @@ fn resolve_script(
     inherited: bool,
     id: &str,
 ) -> anyhow::Result<(SourceProgram, ShellDecl)> {
-    if body.trim().is_empty() {
+    if body.as_str().trim().is_empty() {
         bail!(
             "{}: `script` has no body — write the script inside a `\"\"\"` \
              block, or drop the key",
             at(id)
         );
     }
-    match shebang(body) {
+    script_first_bytes(body, &at(id))?;
+    match shebang(body.as_str()) {
         Some(line) => {
             if let Some(own) = &decl.shell
                 && own.runs_a_shell()
@@ -454,10 +596,13 @@ fn resolve_script(
                     shell_label(own),
                 );
             }
-            Ok((SourceProgram::Script(body.to_string()), shell.clone()))
+            Ok((
+                SourceProgram::Script(body.as_str().to_string()),
+                shell.clone(),
+            ))
         }
         None => {
-            let first = body.lines().next().unwrap_or("");
+            let first = body.as_str().lines().next().unwrap_or("");
             if first.trim_start().starts_with("#!") {
                 bail!(
                     "{}: the `#!` line must be the body's first two bytes, \
@@ -492,24 +637,31 @@ fn resolve_script(
                 ShellDecl::Direct => ShellDecl::Platform,
                 other => other.clone(),
             };
-            Ok((SourceProgram::Script(body.to_string()), shell))
+            Ok((SourceProgram::Script(body.as_str().to_string()), shell))
         }
     }
 }
 
-fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result<PaneBox> {
+fn resolve_box(
+    decl: &PaneDecl,
+    defaults: &PaneDecl,
+    block: &VariableBlock,
+    id: &str,
+) -> anyhow::Result<PaneBox> {
+    // `height` takes no site check: it is an integer, and integers
+    // never pass the string chokepoint — there is no "what if the
+    // variable isn't a number" error class at all (INV-3).
     let height = decl.height.or(defaults.height).ok_or_else(|| {
         anyhow!(
             "{}: needs a `height` — declare one on the pane or in `defaults`",
             at(id)
         )
     })?;
-    let width = match decl
-        .width
-        .as_ref()
-        .or(defaults.width.as_ref())
-        .map(Template::as_str)
-    {
+    let picked_width = inherit(decl.width.as_ref(), defaults.width.as_ref());
+    if let Some((value, inherited)) = picked_width {
+        refuse_deferred_at_load_site(value, "width", inherited, block, &at(id))?;
+    }
+    let width = match picked_width.map(|(value, _)| value.as_str()) {
         None | Some("auto") => PaneWidth::Weight(1),
         Some(token) => parse_width(token, id)?,
     };
@@ -519,11 +671,11 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result
     // keeping the head on one silently kills the `D` and `c` change
     // marks, so declaring it is an error rather than a preference.
     let live = decl.live.or(defaults.live).unwrap_or(false);
-    let declared_overflow = decl
-        .overflow
-        .as_ref()
-        .or(defaults.overflow.as_ref())
-        .map(Template::as_str);
+    let picked_overflow = inherit(decl.overflow.as_ref(), defaults.overflow.as_ref());
+    if let Some((value, inherited)) = picked_overflow {
+        refuse_deferred_at_load_site(value, "overflow", inherited, block, &at(id))?;
+    }
+    let declared_overflow = picked_overflow.map(|(value, _)| value.as_str());
     let overflow = match (declared_overflow, live) {
         (None, true) => Overflow::KeepBottom,
         (None, false) => Overflow::KeepTop,
@@ -541,21 +693,19 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result
             at(id)
         ),
     };
-    let border = match decl
-        .border
-        .as_ref()
-        .or(defaults.border.as_ref())
-        .map(Template::as_str)
-    {
+    let picked_border = inherit(decl.border.as_ref(), defaults.border.as_ref());
+    if let Some((value, inherited)) = picked_border {
+        refuse_deferred_at_load_site(value, "border", inherited, block, &at(id))?;
+    }
+    let border = match picked_border.map(|(value, _)| value.as_str()) {
         None => BorderPreset::None,
         Some(token) => parse_border(token, id)?,
     };
-    let padding = match decl
-        .padding
-        .as_ref()
-        .or(defaults.padding.as_ref())
-        .map(Template::as_str)
-    {
+    let picked_padding = inherit(decl.padding.as_ref(), defaults.padding.as_ref());
+    if let Some((value, inherited)) = picked_padding {
+        refuse_deferred_at_load_site(value, "padding", inherited, block, &at(id))?;
+    }
+    let padding = match picked_padding.map(|(value, _)| value.as_str()) {
         None => Sides::default(),
         Some(token) => parse_sides(token).with_context(|| at(id))?,
     };
@@ -565,11 +715,13 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result
         overflow,
         border,
         padding,
-        title: decl
-            .title
-            .as_ref()
-            .or(defaults.title.as_ref())
-            .map(|title| title.as_str().to_string()),
+        title: {
+            let picked = inherit(decl.title.as_ref(), defaults.title.as_ref());
+            if let Some((value, inherited)) = picked {
+                refuse_deferred_at_load_site(value, "title", inherited, block, &at(id))?;
+            }
+            picked.map(|(title, _)| title.as_str().to_string())
+        },
         chrome: decl.chrome.or(defaults.chrome).unwrap_or(true),
         focusable: decl.focusable.or(defaults.focusable).unwrap_or(true),
     })
@@ -1704,5 +1856,263 @@ mod tests {
         assert!(err.contains("sizeless"), "{err}");
         assert!(err.contains("height"), "{err}");
         assert!(err.contains("defaults"), "{err}");
+    }
+    // ─── INV-7: the site rule ───────────────────────────────────────
+
+    /// Parse a board and run the ONE validation path; a board that
+    /// fails either stage yields its error text.
+    fn load_err(text: &str) -> String {
+        match crate::core::dashboard_kdl::parse_styled(text, false) {
+            Err(err) => format!("{err:#}"),
+            Ok(file) => format!(
+                "{:#}",
+                file.into_registry(&Bindings::new()).expect_err("refused")
+            ),
+        }
+    }
+
+    fn load_result(text: &str) -> anyhow::Result<Registry> {
+        crate::core::dashboard_kdl::parse_styled(text, false)
+            .expect("parses")
+            .into_registry(&Bindings::new())
+    }
+
+    /// The site-rule sentence's fingerprint — what a reject must carry
+    /// and an accept must not.
+    const SITE_PHRASE: &str = "is read when the dashboard loads";
+
+    fn deferred_board(site_line: &str) -> String {
+        format!(
+            "variables {{\n    x \"echo v\" shell=#true defer=#true\n}}\n\npane \"p\" {{\n    command \"true\"\n    height 3\n    {site_line}\n}}\n"
+        )
+    }
+
+    fn load_tier_board(site_line: &str) -> String {
+        format!(
+            "variables {{\n    x \"echo v\" shell=#true\n}}\n\npane \"p\" {{\n    command \"true\"\n    height 3\n    {site_line}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn every_load_time_site_refuses_a_deferred_reference_and_accepts_a_load_one() {
+        // The matrix, not a checklist: each load-time site must REJECT
+        // a deferred reference (naming both the variable and the site)
+        // and ACCEPT a non-deferred one (whose only failures are the
+        // token parser's own).
+        for (site_line, site) in [
+            ("trigger \"file:{{x}}\"", "trigger"),
+            ("interval \"{{x}}\"", "interval"),
+            ("trigger-debounce \"{{x}}\"", "trigger-debounce"),
+            ("width \"{{x}}\"", "width"),
+            ("overflow \"{{x}}\"", "overflow"),
+            ("border \"{{x}}\"", "border"),
+            ("padding \"{{x}}\"", "padding"),
+            ("title \"{{x}}\"", "title"),
+            ("shell \"{{x}}\"", "shell"),
+        ] {
+            let err = load_err(&deferred_board(site_line));
+            assert!(err.contains(SITE_PHRASE), "{site} rejects: {err}");
+            assert!(err.contains(&format!("`{site}`")), "{site} named: {err}");
+            assert!(err.contains("`x`"), "the variable named: {err}");
+
+            match load_result(&load_tier_board(site_line)) {
+                Ok(_) => {}
+                Err(err) => {
+                    let err = format!("{err:#}");
+                    assert!(
+                        !err.contains(SITE_PHRASE),
+                        "{site} accepts a load-tier reference; any failure is the \
+                         token parser's own: {err}"
+                    );
+                }
+            }
+        }
+        // The dashboard's own title is a site too.
+        let err = load_err(
+            "variables {\n    x \"echo v\" shell=#true defer=#true\n}\ntitle \"{{x}}\"\npane \"p\" {\n    command \"true\"\n    height 3\n}\n",
+        );
+        assert!(err.contains(SITE_PHRASE), "{err}");
+        assert!(err.contains("`title`"), "{err}");
+
+        // Rows 7 and 8 — the halves that catch an over-broad
+        // implementation: `command` argv and a `script` body past the
+        // classifier are SPAWN sites and must accept a deferred
+        // reference.
+        load_result(&deferred_board("")).expect("a bare pane loads");
+        load_result(
+            "variables {\n    x \"echo v\" shell=#true defer=#true\n}\n\npane \"p\" {\n    command \"echo {{x}}\"\n    shell #true\n    height 3\n}\n",
+        )
+        .expect("a deferred reference in command argv is the point of defer");
+        load_result(
+            "variables {\n    x \"echo v\" shell=#true defer=#true\n}\n\npane \"p\" {\n    script \"echo {{x}}\"\n    height 3\n}\n",
+        )
+        .expect("a script body past the classifier is a spawn site");
+    }
+
+    #[test]
+    fn both_value_shapes_are_checked() {
+        // This schema's history is that a rule holds on one spelling
+        // and quietly does not hold on the other.
+        let err = load_err(
+            "variables {\n    x \"echo v\" shell=#true defer=#true\n}\n\npane \"p\" interval=\"{{x}}\" {\n    command \"true\"\n    height 3\n}\n",
+        );
+        assert!(err.contains(SITE_PHRASE), "property spelling: {err}");
+        let err = load_err(&deferred_board("interval \"{{x}}\""));
+        assert!(err.contains(SITE_PHRASE), "child-node spelling: {err}");
+        let err = load_err(&deferred_board("trigger \"file:./a\" \"file:{{x}}\""));
+        assert!(err.contains(SITE_PHRASE), "list shape: {err}");
+    }
+
+    #[test]
+    fn an_inherited_value_names_the_pane_and_says_it_came_from_defaults() {
+        let err = load_err(
+            "variables {\n    iv \"echo v\" shell=#true defer=#true\n}\n\ndefaults {\n    interval \"{{iv}}\"\n}\n\npane \"p\" {\n    command \"true\"\n    height 3\n}\n",
+        );
+        assert!(err.contains("pane \"p\""), "names the pane: {err}");
+        assert!(
+            err.contains("inherited from `defaults`"),
+            "says where to edit: {err}"
+        );
+        // The accept half, at this task's own boundary: the same board
+        // with a load-tier variable passes the SITE check; expansion
+        // equality is the load-time-expansion task's claim, not this
+        // one's.
+        match load_result(
+            "variables {\n    iv \"echo v\" shell=#true\n}\n\ndefaults {\n    interval \"{{iv}}\"\n}\n\npane \"p\" {\n    command \"true\"\n    height 3\n}\n",
+        ) {
+            Ok(_) => {}
+            Err(err) => {
+                let err = format!("{err:#}");
+                assert!(!err.contains(SITE_PHRASE), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_raw_string_holding_a_deferred_reference_is_accepted_at_a_load_typed_site() {
+        // Raw-ness is decided BEFORE the site rule: a raw string's
+        // record says it references nothing, so the site check finds
+        // nothing — without ever asking whether the value was raw.
+        // The value then fails later with the token parser's OWN error
+        // where one exists; substitution never acquires opinions about
+        // what the text means.
+        let err = load_err(&deferred_board("interval #\"{{x}}\"#"));
+        assert!(!err.contains(SITE_PHRASE), "{err}");
+        assert!(
+            err.contains("invalid duration"),
+            "parse_interval's own error: {err}"
+        );
+        // `trigger` accepts any path-shaped text, so a raw one loads.
+        load_result(&deferred_board("trigger #\"file:{{x}}\"#"))
+            .expect("a raw trigger is literal bytes");
+        // And `shell`: a dialect's refs are graph EDGES, so a raw one
+        // that wrongly recorded a reference could refuse the board for
+        // a cycle INV-1 says cannot exist. Given a correctly-empty
+        // record, the shell row accepts.
+        load_result(&deferred_board("shell #\"{{x}}\"#"))
+            .expect("a raw dialect name is literal bytes");
+    }
+
+    #[test]
+    fn a_load_time_variable_referencing_a_deferred_one_was_already_refused_by_the_block() {
+        // The IMPLICIT chain refuses at the block's own tier check
+        // (INV-9 clause 2), naming both variables — never with this
+        // task's site message. This pair (with the block's
+        // `an_effective_tier_never_outruns_its_declared_form`) is the
+        // tripwire: if clause 2 is ever relaxed to auto-promotion, the
+        // site check below must become a transitive walk the same day.
+        let err = load_err(
+            "variables {\n    a \"echo v\" shell=#true defer=#true\n    b \"{{a}}/x\"\n}\n\npane \"p\" {\n    command \"true\"\n    height 3\n    trigger \"file:{{b}}\"\n}\n",
+        );
+        assert!(
+            err.contains("`b` is not deferred but references `a`, which is"),
+            "clause 2's refusal, not the site rule's: {err}"
+        );
+        assert!(!err.contains(SITE_PHRASE), "{err}");
+    }
+
+    #[test]
+    fn a_declared_deferral_chain_refuses_at_the_site_one_level_deep() {
+        // The EXPLICIT chain — every link declares defer, legal per
+        // INV-9 clause 3 — refuses at the site by looking only at the
+        // directly-referenced name.
+        let err = load_err(
+            "variables {\n    a \"echo v\" shell=#true defer=#true\n    b \"echo {{a}}\" shell=#true defer=#true\n}\n\npane \"p\" {\n    command \"true\"\n    height 3\n    trigger \"file:{{b}}\"\n}\n",
+        );
+        assert!(err.contains(SITE_PHRASE), "{err}");
+        assert!(err.contains("`b`"), "the direct reference is named: {err}");
+    }
+
+    #[test]
+    fn a_script_body_beginning_with_a_reference_refuses() {
+        let err = load_err(
+            "variables {\n    rev \"echo v\" shell=#true\n}\n\npane \"p\" {\n    script \"{{rev}}\\necho done\"\n    height 3\n}\n",
+        );
+        assert!(err.contains("pane \"p\""), "{err}");
+        assert!(err.contains("begins with"), "{err}");
+        assert!(err.contains("`{{rev}}`"), "{err}");
+    }
+
+    #[test]
+    fn a_shebang_body_with_a_template_anywhere_in_line_one_refuses() {
+        // `shebang()` consumes the WHOLE first line including its one
+        // optional argument, so a template in the argument is inside
+        // the bytes the classifier reads.
+        for body in ["#!{{sh}}\\necho hi", "#!/bin/sh {{flag}}\\necho hi"] {
+            let err = load_err(&format!(
+                "variables {{\n    sh \"echo v\" shell=#true\n    flag \"echo v\" shell=#true\n}}\n\npane \"p\" {{\n    script \"{body}\"\n    height 3\n}}\n"
+            ));
+            assert!(err.contains("`#!` line"), "{body} → {err}");
+        }
+    }
+
+    #[test]
+    fn a_body_beginning_with_ordinary_text_may_carry_a_template_on_line_one() {
+        // NEW-1's regression test: the broad "whole first line is
+        // load-time" rule wrongly refused exactly this shape — nine
+        // natural bodies each grew a throwaway comment line to satisfy
+        // a parser rule. Only the bytes the classifier actually reads
+        // must be literal. Do not re-broaden the rule to delete this.
+        load_result(
+            "variables {\n    rev \"echo v\" shell=#true defer=#true\n}\n\npane \"p\" {\n    script \"[ -n \\\"{{rev}}\\\" ] || exit 0\\necho ok\"\n    height 3\n    shell #true\n}\n",
+        )
+        .expect("ordinary first bytes with a line-1 template load");
+    }
+
+    #[test]
+    fn a_shebang_body_may_carry_templates_on_later_lines() {
+        // A script body past the classifier is a spawn-time site.
+        for tier in ["defer=#true", ""] {
+            load_result(&format!(
+                "variables {{\n    rev \"echo v\" shell=#true {tier}\n}}\n\npane \"p\" {{\n    script \"#!/bin/sh\\necho {{{{rev}}}}\"\n    height 3\n}}\n"
+            ))
+            .unwrap_or_else(|err| panic!("{tier:?} → {err:#}"));
+        }
+    }
+
+    #[test]
+    fn a_literal_double_brace_that_is_not_a_reference_is_not_a_leading_reference() {
+        // "Begins with `{{`" is the wrong rule; "begins with a
+        // REFERENCE" is the right one — inner whitespace and a bare
+        // `{{ }` are literal text (INV-1/INV-6), which is why the check
+        // consults the one reference scanner instead of respelling the
+        // delimiters.
+        load_result("pane \"p\" {\n    script \"{{ } | keys\"\n    height 3\n    shell #true\n}\n")
+            .expect("a jq-shaped body is not a template");
+        load_result(
+            "pane \"p\" {\n    script \"{{ rev }} says hi\"\n    height 3\n    shell #true\n}\n",
+        )
+        .expect("inner whitespace is literal text");
+    }
+
+    #[test]
+    fn the_word_split_still_refuses_unbalanced_quoting_in_template_text() {
+        // No pane `shell`: a one-word command under a shell is kept
+        // verbatim, so the SPLIT path — the one under test — is the
+        // shell-less spelling.
+        let err = load_err(
+            "variables {\n    x \"echo v\" shell=#true\n}\n\npane \"p\" {\n    command \"echo {{x}} 'oops\"\n    height 3\n}\n",
+        );
+        assert!(err.contains("unbalanced quoting"), "{err}");
     }
 }

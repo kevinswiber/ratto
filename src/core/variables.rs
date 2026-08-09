@@ -137,9 +137,6 @@ impl VariableBlock {
         self.vars.is_empty()
     }
 
-    // The site rule (INV-7) is this accessor's production caller;
-    // until it lands only tests read it.
-    #[allow(dead_code)]
     pub fn tier(&self, name: &str) -> Option<Tier> {
         self.get(name).map(|v| v.tier)
     }
