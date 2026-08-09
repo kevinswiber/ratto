@@ -2855,7 +2855,7 @@ column {
     let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
         .expect("spawn rat dashboard under a pty");
     let mut terminal = FakeTerminal::dark();
-    let _ = wait_for_bytes(&session, &mut terminal, b"clock", Duration::from_secs(5))
+    let mut stream = wait_for_bytes(&session, &mut terminal, b"clock", Duration::from_secs(5))
         .expect("the first composition never painted");
 
     // Tab starts at `log`, not the title pane. The visible numbering and
@@ -2867,12 +2867,20 @@ column {
         &["1 · log".as_bytes(), "2 · clock".as_bytes(), b"focus log"],
         Duration::from_secs(3),
     );
+    // Visibility is judged over the WHOLE stream, not the post-Tab
+    // capture alone: the differ rewrites only changed rows, so the
+    // repaint that adds the numbers legally omits the header pane's
+    // unchanged box, and where the first wait stops is a pty
+    // chunk-boundary accident that differs by platform. (An earlier
+    // form asserted over the post-Tab bytes and held only by finding
+    // `header` inside the OSC tab-title sequence.)
+    stream.extend_from_slice(&first_focus);
     assert!(
-        contains(&first_focus, b"header"),
+        contains(&stream, b"header"),
         "the title pane remains visible"
     );
     assert!(
-        !contains(&first_focus, "0 · header".as_bytes()),
+        !contains(&stream, "0 · header".as_bytes()),
         "the visible title pane must not receive a navigation number"
     );
 
