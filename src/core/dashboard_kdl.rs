@@ -2304,6 +2304,7 @@ pane "nested" {
             include_str!("../../examples/follow.kdl"),
             include_str!("../../examples/script.kdl"),
             include_str!("../../examples/variables.kdl"),
+            include_str!("../../examples/keys.kdl"),
             include_str!("../../examples/review.kdl"),
         ] {
             let file = parse(text).expect("the example parses");

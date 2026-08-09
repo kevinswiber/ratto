@@ -448,6 +448,11 @@ const TEMPLATES: &[BoardTemplate] = &[
         summary: "a review console: derived paths, the handoff file, event triggers",
         body: include_str!("../../examples/review.kdl"),
     },
+    BoardTemplate {
+        name: "keys",
+        summary: "a board that acts: bindings with a guard, a confirm, and a pager",
+        body: include_str!("../../examples/keys.kdl"),
+    },
 ];
 
 /// `panes` because it is the README's own first example: `init` with
@@ -1155,6 +1160,40 @@ mod tests {
             seen.push(template.name);
         }
         assert!(seen.contains(&DEFAULT_TEMPLATE), "the default resolves");
+    }
+
+    /// The composed path, not a hand-assembled one: `validated()` is
+    /// read_and_parse -> refuse_claimed_bindings -> finish_load, so
+    /// "the example loads" already asserts that no binding names a
+    /// claimed key, with the load-time error naming what the key
+    /// already does. The assertions inspect the RESOLVED board, never
+    /// the bytes: the example's header comment names every keyword the
+    /// grammar has, so a substring check would pass on a board with no
+    /// bindings at all.
+    #[test]
+    fn the_keys_example_declares_a_worked_binding() {
+        use crate::core::dashboard_file::BindingOutput;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/keys.kdl");
+        let board = validated(std::path::Path::new(path), false, &Bindings::new())
+            .expect("the example loads: parses, binds no claimed key, and resolves");
+        let keys = &board.bindings;
+        assert!(keys.len() >= 3, "{keys:?}");
+        assert!(keys.iter().all(|b| !b.description.trim().is_empty()));
+        assert_eq!(keys.iter().filter(|b| b.when.is_some()).count(), 1);
+        assert_eq!(keys.iter().filter(|b| b.confirm.is_some()).count(), 1);
+        // Every disposition the grammar defines appears somewhere in
+        // the file, including the default one — an example that only
+        // shows the default teaches that there is nothing to choose.
+        for want in [
+            BindingOutput::Hide,
+            BindingOutput::Status,
+            BindingOutput::Pager,
+        ] {
+            assert!(
+                keys.iter().any(|b| b.output == want),
+                "{want:?} unshown in {keys:?}"
+            );
+        }
     }
 
     #[test]

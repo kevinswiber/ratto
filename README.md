@@ -690,8 +690,11 @@ variables layer — the three evaluation forms, the `-v` parameter, and
 a raw string that stays literal — and
 [`examples/review.kdl`](examples/review.kdl) is a review console whose
 paths derive at load, so the same file works in a primary checkout, a
-linked worktree, or a clone. Every one of these ships inside the
-binary too: `rat dashboard init --list`.
+linked worktree, or a clone.
+[`examples/keys.kdl`](examples/keys.kdl) is a board that acts — three
+key bindings, one guarded, one confirmed, each `output` disposition
+shown once. Every one of these ships inside the binary too:
+`rat dashboard init --list`.
 
 #### Key actions
 

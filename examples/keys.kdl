@@ -1,0 +1,74 @@
+// Key actions: a board that can act. A `key` node binds a key to a
+// command; pressing it runs the command once. Run it and press the
+// keys it names:
+//
+//   rat dashboard examples/keys.kdl
+//
+// and delete /tmp/rat-keys-demo.log when you are done; nothing here
+// truncates it except the `r` binding.
+//
+// 1. `description` is required. `?` is the only place a board's own
+//    keys are listed, so a binding nothing advertises is one nobody
+//    finds.
+// 2. `when` runs FIRST, before the confirm and before the command. A
+//    non-zero exit declines the binding and says so on the status
+//    row — press `e` before pressing `n` and nothing happens but the
+//    decline. Guarding inside the command instead would ask the
+//    question first and throw the answer away.
+// 3. `output` says what becomes of the command's output: `status`
+//    (the default) is one line naming the binding and its exit,
+//    `hide` is quiet when it worked — a failure still says so — and
+//    `pager` hands it to the pager.
+// 4. Built-ins win, loudly. `key "j"` here would be refused when the
+//    board loads, because `j` already scrolls — a binding never
+//    silently loses to a built-in.
+// 5. rat keeps nothing about what the command did. The `notes` pane
+//    finds out the same way it finds out about anything: its trigger
+//    fires and it re-runs.
+// 6. The `key` nodes inherit `shell` from `defaults`, the same way
+//    the panes do — and they need it: a redirect, a `||`, and a `2>`
+//    are shell syntax, and without a shell they would be passed to
+//    the program as literal text. The shell bodies below are POSIX;
+//    the `key` node itself is not platform-specific.
+
+variables {
+    log "/tmp/rat-keys-demo.log"
+}
+
+defaults {
+    height 5
+    border "rounded"
+    shell #true
+}
+
+key "n" {
+    description "append a timestamped note"
+    command "date +%H:%M:%S >> {{log}}"
+}
+
+key "e" {
+    description "read the notes in the pager"
+    when "test -s {{log}}"
+    output "pager"
+    command "cat {{log}}"
+}
+
+key "r" {
+    description "throw the notes away"
+    confirm "Delete the notes?"
+    output "hide"
+    command "rm -f {{log}}"
+}
+
+pane "notes" {
+    title "notes — press n"
+    interval "never"
+    trigger "file:{{log}}"
+    command "tail -n 5 {{log}} 2>/dev/null || echo 'nothing yet'"
+}
+
+pane "clock" {
+    height 4
+    interval "1s"
+    command "date +%H:%M:%S"
+}

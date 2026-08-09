@@ -5,11 +5,10 @@
 //
 //   rat dashboard examples/review.kdl
 //
-// The board reads its selection from a handoff file: a small file
-// something else writes and these panes trigger on. The state lives in
-// that file, in the filesystem — the dashboard only reads it. Until a
-// key binding writes it from inside the dashboard, drive it by hand
-// from another terminal:
+// The board reads its selection from a handoff file: a small file the
+// `s` binding below writes and these panes trigger on. The state lives
+// in that file, in the filesystem — the panes only read it, which is
+// also why it can still be driven by hand from another terminal:
 //
 //   echo src/main.rs > "$(git rev-parse --git-common-dir)/review.sel"
 
@@ -68,8 +67,23 @@ pane "diff" {
     command "test \"{{cur}}\" = - && echo select a file to review || git diff HEAD -- \"{{cur}}\""
 }
 
-// When key actions ship, a binding declared here will write the
-// handoff file from inside the dashboard — press a key, pick a changed
-// file, and the selection lands in the file above for these panes to
-// read. Until then, the echo in this file's header is the whole write
-// path.
+// The write half of the console: the selection lands in the handoff
+// file, and the panes above find out through their own triggers — the
+// dashboard itself keeps nothing. `hide` is the right disposition for
+// a write whose effect is already visible in the frame.
+key "s" {
+    description "select the first changed file"
+    shell #true
+    output "hide"
+    command "git diff --name-only HEAD | head -n 1 > \"{{sel}}\""
+}
+
+key "x" {
+    description "clear the selection"
+    // The guard half: a `when` on the same handoff file, so pressing
+    // `x` with nothing selected declines instead of running.
+    when "test -s \"{{sel}}\""
+    shell #true
+    output "hide"
+    command ": > \"{{sel}}\""
+}
