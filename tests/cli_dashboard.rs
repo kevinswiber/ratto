@@ -1457,3 +1457,25 @@ fn each_failure_refuses_the_board_and_writes_no_frame() {
             .stderr(predicates::str::contains(name));
     }
 }
+
+#[test]
+fn the_load_pass_still_refuses_a_failing_once_at_load_variable() {
+    // The two tiers must not have merged into one lenient path: a
+    // failing NON-deferred command variable still refuses at load,
+    // however healthy the deferred one beside it is.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    bad \"exit 3\" shell=#true\n    fine \"cd .\" shell=#true defer=#true\n}}\n\npane \"a\" {{\n    command \"{bin}\" \"style\" \"ok\"\n    height 3\n    chrome #false\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("variable \"bad\""));
+}

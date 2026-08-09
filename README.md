@@ -464,6 +464,22 @@ it every time. The same applies to a nested `rat dashboard … --once`:
 the inner panes all run once per outer tick, and an inner `interval`
 has nothing to schedule.
 
+**A deferred variable is a command on the pane's schedule.** A
+`variables` entry with `defer=#true` re-runs its command at every spawn
+of every pane that references it — that is what deferred means, and
+there is no per-tick memoization: three referencing panes at
+`interval "1s"` are three extra subprocesses a second, on top of the
+panes' own. The command runs on the dashboard's own loop, before the
+pane's child starts, so a slow one delays that pane's output and can
+stall the frame until the bounded wait gives up. And its side effects
+recur at the pane's cadence — the guidance above applies unchanged, on
+a schedule the variable's author may not have been thinking about:
+write deferred commands that can run at any moment, any number of
+times. A deferred command that writes a watched path is the loop the
+next paragraph describes, and the pane that references the variable is
+correctly the one implicated, because the derivation runs as part of
+that pane's own spawn.
+
 **A side effect on a watched path is a loop.** If a pane's command
 touches a file that any pane triggers on — another pane's or its own —
 then those panes drive each other for as long as the dashboard runs, at

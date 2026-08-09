@@ -477,6 +477,154 @@ pub(crate) fn refusal(name: &str, command: &str, failure: &DerivationFailure) ->
     }
 }
 
+/// A deferred derivation failure, as the pane's body.
+///
+/// `pub(crate)`, and its ONE caller is `resolve_for_spawn` — not the
+/// watch engine, which receives an already-worded `io::Error` and only
+/// `?`s it.
+///
+/// DELEGATES to `refusal` — never re-`format!`s a sentence. A `defer`
+/// failure and a load failure describe the SAME event and must not
+/// describe it differently. What changes is only where the text lands:
+/// there is no load left to refuse, so it fails that pane's spawn
+/// instead, through the existing spawn-error path.
+// The spawn-site wiring is this family's production caller; until it
+// lands only tests reach it. Remove these four allows with that caller.
+#[allow(dead_code)]
+pub(crate) fn spawn_refusal(
+    name: &str,
+    command: &str,
+    failure: &DerivationFailure,
+) -> std::io::Error {
+    std::io::Error::other(format!("{:#}", refusal(name, command, failure)))
+}
+
+/// One deferred variable, resolved. Typed failure, so the variants
+/// stay unit-testable; `command` is the EXPANDED command when
+/// expansion got that far, and the raw template when it did not — the
+/// message echoes whichever is the truer thing to show the author.
+#[allow(dead_code)]
+struct Failed {
+    command: String,
+    failure: DerivationFailure,
+}
+
+#[allow(dead_code)]
+fn derive_one(
+    var: &crate::core::variables::Variable,
+    so_far: &crate::core::template::Bindings,
+) -> Result<String, Failed> {
+    let command = var.text.expand(so_far).map_err(|missing| Failed {
+        command: var.text.as_str().to_string(),
+        failure: missing.into(),
+    })?;
+    let Some(decl) = var.source.shell() else {
+        // Unreachable: a deferred variable IS a command variable.
+        debug_assert!(false, "a deferred variable always carries a shell");
+        return Err(Failed {
+            command,
+            failure: DerivationFailure::Empty,
+        });
+    };
+    // The dialect is a template like any other, resolved against the
+    // map built so far — its references joined the dependency set, so
+    // they are already resolved by the time this variable's turn comes.
+    let shell = match decl.resolve(so_far) {
+        Ok(shell) => shell,
+        Err(empty) => {
+            return Err(Failed {
+                command,
+                failure: empty.into(),
+            });
+        }
+    };
+    derive(&crate::core::variables::Derivation {
+        name: &var.name,
+        command: &command,
+        shell: &shell,
+    })
+    .map_err(|failure| Failed { command, failure })
+}
+
+/// The `Bindings` one spawn expands against: the load map, plus every
+/// deferred variable this spawn will consume, each derived exactly
+/// once.
+///
+/// `needed` is the union of each about-to-expand string's recorded
+/// references. Names outside it are NOT derived — "per CONSUMING
+/// spawn" (INV-4.3) means a pane that does not reference a deferred
+/// variable never pays for it. The walk covers the transitive closure
+/// of `needed` under `Variable::refs()` — the union of a variable's
+/// text and shell references, never the text's alone — so a deferred
+/// variable depending on another deferred variable, or on one only its
+/// DIALECT names, sees a resolved value (INV-9 clause 3).
+///
+/// The load map is the BASE: non-deferred names were resolved once at
+/// load and are copied through untouched, never re-derived. Deferred
+/// names are absent from it by construction, so there is no stale
+/// value to accidentally shadow. `-v` overrides apply here too, by
+/// exact name, before any command is reached — and they do NOT change
+/// a variable's tier.
+///
+/// ONE call per spawn is what makes INV-9's per-spawn memoization
+/// true: the map is built once and reused for every string in that
+/// spawn, so a name referenced twice runs its command once and both
+/// occurrences agree. The failure comes out as an already-worded
+/// `io::Error` because this walk covers SEVERAL variables — by the
+/// time a bare failure reached a caller, which variable failed would
+/// be gone, so the name is attached here, where it is in scope,
+/// exactly as the load tier attaches it inside its own callback.
+#[allow(dead_code)]
+pub(crate) fn resolve_for_spawn(
+    block: &crate::core::variables::VariableBlock,
+    load: &crate::core::template::Bindings,
+    overrides: &crate::core::template::Bindings,
+    needed: &[&str],
+) -> Result<crate::core::template::Bindings, std::io::Error> {
+    use crate::core::variables::Tier;
+    // The common case first: a spawn that references no deferred
+    // variable takes a path that cannot fail beyond a clone.
+    let mut wanted: Vec<&str> = Vec::new();
+    let mut stack: Vec<&str> = needed.to_vec();
+    while let Some(name) = stack.pop() {
+        if wanted.contains(&name) {
+            continue;
+        }
+        let Some(var) = block.get(name) else { continue };
+        if var.tier != Tier::Spawn {
+            continue;
+        }
+        wanted.push(name);
+        // `Variable::refs()`, never the text's refs alone: a templated
+        // dialect's references are dependencies too.
+        stack.extend(var.refs());
+    }
+    let mut out = load.clone();
+    if wanted.is_empty() {
+        return Ok(out);
+    }
+    // Dependencies first: the block's topological order, filtered to
+    // the deferred names this spawn actually consumes.
+    let in_this_spawn: Vec<&crate::core::variables::Variable> = block
+        .in_order()
+        .filter(|var| wanted.contains(&var.name.as_str()))
+        .collect();
+    for var in in_this_spawn {
+        if let Some(value) = overrides.get(&var.name) {
+            // Suppressed by never being REACHED, at this tier too.
+            out.insert(var.name.clone(), value.clone());
+            continue;
+        }
+        match derive_one(var, &out) {
+            Ok(value) => {
+                out.insert(var.name.clone(), value);
+            }
+            Err(bad) => return Err(spawn_refusal(&var.name, &bad.command, &bad.failure)),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -649,6 +797,241 @@ mod tests {
         // sleeper is a direct child here, so the kill provably lands.)
         std::thread::sleep(Duration::from_secs(3));
         assert!(!marker.exists(), "the kill reached the child");
+    }
+
+    fn deferred_command(name: &str, command: &str) -> Variable {
+        Variable {
+            name: name.to_string(),
+            source: VarSource::SpawnCommand(ShellDecl::Platform),
+            text: Template::extract(command),
+            tier: Tier::Spawn,
+            span: 0..0,
+        }
+    }
+
+    /// The platform shell's spelling of "append one `x` to COUNTER,
+    /// then print the counter's contents" — output that CHANGES with
+    /// every run, which is what deferred means.
+    fn append_then_read(counter: &std::path::Path) -> String {
+        #[cfg(unix)]
+        {
+            format!("printf x >> {c}; cat {c}", c = counter.display())
+        }
+        #[cfg(windows)]
+        {
+            format!("echo x>> \"{c}\" & type \"{c}\"", c = counter.display())
+        }
+    }
+
+    fn runs(counter: &std::path::Path) -> usize {
+        std::fs::read_to_string(counter)
+            .map(|text| text.matches('x').count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_deferred_variable_derives_once_per_call() {
+        // Three calls model three consuming spawns exactly — the
+        // function is what a spawn calls, once.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let block = VariableBlock::new(
+            vec![deferred_command("head", &append_then_read(&counter))],
+            vec![0],
+        );
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let bindings = resolve_for_spawn(&block, &Bindings::new(), &Bindings::new(), &["head"])
+                .expect("derives");
+            seen.push(bindings.get("head").cloned().expect("a value"));
+        }
+        assert_eq!(runs(&counter), 3);
+        assert_ne!(seen[0], seen[1]);
+        assert_ne!(seen[1], seen[2]);
+    }
+
+    #[test]
+    fn a_deferred_variable_runs_once_per_spawn_however_often_it_is_referenced() {
+        // One CALL whose `needed` names it twice — the shape a command
+        // referencing {{head}} in two strings produces. Without this
+        // pin, reference count silently becomes subprocess count AND a
+        // single command could observe two different values for one
+        // name; the second half is the worse bug.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let block = VariableBlock::new(
+            vec![deferred_command("head", &append_then_read(&counter))],
+            vec![0],
+        );
+        let bindings = resolve_for_spawn(
+            &block,
+            &Bindings::new(),
+            &Bindings::new(),
+            &["head", "head"],
+        )
+        .expect("derives");
+        assert_eq!(runs(&counter), 1);
+        let both = Template::extract("{{head}}={{head}}")
+            .expand(&bindings)
+            .expect("expands");
+        let (left, right) = both.split_once('=').expect("two halves");
+        assert_eq!(left, right, "both occurrences agree");
+    }
+
+    #[test]
+    fn a_name_absent_from_needed_is_never_derived() {
+        // "Per CONSUMING spawn": a spawn that does not reference the
+        // deferred variable must not pay for it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let block = VariableBlock::new(
+            vec![deferred_command("head", &append_then_read(&counter))],
+            vec![0],
+        );
+        resolve_for_spawn(&block, &Bindings::new(), &Bindings::new(), &["head"]).expect("derives");
+        resolve_for_spawn(&block, &Bindings::new(), &Bindings::new(), &[]).expect("derives");
+        assert_eq!(
+            runs(&counter),
+            1,
+            "the empty-needed call contributed nothing"
+        );
+    }
+
+    #[test]
+    fn a_failing_deferred_derivation_is_worded_for_the_panes_box() {
+        let block = VariableBlock::new(vec![deferred_command("head", "exit 7")], vec![0]);
+        let err = resolve_for_spawn(&block, &Bindings::new(), &Bindings::new(), &["head"])
+            .expect_err("the derivation fails");
+        let text = err.to_string();
+        assert!(text.contains(r#"variable "head""#), "{text}");
+        assert!(text.contains('7'), "{text}");
+    }
+
+    #[test]
+    fn a_zero_length_read_under_defer_fails_rather_than_expanding_empty() {
+        // The interrupted zero-length write: the writer truncated but
+        // has not written yet. A silent empty expansion would send
+        // `--revision ""` to a real command, so the NEGATIVE half is
+        // the point.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let handoff = dir.path().join("handoff");
+        std::fs::write(&handoff, "").expect("truncated");
+        #[cfg(unix)]
+        let command = format!("cat {}", handoff.display());
+        #[cfg(windows)]
+        let command = format!("type \"{}\"", handoff.display());
+        let block = VariableBlock::new(vec![deferred_command("rev", &command)], vec![0]);
+        let err = resolve_for_spawn(&block, &Bindings::new(), &Bindings::new(), &["rev"])
+            .expect_err("a zero-length read is a transient the board must announce");
+        let text = err.to_string();
+        assert!(text.contains(r#"variable "rev""#), "{text}");
+        assert!(text.contains("printed nothing"), "{text}");
+
+        // The next tick recovers on its own — two calls are two ticks.
+        std::fs::write(&handoff, "rev-43").expect("the writer finished");
+        let bindings = resolve_for_spawn(&block, &Bindings::new(), &Bindings::new(), &["rev"])
+            .expect("recovers");
+        assert_eq!(bindings.get("rev").map(String::as_str), Some("rev-43"));
+    }
+
+    #[test]
+    fn a_read_does_not_move_a_paths_fingerprint() {
+        // The deterministic core of the loop-detector claim: the
+        // detector's evidence is mtime, and a read moves no mtime — so
+        // a deferred `cat` of a watched file is credited with nothing
+        // and cannot appear on a cycle. If fingerprinting ever starts
+        // considering atime or size, THIS fails first and cheaply.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("watched");
+        std::fs::write(&path, "content").expect("write");
+        let paths = [path.clone()];
+        let before = crate::core::trigger::stamps(&paths);
+        let _ = std::fs::read_to_string(&path);
+        assert_eq!(crate::core::trigger::stamps(&paths), before);
+    }
+
+    #[test]
+    fn an_override_supplies_a_deferred_value_and_suppresses_its_command() {
+        // `-v` applies at the spawn tier by exact name, exactly as at
+        // load — the value is supplied, the command never reached. (The
+        // other half — that the override does NOT change the variable's
+        // tier, so it stays illegal at a load-time site — is the site
+        // rule's to assert.)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let block = VariableBlock::new(
+            vec![deferred_command("head", &append_then_read(&counter))],
+            vec![0],
+        );
+        let overrides = Bindings::from([("head".to_string(), "abc".to_string())]);
+        for _ in 0..3 {
+            let bindings = resolve_for_spawn(&block, &Bindings::new(), &overrides, &["head"])
+                .expect("resolves");
+            assert_eq!(bindings.get("head").map(String::as_str), Some("abc"));
+        }
+        assert_eq!(runs(&counter), 0, "the command was never reached");
+    }
+
+    #[test]
+    fn a_raw_string_holding_a_deferred_reference_runs_nothing() {
+        // The refs-not-text rule made observable: a raw template's
+        // record says it references nothing, so `needed` is empty, so
+        // nothing derives — and expansion returns the literal bytes.
+        // An implementation that re-scanned the bytes would spawn a
+        // subprocess per tick for a string that never interpolates.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let block = VariableBlock::new(
+            vec![deferred_command("head", &append_then_read(&counter))],
+            vec![0],
+        );
+        let raw = Template::literal("--revision {{head}}");
+        let needed: Vec<&str> = raw.refs().iter().map(String::as_str).collect();
+        let bindings = resolve_for_spawn(&block, &Bindings::new(), &Bindings::new(), &needed)
+            .expect("resolves");
+        assert_eq!(runs(&counter), 0);
+        assert_eq!(
+            raw.expand(&bindings).expect("expands"),
+            "--revision {{head}}"
+        );
+    }
+
+    #[test]
+    fn a_deferred_chain_and_a_derived_dialect_both_resolve() {
+        // Two routes the resolver's walk must cover beyond the direct
+        // case: a deferred variable referencing another deferred one
+        // (each link declares defer explicitly), and a deferred
+        // variable whose DIALECT is a template — the shell's references
+        // join the dependency set, or a derived dialect never resolves.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("runs");
+        let base = deferred_command("base", &append_then_read(&counter));
+        #[cfg(unix)]
+        let echo_cmd = "echo chained-{{base}}";
+        #[cfg(windows)]
+        let echo_cmd = "echo chained-{{base}}";
+        let chained = deferred_command("chained", echo_cmd);
+        // A dialect that is itself a template, resolved from the LOAD
+        // map: the platform shell's own name, so the spawn is portable.
+        let mut derived_dialect = deferred_command("dialect-user", "echo hi");
+        derived_dialect.source =
+            VarSource::SpawnCommand(ShellDecl::Named(Template::extract("{{dialect}}")));
+        let block = VariableBlock::new(vec![base, chained, derived_dialect], vec![0, 1, 2]);
+        let load = Bindings::from([("dialect".to_string(), platform_shell())]);
+        let bindings = resolve_for_spawn(
+            &block,
+            &load,
+            &Bindings::new(),
+            &["chained", "dialect-user"],
+        )
+        .expect("resolves");
+        // The chain: `chained` needed `base`, which derived once.
+        assert_eq!(runs(&counter), 1);
+        assert_eq!(
+            bindings.get("chained").map(String::as_str),
+            Some("chained-x")
+        );
+        assert_eq!(bindings.get("dialect-user").map(String::as_str), Some("hi"));
     }
 
     #[test]
