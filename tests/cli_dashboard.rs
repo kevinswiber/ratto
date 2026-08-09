@@ -1588,25 +1588,21 @@ fn a_board_with_no_variables_renders_byte_identically() {
             bin = rat_bin().replace('\\', "\\\\"),
         ),
     );
+    // The width is an INPUT, and the witness pins it: a piped frame is
+    // composed for whoever reads the pipe, so it takes RAT_WIDTH over
+    // any console it can still measure. Left unpinned the literal is
+    // only literal where the runner happens to agree — a piped unix run
+    // measures nothing and falls back to 80, while Windows CI reports
+    // its own console and renders 120.
     let assert = rat()
         .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "80")
+        .env("RAT_HEIGHT", "24")
         .args(["dashboard", &file, "--once"])
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
-    // The environment owns the width — a piped run has no terminal to ask
-    // on unix and falls back to 80, while a Windows console reports its
-    // own size — so read W off the frame and pin the frame's shape and
-    // bytes AT that W: three rows, every one of them W wide, the first
-    // carrying "witness" and the rest blank.
-    let rows: Vec<&str> = stdout
-        .strip_suffix('\n')
-        .unwrap_or(&stdout)
-        .split('\n')
-        .collect();
-    assert_eq!(rows.len(), 3, "the frame is three rows: {stdout:?}");
-    let width = rows[0].chars().count();
-    let expected = format!("{:<width$}\n{:<width$}\n{:<width$}\n", "witness", "", "");
+    let expected = format!("{:<80}\n{:<80}\n{:<80}\n", "witness", "", "");
     assert_eq!(stdout, expected, "the frame's exact bytes moved");
 }
 
