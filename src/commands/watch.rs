@@ -2653,6 +2653,13 @@ pub(crate) fn run_registry(
                                 &history,
                             )?);
                         }
+                        // The resolver answers this once the key table
+                        // has declined; running it is the runner's, and
+                        // the disposition is applied where the renderer
+                        // is in hand. Inert until then, and deliberately
+                        // adjacent to Ignore so the two read as the same
+                        // "nothing happens yet".
+                        WatchAction::RunBinding(_) => {}
                         WatchAction::Ignore => {}
                     }
                 }
@@ -2921,6 +2928,18 @@ enum WatchAction {
     ClearFocus,
     ToggleZoom,
     ToggleCollapse,
+    /// Run the board's declared binding at this index.
+    ///
+    /// The table above NEVER produces this: it is context-blind by
+    /// design, and a board's declarations are context. A binding is
+    /// reached only after the table has declined the key in every mode,
+    /// which is what makes "a built-in always wins" a consequence of
+    /// the dispatch order rather than a rule to remember.
+    ///
+    /// `usize` keeps the enum `Copy` — the dispatch matches by value
+    /// and re-binds with `action @ (…)` patterns.
+    #[allow(dead_code)] // The resolver constructs this next; only tests name it today.
+    RunBinding(usize),
     Ignore,
 }
 
@@ -3148,6 +3167,11 @@ fn describes(action: WatchAction) -> &'static str {
         WatchAction::ClearFocus => "drops the pane focus",
         WatchAction::ToggleZoom => "zooms the focused pane",
         WatchAction::ToggleCollapse => "collapses or restores the focused pane",
+        // Never reached through the claimed-key lookup — the key table
+        // cannot answer with a binding, so this action never comes back
+        // from it. The match is total on purpose, so give it the honest
+        // phrase rather than a panic.
+        WatchAction::RunBinding(_) => "runs a declared binding",
         // Unreachable through `builtin_key` (filtered out), but the
         // match stays total, so it gets the honest phrase.
         WatchAction::Ignore => "does nothing",
@@ -11074,5 +11098,104 @@ mod tests {
                 .all(|key| builtin_key(key).is_some()),
             "a board's real keyspace in v1 is characters and Alt-characters"
         );
+    }
+    // ─── RunBinding precedence ──────────────────────────────────────
+
+    #[test]
+    fn the_table_never_answers_with_a_binding() {
+        // The structural claim of the whole dispatch design: `RunBinding`
+        // enters through a resolver or not at all. Hand `action_for` a
+        // binding table and this fails first, everywhere, instead of
+        // precedence quietly becoming a convention.
+        for key in crate::core::key_spelling::ascii_spellable() {
+            for mode in FRAME_MODES {
+                assert!(
+                    !matches!(action_for(key, mode), WatchAction::RunBinding(_)),
+                    "{key:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    // The table's shape is the promise its own doc comment makes: no pane,
+    // no board, no bindings. Precedence is structural only while dispatch
+    // resolves context AFTER the table answers, so this assignment is the
+    // guard — it stops compiling the moment a parameter is added. Green
+    // before this task and green after it; its value is entirely in later
+    // phases, when the temptation to thread a binding table appears.
+    const _TABLE_STAYS_CONTEXT_BLIND: fn(Key, FrameMode) -> WatchAction = action_for;
+
+    /// A documentation test with teeth: the gate design in dispatch
+    /// DEPENDS on claimed keys answering `Ignore` in some modes — it is
+    /// why the gate is two clauses rather than one. If a future edit
+    /// drops a mode guard this test moves, and whoever moves it is sent
+    /// to the dispatch gate rather than discovering the hole through a
+    /// board that suddenly stops responding to `F`.
+    #[test]
+    fn some_built_in_keys_answer_ignore_in_some_modes() {
+        let paused_blind = [
+            Key::Tab,
+            Key::BackTab,
+            Key::Alt('h'),
+            Key::Alt('j'),
+            Key::Alt('k'),
+            Key::Alt('l'),
+            Key::Alt('1'),
+            Key::Alt('9'),
+            Key::Char('z'),
+            Key::Space,
+            Key::Char('p'),
+        ];
+        for key in paused_blind {
+            assert_eq!(
+                action_for(key, FrameMode::Paused),
+                WatchAction::Ignore,
+                "{key:?}"
+            );
+        }
+        // `F` resumes in every mode but live; `>`/`.` scrub only while
+        // paused — these fall to `Ignore` in modes where bindings DO
+        // fire, which is exactly why an `Ignore`-only gate is not enough.
+        assert_eq!(
+            action_for(Key::Char('F'), FrameMode::Live),
+            WatchAction::Ignore
+        );
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(
+                action_for(Key::Char('>'), mode),
+                WatchAction::Ignore,
+                "{mode:?}"
+            );
+            assert_eq!(
+                action_for(Key::Char('.'), mode),
+                WatchAction::Ignore,
+                "{mode:?}"
+            );
+        }
+        // The complement: every one of those keys is genuinely claimed
+        // somewhere, not merely dead.
+        for key in paused_blind
+            .into_iter()
+            .chain([Key::Char('F'), Key::Char('>'), Key::Char('.')])
+        {
+            assert!(
+                FRAME_MODES
+                    .into_iter()
+                    .any(|mode| action_for(key, mode) != WatchAction::Ignore),
+                "{key:?} answers something in at least one mode"
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_variant_claims_no_key() {
+        // `builtin_key` maps modes through `action_for` and describes the
+        // first non-Ignore answer — this task widens the enum it
+        // describes, so pin the negative on the surface a board author
+        // sees: no key ever comes back described as a binding.
+        let binding_phrase = describes(WatchAction::RunBinding(0));
+        for key in crate::core::key_spelling::ascii_spellable() {
+            assert_ne!(builtin_key(key), Some(binding_phrase), "{key:?}");
+        }
     }
 }
