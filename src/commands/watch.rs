@@ -22,16 +22,17 @@ use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
 use crate::core::child::{
     ActionOutcome, ActionResult, ActionRung, ActionScript, ActionSpawn, ActivationId, ChildSlot,
-    ShutdownGuard, TickEvent, not_started, run_tick, spawn_action, spawn_live_tick, spawn_tick,
+    Rung, ShutdownGuard, TickEvent, not_started, run_tick, spawn_action, spawn_live_tick,
+    spawn_tick,
 };
-use crate::core::dashboard_file::{BindingProgram, KeyBinding};
+use crate::core::dashboard_file::{BindingOutput, BindingProgram, KeyBinding};
 use crate::core::duration::{brief_duration, parse_interval};
 use crate::core::layout::{
     PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
     render_pane_collapsed, scroll_badge,
 };
 use crate::core::live::Emissions;
-use crate::core::measure::{seal_rows, shift_chop};
+use crate::core::measure::{seal_rows, shift_chop, strip_escapes, truncate_display};
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{
     Composition, LayoutNode, Overflow, PaneGeometry, Registry, Shebang, ShellMode, SourceId,
@@ -1364,6 +1365,55 @@ pub(crate) fn run_registry(
                     notices.push(looping_text(&registry, &verdict.panes));
                 }
             }
+            // The actions' dispositions, applied where the iteration's
+            // one-shot rows are already batched — never inside the
+            // drain, whose rule is that only per-source state is
+            // touched there: a `pager` does considerably more than
+            // paint. In completion order; several completions in one
+            // iteration each join the batch, and each pager takes the
+            // ritual in turn.
+            for outcome in actions.drain(..) {
+                let binding = &session.bindings[outcome.binding];
+                let width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+                match binding.output {
+                    BindingOutput::Pager => {
+                        let lines = action_pager_lines(&outcome);
+                        #[cfg(unix)]
+                        let reason = page_with_handoff(
+                            &lines,
+                            &mut renderer,
+                            fullscreen,
+                            &mut mouse_guard,
+                            tap.as_ref(),
+                            &mut theme_sub,
+                            &mut verify,
+                        );
+                        #[cfg(windows)]
+                        let reason =
+                            page_with_handoff(&lines, &mut renderer, fullscreen, &mut mouse_guard);
+                        // A degraded pager carries BOTH facts — its own
+                        // reason and the action's completion line — or
+                        // the reader cannot tell whether the action
+                        // ran. A clean round trip needs neither: the
+                        // pager WAS the report.
+                        if let Some(reason) = reason {
+                            notices.push(reason);
+                            if let Some(line) =
+                                action_line(binding, ActionReport::Completed(&outcome), width)
+                            {
+                                notices.push(line);
+                            }
+                        }
+                    }
+                    BindingOutput::Status | BindingOutput::Hide => {
+                        if let Some(line) =
+                            action_line(binding, ActionReport::Completed(&outcome), width)
+                        {
+                            notices.push(line);
+                        }
+                    }
+                }
+            }
             // One paint for the iteration's out-of-band changes: the
             // batched one-shot rows, a badge that moved, or both. With
             // no frame yet there is nothing to paint over and the batch
@@ -1778,56 +1828,23 @@ pub(crate) fn run_registry(
                                 let Some(live) = live.as_ref() else { continue };
                                 pause.as_ref().map_or(&live.lines, |p| &p.frozen)
                             };
-                            // The pager reads the same terminal. Stop the
-                            // pushes first, then park our reader, so a report
-                            // can never land in a foreign reader's input.
                             #[cfg(unix)]
-                            if let Some(sub) = theme_sub.as_mut() {
-                                let _ = sub.suspend();
-                            }
-                            // The pager doesn't speak SGR mouse reports;
-                            // leaving tracking on sprays bytes into its
-                            // command line. Remember whether capture was
-                            // ours to restore — an m-released mouse must
-                            // stay released across the round trip.
-                            let mouse_was_active =
-                                mouse_guard.as_ref().is_some_and(MouseGuard::active);
-                            if let Some(guard) = mouse_guard.as_mut() {
-                                let _ = guard.suspend();
-                            }
-                            // Park our reader and require its confirmation
-                            // before handing the input stream over.
-                            // Unconfirmed means a reader may still be attached
-                            // — never spawn a second one against it.
-                            #[cfg(unix)]
-                            let handed_off = tap.as_ref().is_none_or(|tap| tap.pause());
+                            let pager_notice = page_with_handoff(
+                                content,
+                                &mut renderer,
+                                fullscreen,
+                                &mut mouse_guard,
+                                tap.as_ref(),
+                                &mut theme_sub,
+                                &mut verify,
+                            );
                             #[cfg(windows)]
-                            let handed_off = true;
-                            let pager_notice = if handed_off {
-                                page_frame(content, &mut renderer, fullscreen)
-                            } else {
-                                Some(
-                                    "pager unavailable: the input reader did not yield; try again"
-                                        .to_string(),
-                                )
-                            };
-                            // Reader first, then pushes: a report always has
-                            // someone to read it.
-                            #[cfg(unix)]
-                            {
-                                if let Some(tap) = tap.as_ref() {
-                                    tap.resume();
-                                }
-                                if let Some(sub) = theme_sub.as_mut() {
-                                    let _ = sub.resume();
-                                }
-                                // Whatever was in flight belongs to a terminal
-                                // state we stopped listening to.
-                                verify = VerifyState::default();
-                            }
-                            if mouse_was_active && let Some(guard) = mouse_guard.as_mut() {
-                                let _ = guard.resume();
-                            }
+                            let pager_notice = page_with_handoff(
+                                content,
+                                &mut renderer,
+                                fullscreen,
+                                &mut mouse_guard,
+                            );
                             // Repaint immediately from the frame on hand:
                             // the content is already current, and a forced
                             // tick would stall the return by a whole child
@@ -4487,6 +4504,75 @@ fn snapshot_frame(lines: &[String], dir: Option<&std::path::Path>, ansi: bool) -
 /// then less -R, then more.com on Windows), bat-style. The loop resumes
 /// when the pager exits; a failure to launch becomes a status line, never
 /// an error exit.
+/// Page CONTENT through the terminal handoff `v` and `?` use — theme
+/// pushes suspended, mouse capture suspended, the input reader parked
+/// and its confirmation REQUIRED before anything is spawned, then the
+/// reader and pushes resumed in that order (a report always has
+/// someone to read it). ONE implementation, three callers — the frame
+/// pager, the key reference, and an action's `output "pager"` — and
+/// the prompts plan reuses it as well; a second copy of a seven-step
+/// terminal handoff would drift.
+///
+/// Returns the pager's one-shot reason when something degraded, `None`
+/// on a clean round trip. The caller repaints — how depends on where
+/// it stands in the iteration.
+#[allow(clippy::too_many_arguments)]
+fn page_with_handoff(
+    content: &[String],
+    renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
+    fullscreen: bool,
+    mouse_guard: &mut Option<MouseGuard<std::io::Stdout>>,
+    #[cfg(unix)] tap: Option<&TtyTap>,
+    #[cfg(unix)] theme_sub: &mut Option<ThemeNotifyGuard<std::io::Stdout>>,
+    #[cfg(unix)] verify: &mut VerifyState,
+) -> Option<String> {
+    // The pager reads the same terminal. Stop the pushes first, then
+    // park our reader, so a report can never land in a foreign
+    // reader's input.
+    #[cfg(unix)]
+    if let Some(sub) = theme_sub.as_mut() {
+        let _ = sub.suspend();
+    }
+    // The pager doesn't speak SGR mouse reports; leaving tracking on
+    // sprays bytes into its command line. Remember whether capture was
+    // ours to restore — an m-released mouse must stay released across
+    // the round trip.
+    let mouse_was_active = mouse_guard.as_ref().is_some_and(MouseGuard::active);
+    if let Some(guard) = mouse_guard.as_mut() {
+        let _ = guard.suspend();
+    }
+    // Park our reader and require its confirmation before handing the
+    // input stream over. Unconfirmed means a reader may still be
+    // attached — never spawn a second one against it.
+    #[cfg(unix)]
+    let handed_off = tap.is_none_or(|tap| tap.pause());
+    #[cfg(windows)]
+    let handed_off = true;
+    let pager_notice = if handed_off {
+        page_frame(content, renderer, fullscreen)
+    } else {
+        Some("pager unavailable: the input reader did not yield; try again".to_string())
+    };
+    // Reader first, then pushes: a report always has someone to read
+    // it.
+    #[cfg(unix)]
+    {
+        if let Some(tap) = tap {
+            tap.resume();
+        }
+        if let Some(sub) = theme_sub.as_mut() {
+            let _ = sub.resume();
+        }
+        // Whatever was in flight belongs to a terminal state we
+        // stopped listening to.
+        *verify = VerifyState::default();
+    }
+    if mouse_was_active && let Some(guard) = mouse_guard.as_mut() {
+        let _ = guard.resume();
+    }
+    pager_notice
+}
+
 fn page_frame(
     lines: &[String],
     renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
@@ -5459,6 +5545,133 @@ fn pane_body(
 /// The chrome row's failure badge: a nonzero exit, and nothing else. A
 /// spawn error's text IS the body, so it carries no badge; a successful
 /// tick returns `None`, which is how the badge clears.
+/// What is being reported about an action. A CLOSED kind, so the set
+/// of things that can be said about a binding is enumerable by the
+/// compiler rather than by hand.
+///
+/// This exists because the alternative was a claim that is not true: a
+/// match over a completion outcome sees only completions, so a fifth
+/// composer added later — a cancellation, a decline, whatever comes
+/// next — compiles fine and slips past the test that is supposed to
+/// guarantee every line names its binding. With this, that addition is
+/// a compile error at every match site.
+enum ActionReport<'a> {
+    /// The command ran to an end. Its `output` disposition decides
+    /// whether this is said at all.
+    Completed(&'a ActionOutcome),
+    /// A rung said no before the command was spawned: a variable
+    /// derivation that failed, a `when` that exited non-zero or never
+    /// started, or an off-thread rung completing on a frozen frame.
+    /// `detail` is the reason text when there is one.
+    #[allow(dead_code)] // The gate constructs this next; the composer already speaks it.
+    Declined { rung: Rung, detail: Option<&'a str> },
+    /// The reader answered a confirm with anything but `y`.
+    #[allow(dead_code)] // The confirm gate constructs this next.
+    Cancelled,
+    /// A binding key arrived while another activation held the gate.
+    #[allow(dead_code)] // The gate constructs this next.
+    Busy,
+    /// An activation is in flight. The one STATE in this enum, and the
+    /// only one that goes to the status row instead of the notice row.
+    #[allow(dead_code)] // The status segment constructs this next.
+    Running,
+}
+
+/// The backticked spelling every line about a binding opens with — ONE
+/// label function, so the binding is named identically everywhere and
+/// a cross-line test can assert against a composed expectation rather
+/// than a literal.
+fn action_label(binding: &KeyBinding) -> String {
+    format!("`{}`", binding.spelling)
+}
+
+/// The last non-empty line of an action's output — its conclusion: the
+/// message a script echoes just before `exit 1`, or the result of its
+/// last command. This is why the capture keeps the BOTTOM. Stripped of
+/// the child's own escapes, because the notice row is wrapped in a
+/// faint SGR the child's colour would fight and bleed past.
+fn action_tail(outcome: &ActionOutcome) -> Option<String> {
+    output_lines(&outcome.stdout.concat(), &outcome.stderr.concat())
+        .iter()
+        .rev()
+        .map(|line| strip_escapes(line))
+        .find(|line| !line.trim().is_empty())
+}
+
+/// One thing said about one binding, as ONE row.
+///
+/// **Every** line this feature can produce comes out of this function —
+/// there is no second entry point taking an outcome directly. That is
+/// what makes the exhaustive `match` below a real guarantee: a sixth
+/// kind of report is a compile error here, rather than a new composer
+/// that quietly forgets to name its binding.
+///
+/// `None` means "say nothing", and exactly one case produces it: a
+/// `Completed` report for a binding declaring `output "hide"` whose
+/// command exited cleanly. Every other case speaks, because a non-zero
+/// exit is reportable everywhere else in this program (`exit_badge`,
+/// `append_exit_line`) and `output` names what to do with the OUTPUT,
+/// not whether a failure may be heard. In particular an action that
+/// never STARTED speaks even under `hide` — a spawn failure has no
+/// exit status, so the tempting "present and non-zero" gate would be
+/// silent for exactly the failure that most needs explaining.
+///
+/// The binding is named FIRST and unconditionally: an unattributed
+/// line is indistinguishable from a dead key, which is the bug report
+/// this feature would otherwise generate. The row is clipped HERE, at
+/// composition — a composed frame's row count is run-constant, so a
+/// wrapping notice would add a row the layout did not budget for.
+fn action_line(binding: &KeyBinding, report: ActionReport<'_>, width: usize) -> Option<String> {
+    let label = action_label(binding);
+    let row = match report {
+        ActionReport::Completed(outcome) => match &outcome.result {
+            ActionResult::NotStarted(err) => format!("{label} did not start: {err}"),
+            ActionResult::Exited(status) => {
+                let quiet = matches!(binding.output, BindingOutput::Hide);
+                match exit_badge(Some(*status)) {
+                    // The whole of what `hide` hides.
+                    None if quiet => return None,
+                    badge => {
+                        let token = badge.unwrap_or_else(|| "done".to_string());
+                        match action_tail(outcome) {
+                            Some(tail) => format!("{label} {token} · {tail}"),
+                            None => format!("{label} {token}"),
+                        }
+                    }
+                }
+            }
+        },
+        ActionReport::Declined { rung, detail } => {
+            let name = match rung {
+                Rung::Prepare => "prepare",
+                Rung::When => "when",
+                Rung::Confirm => "confirm",
+                Rung::Command => "command",
+            };
+            match detail {
+                Some(detail) => format!("{label} declined ({name}) · {}", strip_escapes(detail)),
+                None => format!("{label} declined ({name})"),
+            }
+        }
+        ActionReport::Cancelled => format!("{label} cancelled"),
+        ActionReport::Busy => format!("{label} busy — an activation holds the gate"),
+        ActionReport::Running => format!("{label} running"),
+    };
+    Some(truncate_display(&row, width, "…"))
+}
+
+/// What the pager shows for one action: stdout followed by stderr —
+/// the same composition a pane's body takes — with the dropped count
+/// as its own row when the capture was bounded, so a truncated log
+/// never claims to be the whole output.
+fn action_pager_lines(outcome: &ActionOutcome) -> Vec<String> {
+    let mut lines = output_lines(&outcome.stdout.concat(), &outcome.stderr.concat());
+    if let Some(badge) = dropped_badge(outcome.dropped) {
+        lines.push(badge);
+    }
+    lines
+}
+
 fn exit_badge(status: Option<std::process::ExitStatus>) -> Option<String> {
     let status = status?;
     (!status.success()).then(|| match status.code() {
@@ -12180,5 +12393,196 @@ mod tests {
         );
         let out = spawn.command.output().expect("the child spawns");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "eof");
+    }
+    // ─── action_line ────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    fn completed_action(stdout: &str, stderr: &str, raw_status: i32) -> ActionOutcome {
+        use std::os::unix::process::ExitStatusExt;
+        ActionOutcome {
+            activation: ActivationId(1),
+            binding: 0,
+            rung: ActionRung::Command,
+            stdout: stdout
+                .lines()
+                .map(|l| format!("{l}\n").into_bytes())
+                .collect(),
+            stderr: stderr
+                .lines()
+                .map(|l| format!("{l}\n").into_bytes())
+                .collect(),
+            result: ActionResult::Exited(std::process::ExitStatus::from_raw(raw_status)),
+            dropped: 0,
+        }
+    }
+
+    fn never_started_action() -> ActionOutcome {
+        ActionOutcome {
+            activation: ActivationId(1),
+            binding: 0,
+            rung: ActionRung::Command,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            result: ActionResult::NotStarted(std::io::Error::other(
+                "no such program: missing-tool",
+            )),
+            dropped: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_completion_line_names_the_binding() {
+        // Substring, never the whole sentence — the wording must stay
+        // improvable without a test rewrite; what is pinned is that the
+        // binding is named.
+        let binding = declared_binding(Key::Char('r'));
+        let line = action_line(
+            &binding,
+            ActionReport::Completed(&completed_action("done fine", "", 0)),
+            80,
+        )
+        .expect("a status completion speaks");
+        assert!(line.contains("`r`"), "{line}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_zero_exit_is_named_with_the_shipped_vocabulary() {
+        let binding = declared_binding(Key::Char('r'));
+        let exited = action_line(
+            &binding,
+            ActionReport::Completed(&completed_action("", "boom", 1 << 8)),
+            80,
+        )
+        .expect("a failure speaks");
+        assert!(exited.contains("exit 1"), "{exited}");
+        // A signalled child has no code; `exit_badge`'s own arm says
+        // `killed`, and a re-format!ed copy would say `exit ` bare.
+        let killed = action_line(
+            &binding,
+            ActionReport::Completed(&completed_action("", "", 9)),
+            80,
+        )
+        .expect("a kill speaks");
+        assert!(killed.contains("killed"), "{killed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_completion_quotes_the_last_line_of_the_output() {
+        // stdout FOLLOWED BY stderr is the shipped ordering, so the
+        // stderr line is the conclusion here — the message the author
+        // wrote for the reader, echoed just before the exit.
+        let binding = declared_binding(Key::Char('r'));
+        let line = action_line(
+            &binding,
+            ActionReport::Completed(&completed_action(
+                "progress banner\nmiddle",
+                "the conclusion",
+                1 << 8,
+            )),
+            120,
+        )
+        .expect("a failure speaks");
+        assert!(line.contains("the conclusion"), "{line}");
+        assert!(!line.contains("progress banner"), "{line}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hide_is_silent_on_success_and_speaks_on_failure() {
+        // The absence half needs its presence anchor in the SAME test:
+        // `None` is also what a function that always returns None
+        // produces.
+        let mut binding = declared_binding(Key::Char('r'));
+        binding.output = crate::core::dashboard_file::BindingOutput::Hide;
+        assert!(
+            action_line(
+                &binding,
+                ActionReport::Completed(&completed_action("wrote the file", "", 0)),
+                80,
+            )
+            .is_none(),
+            "hide hides exactly the success notice"
+        );
+        let line = action_line(
+            &binding,
+            ActionReport::Completed(&completed_action("", "no cursor", 1 << 8)),
+            80,
+        )
+        .expect("a failure under hide still speaks");
+        assert!(line.contains("`r`"), "{line}");
+        assert!(line.contains("exit 1"), "{line}");
+    }
+
+    #[test]
+    fn hide_speaks_for_an_action_that_never_started() {
+        // The clause an implementer drops: the natural gate — "the
+        // status is present and non-zero" — is silent for an action
+        // that never ran, which is the failure that most needs
+        // explaining.
+        let mut binding = declared_binding(Key::Char('r'));
+        binding.output = crate::core::dashboard_file::BindingOutput::Hide;
+        let line = action_line(
+            &binding,
+            ActionReport::Completed(&never_started_action()),
+            120,
+        )
+        .expect("a spawn failure under hide still speaks");
+        assert!(line.contains("`r`"), "{line}");
+        assert!(line.contains("missing-tool"), "{line}");
+    }
+
+    #[test]
+    fn an_action_that_never_started_does_not_report_exit_zero() {
+        let binding = declared_binding(Key::Char('r'));
+        let line = action_line(
+            &binding,
+            ActionReport::Completed(&never_started_action()),
+            120,
+        )
+        .expect("a spawn failure speaks");
+        assert!(line.contains("`r`"), "{line}");
+        assert!(line.contains("missing-tool"), "{line}");
+        assert!(!line.contains("exit 0"), "{line}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_completion_line_fits_the_row() {
+        // A composed frame's row count is run-constant, so a notice
+        // that wraps adds a row the layout did not budget for.
+        let binding = declared_binding(Key::Char('r'));
+        let long = "x".repeat(5000);
+        let line = action_line(
+            &binding,
+            ActionReport::Completed(&completed_action(&long, "", 1 << 8)),
+            60,
+        )
+        .expect("a failure speaks");
+        assert!(
+            crate::core::measure::display_width(&line) <= 60,
+            "clipped to the row: {}",
+            line.len()
+        );
+        assert!(line.contains("…"), "clipped through truncate_display");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_completion_line_carries_no_child_escapes() {
+        // The notice row is wrapped in a faint SGR; a child's own
+        // colour inside it fights that wrapper and can bleed past the
+        // row.
+        let binding = declared_binding(Key::Char('r'));
+        let line = action_line(
+            &binding,
+            ActionReport::Completed(&completed_action("", "\x1b[31mboom\x1b[0m", 1 << 8)),
+            120,
+        )
+        .expect("a failure speaks");
+        assert!(line.contains("boom"), "{line}");
+        assert!(!line.contains("\x1b["), "stripped: {line:?}");
     }
 }

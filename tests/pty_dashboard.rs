@@ -4934,7 +4934,13 @@ fn a_binding_runs_from_a_focused_pane() {
         "the focus segment never appeared"
     );
     session.write_bytes(b"x");
-    wait_for_counter(&counter, 1);
+    // The completion notice quotes the counter's tail, so waiting on it
+    // both DRAINS the pty (an undrained master stalls the loop's
+    // writer) and proves the run.
+    assert!(
+        wait_for(&session, &mut terminal, b"count-1", Duration::from_secs(5)),
+        "the focused press never ran"
+    );
     // The zoomed arm, since it is cheap from here.
     session.write_bytes(b"z");
     assert!(
@@ -4942,7 +4948,10 @@ fn a_binding_runs_from_a_focused_pane() {
         "the zoom segment never appeared"
     );
     session.write_bytes(b"x");
-    wait_for_counter(&counter, 2);
+    assert!(
+        wait_for(&session, &mut terminal, b"count-2", Duration::from_secs(5)),
+        "the zoomed press never ran"
+    );
     assert_counter_settled_at(&counter, 2);
     session.write_bytes(b"q");
     assert!(
@@ -5020,6 +5029,248 @@ fn a_frozen_frame_runs_no_binding() {
     let _ = drain_for(&session, Duration::from_millis(400));
     session.write_bytes(b"x");
     wait_for_counter(&counter, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The default disposition (no `output` declared — ruled `status`): one
+/// line on the notice row naming the binding and its exit.
+#[test]
+fn a_status_binding_reports_its_exit_on_the_notice_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        "row-gap 0\n\ndefaults {\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}\n\n\
+         key \"r\" {\n    description \"fails\"\n    command \"echo the-reason >&2; exit 1\"\n}\n\n\
+         pane \"steady\" {\n    interval \"1h\"\n    command \"echo steady-content\"\n}\n",
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`r`", b"exit 1"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The hide ruling's silent half, anchored by the counter: the action
+/// really ran, and nothing was painted about it.
+#[test]
+fn a_hide_binding_paints_nothing_when_it_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"quiet worker\"\n    command \"{counter_cmd} > /dev/null\"\n    output \"hide\"\n}}\n\n\
+             pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+            counter_cmd = counter_cmd(&counter),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    wait_for_counter(&counter, 1);
+    // The stream AFTER the run confirms nothing was said: the needle is
+    // the backticked spelling, which no fixture text contains.
+    let settled = drain_for(&session, Duration::from_millis(600));
+    assert!(
+        !contains(&settled, b"`r`"),
+        "hide painted a success notice: {:?}",
+        String::from_utf8_lossy(&settled)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The hide ruling's loud half: a failure under `hide` still emits the
+/// full line — `output` names the output, not whether a failure may be
+/// heard.
+#[test]
+fn a_hide_binding_still_reports_a_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        "row-gap 0\n\ndefaults {\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}\n\n\
+         key \"r\" {\n    description \"guarded\"\n    command \"echo the-reason >&2; exit 1\"\n    output \"hide\"\n}\n\n\
+         pane \"steady\" {\n    interval \"1h\"\n    command \"echo steady-content\"\n}\n",
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`r`", b"exit 1", b"the-reason"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The pager disposition: the terminal is handed over, the captured
+/// output appears, and — the half that matters — the board repaints its
+/// live frame afterwards. A pager route that never resumes is the
+/// failure mode worth catching.
+#[test]
+fn a_pager_binding_hands_the_terminal_over_and_comes_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fast = dir.path().join("fast");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"page me\"\n    command \"echo pager-payload\"\n    output \"pager\"\n}}\n\n\
+             pane \"fast\" {{\n    interval \"100ms\"\n    command \"{fast_cmd}\"\n}}\n",
+            fast_cmd = labeled_counter_cmd(&fast, "fast"),
+        ),
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_PAGER", "cat")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"fast-1", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"pager-payload", b"fast-"],
+        Duration::from_secs(8),
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// An unavailable pager degrades to ONE row carrying BOTH facts: the
+/// pager's reason and the action's completion — the reader must not be
+/// left unable to tell whether the action ran.
+#[test]
+fn a_pager_that_cannot_launch_degrades_to_one_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        "row-gap 0\n\ndefaults {\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}\n\n\
+         key \"r\" {\n    description \"page me\"\n    command \"echo pager-payload\"\n    output \"pager\"\n}\n\n\
+         pane \"steady\" {\n    interval \"1h\"\n    command \"echo steady-content\"\n}\n",
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_PAGER", "rat-no-such-pager-xyz")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"set RAT_PAGER", b"`r`"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The non-rest arm for the dispositions: the same status line appears
+/// on a FRAME-SCROLLED board, waiting on the scrolled needle first so
+/// the arm cannot silently press at live rest.
+#[test]
+fn the_dispositions_hold_on_a_frame_scrolled_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        "row-gap 0\n\ndefaults {\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n}\n\n\
+         key \"r\" {\n    description \"fails\"\n    command \"echo scrolled-reason >&2; exit 1\"\n}\n\n\
+         pane \"a\" {\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}\n\
+         pane \"b\" {\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}\n",
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(3)),
+        "the frame never scrolled — the binding would press at live rest"
+    );
+    session.write_bytes(b"r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`r`", b"exit 1"],
+        Duration::from_secs(5),
+    );
     session.write_bytes(b"q");
     assert!(
         !session.kill_if_alive(Duration::from_secs(2)),
