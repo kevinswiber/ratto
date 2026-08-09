@@ -4651,3 +4651,68 @@ fn the_live_route_expands_like_the_piped_ones() {
     );
     session.kill_if_alive(Duration::from_secs(2));
 }
+
+/// INV-3's falsification arm, and the only test in the phase that
+/// presses a key: nothing sends a keystroke down a pipe, so the piped
+/// byte-identity witnesses would pass just as happily against a build
+/// that dispatched bindings on piped boards. A `--once` run on a real
+/// terminal is the cell where a key CAN arrive and must still do
+/// nothing — `interactive` is `is_tty && !once`, and the input read
+/// sits below that gate.
+///
+/// The pty stream is deliberately NOT byte-compared here: a `--once`
+/// run never enables raw mode, so the line discipline echoes the
+/// keystroke into the captured output. The counter file is the
+/// child-side evidence; the stream is not.
+#[test]
+fn a_once_board_on_a_terminal_never_runs_a_binding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let stable = dir.path().join("stable");
+    seed(&stable, "stable-content\n");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+             key \"x\" {{\n    description \"append to the counter\"\n    command \"{counter_cmd}\"\n}}\n\n\
+             pane \"slow\" {{\n    interval \"1h\"\n    command \"sleep 1; echo ready\"\n}}\n\n\
+             pane \"stable\" {{\n    interval \"1h\"\n    command \"cat {stable}\"\n}}\n",
+            counter_cmd = counter_cmd(&counter),
+            stable = stable.display(),
+        ),
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", "--once", &decl.display().to_string()],
+        &[],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // The bound key, pressed while the slow pane still holds the run
+    // open — the moment a gate computed from `is_tty` alone would fire.
+    session.write_bytes(b"x");
+    // One frame carries both panes in declaration order, so both
+    // needles are asserted over one read — a second `wait_for` would
+    // start a fresh buffer and miss bytes the first already consumed.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"ready", b"stable-content"],
+        Duration::from_secs(5),
+    );
+    // And again after the frame painted, in case the first byte raced
+    // the spawn.
+    session.write_bytes(b"x");
+    // The presence anchors: the frame painted (above) and the run
+    // exits on its own — a board that failed to load would satisfy
+    // "the counter is zero" perfectly.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !session.exited() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "--once never exited on its own"
+        );
+        let _ = session.read_available(Duration::from_millis(50));
+    }
+    assert_counter_settled_at(&counter, 0);
+}

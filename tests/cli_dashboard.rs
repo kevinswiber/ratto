@@ -2831,3 +2831,133 @@ fn a_binding_that_names_one_of_rats_own_keys_is_refused_at_load() {
             .stderr(predicates::str::contains("board.kdl"));
     }
 }
+
+/// The same board twice: without bindings, and with. Anything that
+/// differs between these two beyond the `key` blocks makes the
+/// comparison meaningless, so they are generated from one template —
+/// and the helper asserts the only difference IS the key blocks.
+fn board_pair(dir: &std::path::Path, keys: &str) -> (String, String) {
+    let seeded = dir.join("seed.txt");
+    std::fs::write(&seeded, "inert-needle\n").expect("seed");
+    // `chrome #false`: the footer row carries a wall-clock stamp, and
+    // two runs a second apart would differ in the clock rather than in
+    // anything a binding could touch. The pane content and stderr are
+    // the compared surface.
+    let body = |keys: &str| {
+        format!(
+            "{keys}pane \"a\" {{\n    interval \"never\"\n    command \"{bin}\" \"__cat\" \"{seed}\"\n    height 3\n    chrome #false\n    border \"none\"\n}}\n",
+            bin = rat_bin().escape_default(),
+            seed = seeded.display().to_string().escape_default(),
+        )
+    };
+    let (plain, bound) = (body(""), body(keys));
+    assert_eq!(
+        bound,
+        format!("{keys}{plain}"),
+        "the pair differs only in the key blocks"
+    );
+    (
+        fixture(dir, "plain.kdl", &plain),
+        fixture(dir, "bound.kdl", &bound),
+    )
+}
+
+/// The `key` blocks the bound half of every pair declares. The command
+/// is irrelevant on an inert route — nothing can press the key — but a
+/// real program keeps the fixture honest.
+const INERT_KEYS: &str =
+    "key \"x\" {\n    description \"never reachable here\"\n    command \"true\"\n}\n\n";
+
+/// Drain whatever else arrives inside the window, so a byte comparison
+/// compares settled output rather than racing a late chunk.
+fn settle(stream: &std::sync::mpsc::Receiver<Vec<u8>>, seen: &mut String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match stream.recv_timeout(left) {
+            Ok(chunk) => seen.push_str(&String::from_utf8_lossy(&chunk)),
+            Err(_) => return,
+        }
+    }
+}
+
+/// One piped, live run of a board: spawn, read until the pane's
+/// needle, settle, kill. Returns (stdout, stderr) as captured.
+fn piped_live_capture(decl: &str) -> (String, String) {
+    let dash = std::process::Command::new(rat_bin())
+        .args(["dashboard", decl])
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "60")
+        .env("RAT_HEIGHT", "12")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat dashboard piped");
+    let mut dash = KillOnDrop(dash);
+    let out = stdout_stream(dash.0.stdout.take().expect("piped stdout"));
+    let err = stderr_stream(dash.0.stderr.take().expect("piped stderr"));
+    let mut seen_out = String::new();
+    let mut seen_err = String::new();
+    read_until(&out, &mut seen_out, "inert-needle");
+    settle(&out, &mut seen_out);
+    settle(&err, &mut seen_err);
+    (seen_out, seen_err)
+}
+
+/// INV-3's byte-level half, piped live route. A witness rather than a
+/// regression test: it was green the first time it ran, and its value
+/// is that the binding transport can never move a piped board's bytes.
+/// stderr matters as much as stdout — a binding diagnostic would land
+/// there, and the invariant says no behavior change of ANY kind.
+#[test]
+fn a_piped_live_board_is_byte_identical_with_and_without_bindings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (plain, bound) = board_pair(dir.path(), INERT_KEYS);
+    let (out_plain, err_plain) = piped_live_capture(&plain);
+    let (out_bound, err_bound) = piped_live_capture(&bound);
+    assert_eq!(out_plain, out_bound, "stdout moved");
+    assert_eq!(err_plain, err_bound, "stderr moved");
+}
+
+/// INV-3's byte-level half, piped `--once` route — the cheapest
+/// witness in the plan: two complete runs, compared byte for byte.
+#[test]
+fn a_piped_once_board_is_byte_identical_with_and_without_bindings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (plain, bound) = board_pair(dir.path(), INERT_KEYS);
+    let run = |decl: &str| {
+        rat()
+            .env("NO_COLOR", "1")
+            .env("RAT_WIDTH", "60")
+            .env("RAT_HEIGHT", "12")
+            .args(["dashboard", decl, "--once"])
+            .output()
+            .expect("run rat dashboard --once")
+    };
+    let (a, b) = (run(&plain), run(&bound));
+    assert!(a.status.success(), "plain board failed: {a:?}");
+    assert!(b.status.success(), "bound board failed: {b:?}");
+    assert_eq!(a.stdout, b.stdout, "stdout moved");
+    assert_eq!(a.stderr, b.stderr, "stderr moved");
+}
+
+/// The anti-vacuity guard: two boards that both refused to load would
+/// produce identical, empty output — green witnesses proving the
+/// opposite of what they claim. This pins that the bound half loads
+/// and renders, so the byte comparisons above compare something.
+#[test]
+fn a_board_declaring_bindings_still_loads_and_renders() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_, bound) = board_pair(dir.path(), INERT_KEYS);
+    rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "60")
+        .env("RAT_HEIGHT", "12")
+        .args(["dashboard", &bound, "--once"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("inert-needle"));
+}

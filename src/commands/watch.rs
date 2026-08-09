@@ -1538,6 +1538,16 @@ pub(crate) fn run_registry(
             .map(|r| r.schedule.nap(Instant::now(), SLICE))
             .min()
             .unwrap_or(SLICE);
+        // Nothing below this line runs without a keyboard: the tty
+        // read, the event dispatch and every resolver sit under it, so
+        // a piped, a `--once`, and a non-tty run take no input at all.
+        // That is the whole of the gate — there is no second, per-
+        // feature check anywhere, and a declared key binding is inert
+        // here for exactly this reason.
+        //
+        // Hoisting the event read above this nap would look like a
+        // responsiveness win and would let a piped board SPAWN
+        // COMMANDS from whatever is on the controlling terminal.
         if !interactive {
             std::thread::sleep(nap);
             continue;
