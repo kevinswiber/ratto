@@ -455,6 +455,53 @@ pub fn not_started(source: SourceId, err: std::io::Error) -> TickOutcome {
     }
 }
 
+/// Which file, if any, one key-action activation's `#!` body executes —
+/// and the directory that file lives in.
+///
+/// Every shebang variant carries the directory share, so "a shebang form
+/// always has a directory owner" is a property of the TYPE rather than
+/// of a caller remembering to pass one. There is no spelling of
+/// `Shared`-without-a-directory to get wrong.
+#[allow(dead_code)] // The activation consumes this next; only tests drive it today.
+pub enum ActionScript {
+    /// No `#!` body, or an argv program.
+    None,
+    /// A STATIC body, written once at load. The run owns the file; this
+    /// activation owns a share of the directory holding it.
+    Shared {
+        path: std::path::PathBuf,
+        dir: Arc<tempfile::TempDir>,
+    },
+    /// A TEMPLATED body, written for this activation alone. It owns the
+    /// file AND a share of the directory; both travel with the command
+    /// and are dropped after the child is reaped.
+    Owned {
+        file: tempfile::TempPath,
+        dir: Arc<tempfile::TempDir>,
+    },
+}
+
+/// Everything ONE key-action activation needs in order to start: the
+/// configured command, and whatever must stay alive until its child is
+/// reaped.
+///
+/// These are ONE value because their lifetimes are coupled: the script
+/// must outlive `Command::spawn`, which happens on another thread, so a
+/// handle held anywhere but beside the command is a handle that drops
+/// too early. The worker takes this whole value.
+#[allow(dead_code)] // The activation consumes this next; only tests drive it today.
+pub struct ActionSpawn {
+    pub command: std::process::Command,
+    /// The per-activation file, when the body was templated.
+    pub script: Option<tempfile::TempPath>,
+    /// The DIRECTORY the script lives in — shared with every pane's
+    /// script and with every other activation. Held for EVERY shebang
+    /// form, static included: owning a path inside a directory does not
+    /// keep the directory alive, and an action worker is neither joined
+    /// nor barred by a shutdown flag, so the loop is not the last user.
+    pub script_dir: Option<Arc<tempfile::TempDir>>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write as _};

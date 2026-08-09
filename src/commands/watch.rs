@@ -21,7 +21,8 @@ use crossterm::tty::IsTty;
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
 use crate::core::child::{
-    ChildSlot, ShutdownGuard, TickEvent, not_started, run_tick, spawn_live_tick, spawn_tick,
+    ActionScript, ActionSpawn, ChildSlot, ShutdownGuard, TickEvent, not_started, run_tick,
+    spawn_live_tick, spawn_tick,
 };
 use crate::core::dashboard_file::KeyBinding;
 use crate::core::duration::{brief_duration, parse_interval};
@@ -312,7 +313,7 @@ pub(crate) fn run_registry(
     // remove the directory here and now — and it is declared BEFORE the
     // shutdown guards so it drops after them: children die first, then
     // the files they were running.
-    let mut scripts = ScriptFiles::materialize(&registry)?;
+    let mut scripts = ScriptFiles::materialize(&registry, &session.bindings)?;
     let _raw_guard = if interactive {
         Some(RawModeGuard::enable().context("enabling raw mode")?)
     } else {
@@ -4666,6 +4667,129 @@ fn build_source_command(
     command
 }
 
+/// The child ONE key-action runs, fully configured on the loop thread.
+///
+/// The single construction point for every process this feature spawns:
+/// the action itself, and the `when` precondition that gates it. Later
+/// plans extend this function's ENVIRONMENT and nothing else — a second
+/// place that builds an action's command is a second place for a
+/// variable to go missing, and the failure is silent.
+///
+/// Deliberately NOT parameterized by geometry: an action paints into no
+/// box, so a pane's RAT_WIDTH/RAT_HEIGHT would be a different meaning
+/// under the same name — see `build_source_command` for what those
+/// variables actually promise. If a pager script ever needs the
+/// terminal's width, that is a NEW name, never RAT_WIDTH carrying a
+/// second meaning.
+///
+/// Deliberately NOT parameterized by `interactive` either: a binding
+/// only exists while ratto owns the keyboard, so the null stdin is
+/// unconditional here — which is what makes "no key is ever forwarded
+/// to a child, no stdin plumbing of any kind" a property of the type
+/// rather than a rule to remember.
+#[allow(dead_code)] // The activation consumes this next; only tests drive it today.
+fn build_action_command(
+    program: &ResolvedProgram,
+    shell: &ShellMode,
+    script: ActionScript,
+    appearance: Appearance,
+) -> ActionSpawn {
+    // The command and the file's owner are produced TOGETHER, because
+    // they leave together: `ActionSpawn` is one value precisely so the
+    // handle cannot be dropped before the spawn that needs it.
+    let (mut command, owner, dir) = match (program, script) {
+        // A `#!` body written once at load. The run's TempDir owns the
+        // file; this activation borrows the path and holds the
+        // directory share.
+        (ResolvedProgram::Script(body), ActionScript::Shared { path, dir }) => {
+            let line = shebang(body).expect("a materialized script has a shebang");
+            (
+                interpreter_command(SHEBANG_ARM, &line, &path),
+                None,
+                Some(dir),
+            )
+        }
+        // A `#!` body written for THIS activation. Same command shape;
+        // the difference is entirely who owns the file afterwards.
+        (ResolvedProgram::Script(body), ActionScript::Owned { file, dir }) => {
+            let line = shebang(body).expect("a materialized script has a shebang");
+            let command = interpreter_command(SHEBANG_ARM, &line, &file);
+            (command, Some(file), Some(dir))
+        }
+        // No file: a shebang-less body runs through the binding's
+        // shell. Load's ladder guarantees the expect — a shebang-less
+        // binding body never resolves to Direct.
+        (ResolvedProgram::Script(body), ActionScript::None) => {
+            let (program, flags) = shell_invocation(shell)
+                .expect("a shebang-less script body never resolves to Direct");
+            (shell_command(&program, flags, body), None, None)
+        }
+        // Load guarantees the argv non-empty, so `argv[0]` is not a
+        // panic path.
+        (ResolvedProgram::Argv(argv), _) => {
+            let command = match shell_invocation(shell) {
+                Some((program, flags)) => shell_command(&program, flags, &argv.join(" ")),
+                None => {
+                    let mut cmd = std::process::Command::new(&argv[0]);
+                    cmd.args(&argv[1..]);
+                    cmd
+                }
+            };
+            (command, None, None)
+        }
+    };
+    command.stdin(std::process::Stdio::null());
+    command.env("RAT_APPEARANCE", appearance.as_str());
+    // All three fields from the ONE construction point — no caller
+    // attaches anything afterwards, because a caller that forgets is a
+    // shutdown race nobody sees.
+    ActionSpawn {
+        command,
+        script: owner,
+        script_dir: dir,
+    }
+}
+
+/// Write one activation's templated `#!` body, through the same
+/// classification seam the materializer uses — `script_file` supplies
+/// the platform suffix Windows execution needs and the `cmd` body
+/// transformation — never a parallel write.
+///
+/// The stem names the ACTIVATION rather than the binding, so two
+/// concurrent activations of one binding cannot collide, and
+/// `create_new` turns any collision into a loud error rather than one
+/// activation silently executing another's bytes. Never rewrite a file
+/// in place: a file a child may be executing is ETXTBSY on unix and a
+/// sharing violation on Windows.
+#[allow(dead_code)] // The activation consumes this next; only tests drive it today.
+fn activation_script(
+    dir: &std::sync::Arc<tempfile::TempDir>,
+    stem: &str,
+    body: &str,
+) -> std::io::Result<ActionScript> {
+    let line = shebang(body).expect("only shebang bodies are materialized");
+    let (name, bytes) = script_file(SHEBANG_ARM, &line, stem, body);
+    let path = dir.path().join(name);
+    // Mode AT creation, exactly as the materializer does — no window
+    // where the file lacks it, and the kernel arm execs the file
+    // itself; the writable handle drops before any spawn (ETXTBSY).
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o700);
+    }
+    use std::io::Write;
+    options
+        .open(&path)
+        .and_then(|mut file| file.write_all(bytes.as_bytes()))?;
+    Ok(ActionScript::Owned {
+        file: tempfile::TempPath::try_from_path(path)?,
+        dir: std::sync::Arc::clone(dir),
+    })
+}
+
 /// How many lines any one source retains.
 ///
 /// Measured rather than picked: a thousand lines is about 2% of a loop
@@ -5828,22 +5952,26 @@ fn spawn_program(spec: &SourceSpec) -> String {
     }
 }
 
-/// Every source's materialized script, by `SourceId`, and the private
-/// directory holding them. Bodies are static for a run: written ONCE
-/// at load, the path re-executed on every respawn tick, the directory
-/// removed when this drops (children are already down by drop order —
-/// the shutdown guards are declared after this binding). A dashboard
+/// Every source's materialized script, by `SourceId`, the bindings'
+/// static `#!` bodies beside them, and the private directory holding
+/// them all. Bodies are static for a run: written ONCE at load, the
+/// path re-executed on every respawn tick, the directory removed when
+/// the LAST holder of the share drops (children are already down by
+/// drop order — the shutdown guards are declared after this binding —
+/// and an in-flight action worker holds its own share). A dashboard
 /// with no `#!` body builds the `Default` — no directory, no syscall,
 /// nothing on disk. Removal failure is silent litter in the OS tmpdir
 /// (`TempDir::drop` ignores errors by design); never a retry, never a
-/// message.
+/// message — and a process exiting while an action is in flight leaves
+/// the same litter, since a thread killed at exit does not unwind.
 #[derive(Default)]
 struct ScriptFiles {
-    /// Held for Drop alone: OWNING the TempDir is what removes the
-    /// directory when this drops. Nothing reads it — the paths below
-    /// are the lookups — so the field is read only by the templated
-    /// re-materialization path.
-    dir: Option<tempfile::TempDir>,
+    /// SHARED, not merely owned: every activation running a shebang
+    /// script holds a clone (`dir_handle`), so the directory is
+    /// removed when the LAST user drops rather than when the loop
+    /// does. Action workers are neither joined nor barred by a
+    /// shutdown flag, so the loop is not the last user.
+    dir: Option<std::sync::Arc<tempfile::TempDir>>,
     paths: Vec<Option<std::path::PathBuf>>,
     /// The hash of the bytes each id's file was last written with —
     /// the bytes ACTUALLY written (post-wrapper), so a change in the
@@ -5856,13 +5984,21 @@ struct ScriptFiles {
     /// Windows, both intermittent and only under `defer`, which is
     /// exactly where no one would look.
     generations: Vec<usize>,
+    /// The bindings' static `#!` bodies, by binding index — a second
+    /// index space that also starts at 0, which is why their stems are
+    /// prefixed `key-` where a pane's begin with its numeric id.
+    binding_paths: Vec<Option<std::path::PathBuf>>,
 }
 
 impl ScriptFiles {
-    /// Write every shebang body once. A no-shebang `Script` body gets
-    /// no file — it runs through the shell fallback route instead, so
-    /// `path` answering `Some` is exactly "this body has a shebang".
-    fn materialize(registry: &Registry) -> anyhow::Result<ScriptFiles> {
+    /// Write every shebang body once — the panes' and the bindings'
+    /// static ones alike. A no-shebang `Script` body gets no file — it
+    /// runs through the shell fallback route instead, so `path`
+    /// answering `Some` is exactly "this body has a shebang". A
+    /// TEMPLATED binding body gets no slot at all: its bytes exist
+    /// only at an activation, which writes its own file
+    /// (`activation_script`).
+    fn materialize(registry: &Registry, bindings: &[KeyBinding]) -> anyhow::Result<ScriptFiles> {
         // A TEMPLATED shebang body gets a slot but no bytes at load —
         // its bytes do not exist until a spawn's map does, so it is
         // written on first use (`ensure`) and its write failure is
@@ -5877,7 +6013,19 @@ impl ScriptFiles {
                 SourceProgram::Argv(_) => None,
             })
             .collect();
-        if bodies.is_empty() {
+        let binding_bodies: Vec<(usize, Shebang, &str)> = bindings
+            .iter()
+            .enumerate()
+            .filter_map(|(index, binding)| match &binding.program {
+                crate::core::dashboard_file::BindingProgram::Script(body)
+                    if body.refs().is_empty() =>
+                {
+                    shebang(body.as_str()).map(|line| (index, line, body.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        if bodies.is_empty() && binding_bodies.is_empty() {
             return Ok(ScriptFiles::default());
         }
         let mut builder = tempfile::Builder::new();
@@ -5922,16 +6070,56 @@ impl ScriptFiles {
             hashes[id.0] = Some(signature(bytes.as_bytes()));
             paths[id.0] = Some(path);
         }
+        let mut binding_paths = vec![None; bindings.len()];
+        for (index, line, body) in binding_bodies {
+            // The `key-` prefix is namespace separation, not decor: a
+            // binding index and a source index both start at 0, and a
+            // shared stem would hand one board's binding a pane's body.
+            let stem = format!("key-{index}");
+            let (name, bytes) = script_file(SHEBANG_ARM, &line, &stem, body);
+            let path = dir.path().join(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o700);
+            }
+            use std::io::Write;
+            options
+                .open(&path)
+                .and_then(|mut file| file.write_all(bytes.as_bytes()))
+                .with_context(|| {
+                    format!("writing the script for key {:?}", bindings[index].spelling)
+                })?;
+            binding_paths[index] = Some(path);
+        }
         Ok(ScriptFiles {
-            dir: Some(dir),
+            dir: Some(std::sync::Arc::new(dir)),
             paths,
             hashes,
             generations: vec![0; count],
+            binding_paths,
         })
     }
 
     fn path(&self, id: SourceId) -> Option<&std::path::Path> {
         self.paths.get(id.0)?.as_deref()
+    }
+
+    /// The static `#!` body one binding executes, by binding index —
+    /// `None` for an argv binding, a shebang-less body, or a templated
+    /// one (which writes per activation instead).
+    #[allow(dead_code)] // The activation consumes this next; only tests drive it today.
+    fn binding_path(&self, index: usize) -> Option<&std::path::Path> {
+        self.binding_paths.get(index)?.as_deref()
+    }
+
+    /// The directory handle an activation must hold while it runs a
+    /// script from here. `None` when this board materialized nothing.
+    #[allow(dead_code)] // The activation consumes this next; only tests drive it today.
+    fn dir_handle(&self) -> Option<std::sync::Arc<tempfile::TempDir>> {
+        self.dir.clone()
     }
 
     /// The path `id`'s child should execute, given the body this spawn
@@ -10228,7 +10416,7 @@ mod tests {
     fn a_dashboard_without_a_script_body_creates_no_temp_directory() {
         // No shebang body, no directory, no syscall — the Default.
         let registry = Registry::single(source_spec(&["true"], ShellMode::Direct), None);
-        let scripts = ScriptFiles::materialize(&registry).unwrap();
+        let scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
         assert!(scripts.dir.is_none());
         assert!(scripts.path(SourceId(0)).is_none());
     }
@@ -10237,7 +10425,7 @@ mod tests {
     fn a_shebang_body_is_written_once_where_its_source_can_find_it() {
         let registry =
             Registry::single(script_spec("#!/bin/sh\necho hi", ShellMode::Platform), None);
-        let scripts = ScriptFiles::materialize(&registry).unwrap();
+        let scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
         let path = scripts
             .path(SourceId(0))
             .expect("a shebang body has a path");
@@ -10256,7 +10444,7 @@ mod tests {
         // A no-shebang Script body gets NO file — it takes the shell
         // fallback route instead.
         let registry = Registry::single(script_spec("echo hi", ShellMode::Platform), None);
-        let scripts = ScriptFiles::materialize(&registry).unwrap();
+        let scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
         assert!(scripts.path(SourceId(0)).is_none());
         assert!(scripts.dir.is_none());
     }
@@ -10271,7 +10459,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let registry =
             Registry::single(script_spec("#!/bin/sh\necho hi", ShellMode::Platform), None);
-        let scripts = ScriptFiles::materialize(&registry).unwrap();
+        let scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
         let path = scripts.path(SourceId(0)).unwrap().to_path_buf();
         let dir = path.parent().unwrap().to_path_buf();
         for p in [&dir, &path] {
@@ -10290,7 +10478,8 @@ mod tests {
         let mut spec = script_spec("#!/bin/sh\necho hi", ShellMode::Platform);
         spec.id = "p".repeat(254);
         let registry = Registry::single(spec, None);
-        let scripts = ScriptFiles::materialize(&registry).expect("a long id still materializes");
+        let scripts =
+            ScriptFiles::materialize(&registry, &[]).expect("a long id still materializes");
         let name = scripts
             .path(SourceId(0))
             .expect("a shebang body has a path")
@@ -10306,7 +10495,7 @@ mod tests {
     fn the_script_directory_leaves_with_the_guard() {
         let registry =
             Registry::single(script_spec("#!/bin/sh\necho hi", ShellMode::Platform), None);
-        let scripts = ScriptFiles::materialize(&registry).unwrap();
+        let scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
         let dir = scripts
             .path(SourceId(0))
             .unwrap()
@@ -10800,7 +10989,7 @@ mod tests {
                 SourceProgram::Argv(vec!["echo".into(), "hi".into()]),
                 ShellMode::Direct,
             );
-            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let mut scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
             let vars = SpawnVariables::default();
             let resolved = resolve_spawn(&registry, &mut scripts, &vars, SourceId(0))
                 .expect("a template-free program cannot fail to resolve");
@@ -10822,7 +11011,7 @@ mod tests {
                 SourceProgram::Argv(vec!["prog".into(), "style".into(), "{{msg}}".into()]),
                 ShellMode::Direct,
             );
-            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let mut scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
             let vars = SpawnVariables::new(
                 VariableBlock::default(),
                 Bindings::from([("msg".to_string(), "one two".to_string())]),
@@ -10860,7 +11049,7 @@ mod tests {
                 ]),
                 ShellMode::Direct,
             );
-            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let mut scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
             let vars = SpawnVariables::new(
                 VariableBlock::default(),
                 Bindings::from([("msg".to_string(), "expanded".to_string())]),
@@ -10888,7 +11077,7 @@ mod tests {
                 SourceProgram::Argv(vec!["prog".into(), Template::extract("{{n}} {{n}}")]),
                 ShellMode::Direct,
             );
-            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let mut scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
             let resolved =
                 resolve_spawn(&registry, &mut scripts, &vars, SourceId(0)).expect("resolves");
             assert_eq!(runs(&counter), 1, "one derivation for two references");
@@ -10921,7 +11110,7 @@ mod tests {
                 SourceProgram::Argv(vec!["prog".into(), Template::extract("{{n}}")]),
                 ShellMode::Direct,
             );
-            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let mut scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
             let resolved =
                 resolve_spawn(&registry, &mut scripts, &vars, SourceId(0)).expect("resolves");
             let first = source_command(
@@ -10950,7 +11139,7 @@ mod tests {
                 SourceProgram::Script("#!/bin/sh\necho hi".into()),
                 ShellMode::Platform,
             );
-            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let mut scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
             let line = shebang("#!/bin/sh\necho hi").expect("a shebang");
             let before = scripts
                 .path(SourceId(0))
@@ -10978,7 +11167,7 @@ mod tests {
                 SourceProgram::Script("#!/bin/sh\necho hi".into()),
                 ShellMode::Platform,
             );
-            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let mut scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
             let line = shebang("#!/bin/sh\necho hi").expect("a shebang");
             let before = scripts
                 .path(SourceId(0))
@@ -11019,7 +11208,7 @@ mod tests {
                 SourceProgram::Argv(vec!["prog".into(), Template::extract("{{n}}")]),
                 ShellMode::Direct,
             );
-            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let mut scripts = ScriptFiles::materialize(&registry, &[]).unwrap();
             let err = resolve_spawn(&registry, &mut scripts, &vars, SourceId(0))
                 .expect_err("the derivation fails");
             // The identity was attached inside the resolver's own walk;
@@ -11482,5 +11671,358 @@ mod tests {
             ),
             WatchAction::RunBinding(0)
         );
+    }
+    // ─── build_action_command ───────────────────────────────────────
+
+    /// A binding whose program is a `#!` body. The shell field is inert
+    /// on the shebang arms; `Platform` is the honest post-ladder value.
+    fn script_binding(body: &str) -> crate::core::dashboard_file::KeyBinding {
+        crate::core::dashboard_file::KeyBinding {
+            key: Key::Char('x'),
+            spelling: "x".to_string(),
+            description: "x".to_string(),
+            program: crate::core::dashboard_file::BindingProgram::Script(Template::extract(body)),
+            shell: crate::core::registry::ShellMode::Platform,
+            when: None,
+            when_shell: None,
+            output: crate::core::dashboard_file::BindingOutput::Status,
+            confirm: None,
+        }
+    }
+
+    fn action_envs(cmd: &std::process::Command) -> std::collections::HashMap<String, String> {
+        cmd.get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_action_command_runs_the_declared_argv_verbatim() {
+        let program =
+            ResolvedProgram::Argv(vec!["some-tool".into(), "--flag".into(), "value".into()]);
+        let spawn = build_action_command(
+            &program,
+            &ShellMode::Direct,
+            ActionScript::None,
+            Appearance::Dark,
+        );
+        assert_eq!(program_of(&spawn.command), "some-tool");
+        assert_eq!(argv_of(&spawn.command), ["--flag", "value"]);
+    }
+
+    #[test]
+    fn an_action_under_a_named_shell_runs_that_program() {
+        // Through `shell_invocation` + `shell_command`, not a
+        // hand-rolled spawn — which is what carries the Windows `/C`
+        // raw-arg rule to actions for free.
+        let program = ResolvedProgram::Argv(vec!["echo hi".into()]);
+        let spawn = build_action_command(
+            &program,
+            &ShellMode::Named("fish".to_string()),
+            ActionScript::None,
+            Appearance::Dark,
+        );
+        assert_eq!(program_of(&spawn.command), "fish");
+        assert_eq!(argv_of(&spawn.command), ["-c", "echo hi"]);
+    }
+
+    #[test]
+    fn an_action_shell_inherits_the_documents_defaults() {
+        // The resolution half is load's (the binding record carries the
+        // resolved mode); this pins that the builder honors what load
+        // resolved, end to end from the document's bytes.
+        let resolve = |text: &str| {
+            let file =
+                crate::core::dashboard_kdl::parse_styled(text, false).expect("the board parses");
+            file.resolve_bindings(&crate::core::template::Bindings::new())
+                .expect("the bindings load")
+                .remove(0)
+        };
+        let inherited = resolve(
+            "defaults { shell \"fish\"\nheight 3 }\nkey \"r\" { description \"x\"\ncommand \"echo hi\" }\npane \"a\" { command \"true\"\nheight 3 }\n",
+        );
+        let program = ResolvedProgram::Argv(vec!["echo hi".into()]);
+        let spawn = build_action_command(
+            &program,
+            &inherited.shell,
+            ActionScript::None,
+            Appearance::Dark,
+        );
+        assert_eq!(program_of(&spawn.command), "fish");
+        let own = resolve(
+            "defaults { shell \"fish\"\nheight 3 }\nkey \"r\" { description \"x\"\ncommand \"echo hi\"\nshell \"sh\" }\npane \"a\" { command \"true\"\nheight 3 }\n",
+        );
+        let spawn =
+            build_action_command(&program, &own.shell, ActionScript::None, Appearance::Dark);
+        assert_eq!(program_of(&spawn.command), "sh");
+    }
+
+    #[test]
+    fn an_action_body_without_a_shebang_runs_through_the_bindings_shell() {
+        let program = ResolvedProgram::Script("echo hi".to_string());
+        let spawn = build_action_command(
+            &program,
+            &ShellMode::Named("sh".to_string()),
+            ActionScript::None,
+            Appearance::Dark,
+        );
+        assert_eq!(program_of(&spawn.command), "sh");
+        assert_eq!(argv_of(&spawn.command), ["-c", "echo hi"]);
+    }
+
+    #[test]
+    fn an_action_shebang_body_runs_the_materialized_file() {
+        let dir = std::sync::Arc::new(tempfile::tempdir().expect("tempdir"));
+        let path = dir.path().join("key-0-static");
+        let program = ResolvedProgram::Script("#!/usr/bin/env fish\necho hi".to_string());
+        let spawn = build_action_command(
+            &program,
+            &ShellMode::Platform,
+            ActionScript::Shared {
+                path: path.clone(),
+                dir: std::sync::Arc::clone(&dir),
+            },
+            Appearance::Dark,
+        );
+        match SHEBANG_ARM {
+            ShebangArm::Kernel => assert_eq!(spawn.command.get_program(), path.as_os_str()),
+            ShebangArm::Interpreter => assert_eq!(spawn.command.get_program(), "fish"),
+        }
+        // A Shared script is the run's file: the activation owns no
+        // file, but it ALWAYS holds the directory share.
+        assert!(spawn.script.is_none());
+        assert!(spawn.script_dir.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_per_activation_script_file_is_executable_at_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::sync::Arc::new(tempfile::tempdir().expect("tempdir"));
+        let body = "#!/bin/sh\necho ran";
+        let script = activation_script(&dir, "key-0-1", body).expect("write the script");
+        let ActionScript::Owned { file, .. } = &script else {
+            panic!("a templated body owns its file");
+        };
+        let mode = std::fs::metadata(file).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "mode set at creation");
+        // The half that catches the real bug: on the kernel arm the
+        // program IS the file, and without the bit the spawn is EACCES
+        // — a mode-only assertion passes on the interpreter arm forever.
+        let mut spawn = build_action_command(
+            &ResolvedProgram::Script(body.to_string()),
+            &ShellMode::Platform,
+            script,
+            Appearance::Dark,
+        );
+        let out = spawn.command.output().expect("the child spawns");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+    }
+
+    #[test]
+    fn a_per_activation_script_keeps_its_platform_suffix_and_transformed_bytes() {
+        // Asserted against `script_file`'s own output for the same
+        // inputs, so this cannot drift from the classification it
+        // checks — the write must go through that seam, not around it.
+        let dir = std::sync::Arc::new(tempfile::tempdir().expect("tempdir"));
+        for (stem, body) in [
+            ("key-9-1", "#!/usr/bin/env python3\nprint(1)"),
+            ("key-9-2", "#!cmd\nset /a 6*7"),
+            ("key-9-3", "#!/usr/bin/env pwsh\n1"),
+        ] {
+            let line = shebang(body).expect("the fixture has a shebang");
+            let (name, bytes) = script_file(SHEBANG_ARM, &line, stem, body);
+            let script = activation_script(&dir, stem, body).expect("write the script");
+            let ActionScript::Owned { file, .. } = &script else {
+                panic!("a templated body owns its file");
+            };
+            assert_eq!(file.file_name().unwrap().to_str().unwrap(), name, "{stem}");
+            assert_eq!(
+                std::fs::read_to_string(file).expect("read"),
+                bytes,
+                "{stem}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_survives_the_loop_dropping_its_script_files() {
+        // The shutdown race, made deterministic: dropping ScriptFiles
+        // first IS the shutdown ordering. Both arms matter, and the
+        // static one is the surprising half — an activation that merely
+        // borrows a path is exposed exactly as much as one that owns a
+        // file, because neither keeps the directory alive on its own.
+        let registry = Registry::single(source_spec(&["true"], ShellMode::Direct), None);
+        let bindings = [script_binding("#!/bin/sh\necho shared-ran")];
+        let scripts = ScriptFiles::materialize(&registry, &bindings).unwrap();
+        let shared_path = scripts
+            .binding_path(0)
+            .expect("a static slot")
+            .to_path_buf();
+        let dir = scripts.dir_handle().expect("a directory exists");
+        let mut shared = build_action_command(
+            &ResolvedProgram::Script("#!/bin/sh\necho shared-ran".to_string()),
+            &ShellMode::Platform,
+            ActionScript::Shared {
+                path: shared_path,
+                dir: std::sync::Arc::clone(&dir),
+            },
+            Appearance::Dark,
+        );
+        let owned_script =
+            activation_script(&dir, "key-0-7", "#!/bin/sh\necho owned-ran").expect("write");
+        let mut owned = build_action_command(
+            &ResolvedProgram::Script("#!/bin/sh\necho owned-ran".to_string()),
+            &ShellMode::Platform,
+            owned_script,
+            Appearance::Dark,
+        );
+        drop(scripts);
+        drop(dir);
+        let out = shared.command.output().expect("the shared child spawns");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shared-ran");
+        let out = owned.command.output().expect("the owned child spawns");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "owned-ran");
+    }
+
+    #[test]
+    fn a_templated_shebang_body_gets_a_fresh_file_per_activation() {
+        // Never a rewritten per-binding slot: two activations of one
+        // binding can overlap, and a slot rewritten between building a
+        // command and spawning it hands the first worker someone else's
+        // bytes.
+        let dir = std::sync::Arc::new(tempfile::tempdir().expect("tempdir"));
+        let first = activation_script(&dir, "key-0-1", "#!/bin/sh\necho first").expect("write");
+        let second = activation_script(&dir, "key-0-2", "#!/bin/sh\necho second").expect("write");
+        let (ActionScript::Owned { file: a, .. }, ActionScript::Owned { file: b, .. }) =
+            (&first, &second)
+        else {
+            panic!("templated bodies own their files");
+        };
+        assert_ne!(a.to_path_buf(), b.to_path_buf());
+        assert!(std::fs::read_to_string(a).expect("read").contains("first"));
+        assert!(std::fs::read_to_string(b).expect("read").contains("second"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_concurrent_activations_of_one_binding_each_run_their_own_bytes() {
+        // The race, pinned at the unit level: the window is between
+        // building a command and spawning it, which no keyboard fixture
+        // can aim at reliably. Anchored with presence assertions — two
+        // children that both failed to start satisfy "two different
+        // outputs" vacuously.
+        let dir = std::sync::Arc::new(tempfile::tempdir().expect("tempdir"));
+        let slow = "#!/bin/sh\nsleep 0.4\necho first-run";
+        let fast = "#!/bin/sh\necho second-run";
+        let first = activation_script(&dir, "key-0-1", slow).expect("write");
+        let mut first = build_action_command(
+            &ResolvedProgram::Script(slow.to_string()),
+            &ShellMode::Platform,
+            first,
+            Appearance::Dark,
+        );
+        let child_one = first
+            .command
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("the first child starts");
+        let second = activation_script(&dir, "key-0-2", fast).expect("write");
+        let mut second = build_action_command(
+            &ResolvedProgram::Script(fast.to_string()),
+            &ShellMode::Platform,
+            second,
+            Appearance::Dark,
+        );
+        let child_two = second
+            .command
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("the second child starts");
+        let one = child_one.wait_with_output().expect("first output");
+        let two = child_two.wait_with_output().expect("second output");
+        assert_eq!(String::from_utf8_lossy(&one.stdout).trim(), "first-run");
+        assert_eq!(String::from_utf8_lossy(&two.stdout).trim(), "second-run");
+    }
+
+    #[test]
+    fn a_bindings_script_file_never_collides_with_a_panes() {
+        // Two index spaces that both start at 0: without a distinct
+        // stem, a binding would silently execute a pane's body — and
+        // only on boards using both forms.
+        let registry = Registry::single(
+            script_spec("#!/bin/sh\necho pane-bytes", ShellMode::Platform),
+            None,
+        );
+        let bindings = [script_binding("#!/bin/sh\necho binding-bytes")];
+        let scripts = ScriptFiles::materialize(&registry, &bindings).unwrap();
+        let pane = scripts.path(SourceId(0)).expect("the pane's file");
+        let binding = scripts.binding_path(0).expect("the binding's file");
+        assert_ne!(pane, binding);
+        assert!(
+            std::fs::read_to_string(pane)
+                .unwrap()
+                .contains("pane-bytes")
+        );
+        assert!(
+            std::fs::read_to_string(binding)
+                .unwrap()
+                .contains("binding-bytes")
+        );
+    }
+
+    #[test]
+    fn an_action_is_told_the_appearance_and_nothing_about_geometry() {
+        // The absence assertions are guarded by a presence assertion in
+        // the same map, on purpose: RAT_WIDTH being absent is satisfied
+        // perfectly by a builder that sets no environment at all.
+        let program = ResolvedProgram::Argv(vec!["true".into()]);
+        let spawn = build_action_command(
+            &program,
+            &ShellMode::Direct,
+            ActionScript::None,
+            Appearance::Light,
+        );
+        let envs = action_envs(&spawn.command);
+        assert_eq!(
+            envs.get("RAT_APPEARANCE").map(String::as_str),
+            Some("light")
+        );
+        assert!(
+            !envs.contains_key("RAT_WIDTH"),
+            "a pane box's interior, not an action's"
+        );
+        assert!(!envs.contains_key("RAT_HEIGHT"));
+        assert!(
+            !envs.contains_key("RAT_PANE"),
+            "a binding is board-level; pane targeting is not v1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_actions_stdin_is_null() {
+        // Behavioural, because `Command` exposes no stdin getter: a
+        // child that reads stdin must see EOF immediately, never the
+        // harness's own input and never a forwarded key.
+        let program = ResolvedProgram::Argv(vec![
+            "sh".into(),
+            "-c".into(),
+            "read x && echo got || echo eof".into(),
+        ]);
+        let mut spawn = build_action_command(
+            &program,
+            &ShellMode::Direct,
+            ActionScript::None,
+            Appearance::Dark,
+        );
+        let out = spawn.command.output().expect("the child spawns");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "eof");
     }
 }
