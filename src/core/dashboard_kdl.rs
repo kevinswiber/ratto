@@ -792,9 +792,15 @@ fn one_text(node: &kdl::KdlNode, k: &Key, at: &str, load: &Load<'_>) -> anyhow::
 /// `defaults` values, which is what makes a new string-valued key
 /// inherit both for free — the point of chokepointing here.
 fn template_of(text: &str, entry: &kdl::KdlEntry, load: &Load<'_>) -> anyhow::Result<Template> {
-    // The raw-string rule (INV-1) replaces this with the flavor-aware
-    // pick between `extract` and `Template::literal`.
-    let template = Template::extract(text);
+    // The flavor pick (INV-1): double quotes interpolate, single
+    // quotes (KDL: raw strings) don't. Decided ONCE, at extraction, so
+    // validation, the site rule, expansion, and the word split all
+    // inherit it from the record without a second check anywhere.
+    let template = if is_raw(entry) {
+        Template::literal(text)
+    } else {
+        Template::extract(text)
+    };
     validate_refs(&template.refs, entry, load)?;
     Ok(template)
 }
@@ -1247,11 +1253,17 @@ fn variables_block(
         vars.push(Variable {
             name: name.to_string(),
             source,
-            // The raw-string rule (INV-1) replaces this with the
-            // flavor-aware pick between `extract` and
-            // `Template::literal`; a raw variable value is literal end
-            // to end and therefore references nothing.
-            text: Template::extract(entry.value().as_string().expect("filtered to strings")),
+            // The flavor pick (INV-1): a raw variable value is literal
+            // end to end and therefore references nothing — it forms
+            // no graph edge and constrains no ordering.
+            text: {
+                let text = entry.value().as_string().expect("filtered to strings");
+                if is_raw(entry) {
+                    Template::literal(text)
+                } else {
+                    Template::extract(text)
+                }
+            },
             tier: Tier::Load, // replaced by `classify`
             span: span_range(entry),
         });
@@ -1333,6 +1345,39 @@ fn variable_source(node: &kdl::KdlNode, name: &str, at: &str) -> anyhow::Result<
 /// parser out of the walk. If a future caller outside this module
 /// genuinely needs to PARSE a shell entry, widen it to `pub(crate)`
 /// and say why here — not to `pub`.
+/// Is this entry's value a RAW KDL string? Decided lexically from the
+/// value's verbatim source text, because the parsed value cannot say:
+/// the v2 `KdlValue` has one `String` variant and the v1 bridge
+/// collapses raw into it. `KdlEntryFormat::value_repr` holds the
+/// source bytes, and a raw string opens with one or more `#` then a
+/// quote — `#"`, `##"`, `#"""`, at any depth.
+///
+/// The rule this decides (INV-1), in the analogy every reader already
+/// owns: **double quotes interpolate, single quotes don't.** A normal
+/// string interpolates `{{name}}`; a raw string is literal end to
+/// end, and `{{` is not even recognized there.
+///
+/// The known cost, recorded because it is a real collision: one
+/// literal cannot be both raw (backslash freedom) and interpolating.
+/// A `script` body that wants awk/sed backslashes AND `{{name}}` must
+/// use a normal string and escape its backslashes, or read the value
+/// from the environment instead.
+///
+/// `format()` is `None` for a programmatically built entry and after
+/// `clear_format()`/`autoformat()`; ratto only ever parses from
+/// source, so that never happens here. The fallback is **normal**, and
+/// deliberately so: defaulting to raw would SILENTLY stop
+/// interpolating a value the author wrote to interpolate — a wrong
+/// answer with no error — while defaulting to normal can at worst
+/// produce a loud unknown-variable refusal.
+fn is_raw(entry: &kdl::KdlEntry) -> bool {
+    let Some(repr) = entry.format().map(|f| f.value_repr.trim_start()) else {
+        return false;
+    };
+    let after_hashes = repr.trim_start_matches('#');
+    after_hashes.len() < repr.len() && after_hashes.starts_with('"')
+}
+
 fn shell_decl(entry: &kdl::KdlEntry) -> Option<ShellDecl> {
     if let Some(flag) = entry.value().as_bool() {
         return Some(if flag {
@@ -1345,13 +1390,19 @@ fn shell_decl(entry: &kdl::KdlEntry) -> Option<ShellDecl> {
         .value()
         .as_string()
         .filter(|name| !name.trim().is_empty())
-        // The raw-string rule (INV-1) replaces this with the
-        // flavor-aware pick. A raw dialect name that wrongly recorded
-        // a reference would do more than interpolate: a dialect's
-        // references are graph EDGES (`Variable::refs`, in
-        // `variables.rs`), so it could refuse a board for a cycle or a
-        // tier violation INV-1 says cannot exist.
-        .map(|name| ShellDecl::Named(Template::extract(name)))
+        // The flavor pick (INV-1), and the highest-stakes of the three
+        // sites that make it: a dialect name's references are graph
+        // EDGES (`Variable::refs`, in `variables.rs`) and tier-analysis
+        // participants, so a raw name that wrongly recorded one could
+        // refuse a board for a cycle or a tier violation INV-1 says
+        // cannot exist.
+        .map(|name| {
+            ShellDecl::Named(if is_raw(entry) {
+                Template::literal(name)
+            } else {
+                Template::extract(name)
+            })
+        })
 }
 
 /// Build the dependency graph, refuse cycles by NAME PATH, order
@@ -3635,5 +3686,193 @@ variables {{
         )
         .expect("an awk body is not a template");
         assert!(file.panes[0].command.as_ref().unwrap()[0].refs.is_empty());
+    }
+
+    // ─── Raw strings never interpolate ──────────────────────────────
+
+    #[test]
+    fn a_raw_string_records_no_references_at_any_of_the_three_shapes() {
+        // Routes 1-3: the property spelling, the child-node spelling, and
+        // a list value. `p` IS declared, so a validation error cannot be
+        // what keeps the braces — only raw-ness can.
+        let file = parse(
+            "variables {\n    p \"0028\"\n}\n\npane \"a\" title=#\"t {{p}}\"# {\n    border ##\"b {{p}}\"##\n    command \"git\" #\"log {{p}}\"#\n    height 3\n}\n",
+        )
+        .expect("parses");
+        let pane = &file.panes[0];
+        for t in [
+            pane.title.as_ref().unwrap(),
+            pane.border.as_ref().unwrap(),
+            &pane.command.as_ref().unwrap()[1],
+        ] {
+            assert!(t.refs.is_empty(), "{:?} references nothing", t.text);
+            assert!(!t.interpolates);
+            // The braces survive: expansion is a no-op, whatever the map.
+            let map = Bindings::from([("p".to_string(), "0028".to_string())]);
+            assert_eq!(t.expand(&map).unwrap(), t.text);
+        }
+        assert_eq!(pane.title.as_ref().unwrap().text, "t {{p}}");
+    }
+
+    #[test]
+    fn a_raw_multiline_script_body_is_literal_end_to_end() {
+        // Route 4, and the case INV-1 calls out by name: boards reach for
+        // raw strings precisely for regex and awk bodies.
+        let file = parse(
+            "variables {\n    p \"0028\"\n}\n\npane \"a\" {\n    shell #true\n    height 3\n    script #\"\"\"\nawk '{{print $1}}' {{p}}\n\"\"\"#\n}\n",
+        )
+        .expect("parses");
+        let body = file.panes[0].script.as_ref().expect("a script body");
+        assert!(body.refs.is_empty());
+        assert!(
+            body.text.contains("{{p}}"),
+            "the braces survive: {:?}",
+            body.text
+        );
+    }
+
+    #[test]
+    fn a_raw_string_is_legal_at_a_load_typed_site_even_holding_a_deferred_name() {
+        // Route 5, and the INV-7 interaction: a raw string can NEVER be a
+        // template, so it is trivially legal at every site including the
+        // load-typed ones. This is the route that proves raw-ness is
+        // decided BEFORE the site rule rather than after — the recorded
+        // reference set is already empty, so the site check has nothing
+        // to look at. The site-rule task re-asserts this once the rule
+        // exists.
+        let file = parse(
+            "variables {\n    head \"git rev-parse HEAD\" shell=#true defer=#true\n}\n\npane \"a\" {\n    command \"true\"\n    height 3\n    trigger #\"file:{{head}}/stamp\"#\n    interval #\"{{head}}\"#\n}\n",
+        )
+        .expect("a raw string is not a template");
+        assert!(file.panes[0].trigger.as_ref().unwrap()[0].refs.is_empty());
+        assert!(file.panes[0].interval.as_ref().unwrap().refs.is_empty());
+    }
+
+    #[test]
+    fn a_normal_multiline_string_still_interpolates() {
+        // The pair that proves the rule is FLAVOR, not line count: the
+        // `"""…"""` form is a normal string and behaves like one.
+        let file = parse(
+            "variables {\n    p \"0028\"\n}\n\npane \"a\" {\n    shell #true\n    height 3\n    script \"\"\"\necho {{p}}\n\"\"\"\n}\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            file.panes[0].script.as_ref().unwrap().refs,
+            vec!["p".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_raw_string_is_never_validated_and_so_never_refuses() {
+        // The other half of raw-ness: an undeclared name inside a raw
+        // string is not a name at all, so INV-6 has nothing to complain
+        // about. The same bytes in a normal string refuse.
+        parse("pane \"a\" {\n    command \"true\"\n    height 3\n    title #\"{{nope}}\"#\n}\n")
+            .expect("a raw string references nothing");
+        let err = vars_err(
+            "pane \"a\" {\n    command \"true\"\n    height 3\n    title \"{{nope}}\"\n}\n",
+        );
+        assert!(err.contains("unknown variable `nope`"), "got {err}");
+    }
+
+    #[test]
+    fn a_raw_variable_value_is_literal_too() {
+        let block = vars(&format!(
+            "variables {{\n    a \"x\"\n    lit #\"{{{{a}}}}\"#\n}}\n{ONE_PANE}"
+        ));
+        assert!(block.get("lit").unwrap().text.refs.is_empty());
+        // And therefore it is not a graph edge: `lit` depends on nothing.
+        assert_eq!(block.tier("lit"), Some(Tier::Load));
+    }
+
+    #[test]
+    fn a_raw_values_words_stay_literal_across_the_command_split() {
+        // INV-7's argv boundary rule meets INV-1: the split happens at
+        // load on template text, and re-recording each word must not
+        // invent a reference the whole value never had.
+        let file = parse(
+            "variables {\n    p \"x\"\n}\n\npane \"a\" {\n    command #\"git log {{p}}\"#\n    height 3\n}\n",
+        )
+        .expect("parses");
+        let argv = file.panes[0].command.as_ref().unwrap();
+        assert_eq!(argv.len(), 3);
+        assert!(argv.iter().all(|w| w.refs.is_empty()));
+        assert_eq!(argv[2].text, "{{p}}");
+    }
+
+    #[test]
+    fn a_raw_shell_dialect_name_is_literal_at_both_callers() {
+        // `shell_decl` is the THIRD site that builds a `Template` from an
+        // entry, and it has two callers — a pane and a variable. Both must
+        // pick by flavor, so both are pinned.
+        //
+        // The stake here is higher than at the other two sites: a dialect
+        // name's references are dependency-graph EDGES (`Variable::refs`)
+        // and tier-analysis participants. A raw name that wrongly
+        // recorded a reference could refuse a board for a cycle or an
+        // INV-9 tier violation that INV-1 says cannot exist.
+
+        // Caller 1 — a pane.
+        let file = parse(
+            "variables {\n    sh \"fish\"\n}\n\npane \"a\" shell=#\"{{sh}}\"# {\n    command \"git log\"\n    height 3\n}\n",
+        )
+        .expect("a raw dialect name references nothing");
+        match file.panes[0].shell.as_ref().expect("a shell") {
+            ShellDecl::Named(t) => {
+                assert!(t.refs.is_empty());
+                assert!(!t.interpolates);
+                assert_eq!(t.text, "{{sh}}");
+            }
+            other => panic!("expected a named dialect, got {other:?}"),
+        }
+
+        // Caller 2 — a variable, where the graph consequence lives.
+        let block = vars(&format!(
+            "variables {{\n    sh \"fish\"\n    out \"status\" shell=#\"{{{{sh}}}}\"#\n}}\n{ONE_PANE}"
+        ));
+        let out = block.get("out").expect("declared");
+        assert!(out.source.shell().expect("a shell").refs().is_empty());
+        // No edge, so no ordering constraint and no tier participation.
+        assert_eq!(out.refs().collect::<Vec<_>>(), Vec::<&str>::new());
+
+        // And the case that proves raw-ness is doing the work: the SAME
+        // board with a normal string refuses, because `nope` is undeclared.
+        let err = vars_err(&format!(
+            "variables {{\n    out \"status\" shell=\"{{{{nope}}}}\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("unknown variable `nope`"), "got {err}");
+        // …while the raw spelling of the same bytes loads.
+        vars(&format!(
+            "variables {{\n    out \"status\" shell=#\"{{{{nope}}}}\"#\n}}\n{ONE_PANE}"
+        ));
+    }
+
+    #[test]
+    fn the_flavor_check_reads_the_repr_and_falls_back_to_interpolating() {
+        // The prefix rule, at every hash depth, and the `None` fallback
+        // stated as a unit test rather than a comment — ratto only ever
+        // parses from source, so the fallback is unreachable in practice
+        // and a test is the only place it is ever exercised.
+        // ORDINARY Rust strings with escaped quotes, deliberately: a Rust
+        // raw literal terminates at the first quote-hash, which is exactly
+        // the closer of the KDL raw string being tested — one fixture
+        // would truncate its own KDL and the deeper-hash ones would not
+        // compile. Escapes are ugly here and correct here.
+        for (source, raw) in [
+            ("a \"x\"", false),
+            ("a #\"x\"#", true),
+            ("a ##\"x\"##", true),
+            ("a \"\"\"\nx\n\"\"\"", false),
+            ("a #\"\"\"\nx\n\"\"\"#", true),
+            ("a x", false),     // a bare KDL v2 string
+            ("a #true", false), // a keyword, never a string
+        ] {
+            let doc: kdl::KdlDocument = source.parse().expect(source);
+            let entry = doc.nodes()[0].entries().first().expect(source);
+            assert_eq!(is_raw(entry), raw, "{source:?}");
+        }
+        let mut built = kdl::KdlEntry::new("x");
+        built.clear_format();
+        assert!(!is_raw(&built), "no format means NORMAL — never raw");
     }
 }
