@@ -88,7 +88,7 @@ impl ShellDecl {
     /// return.
     pub fn refs(&self) -> &[String] {
         match self {
-            ShellDecl::Named(template) => &template.refs,
+            ShellDecl::Named(template) => template.refs(),
             _ => &[],
         }
     }
@@ -112,7 +112,7 @@ impl ShellDecl {
             ShellDecl::Platform => Ok(ShellMode::Platform),
             ShellDecl::Named(template) => {
                 let blank = || EmptyShellName {
-                    declared: template.text.clone(),
+                    declared: template.as_str().to_string(),
                 };
                 let name = template.expand(bindings).map_err(|_| blank())?;
                 if name.trim().is_empty() {

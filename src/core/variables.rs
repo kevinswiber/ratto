@@ -92,7 +92,7 @@ impl Variable {
     /// `contains(&str)` directly, which is what every caller does
     /// with it.
     pub fn refs(&self) -> impl Iterator<Item = &str> + '_ {
-        self.text.refs.iter().map(String::as_str).chain(
+        self.text.refs().iter().map(String::as_str).chain(
             self.source
                 .shell()
                 .map(ShellDecl::refs)
@@ -326,11 +326,11 @@ impl Template {
         // there, misses it in the map, and reports
         // `Skipped(["store"])` — a raw literal wrongly declared
         // unknowable.
-        if self.refs.is_empty() {
-            return Expanded::Known(self.text.clone());
+        if self.refs().is_empty() {
+            return Expanded::Known(self.as_str().to_string());
         }
         let unknowable: Vec<String> = self
-            .refs
+            .refs()
             .iter()
             .filter(|name| !matches!(partial.get(name.as_str()), Some(Resolved::Known(_))))
             .cloned()
@@ -342,14 +342,14 @@ impl Template {
         // unreachable — but it is HANDLED rather than unwrapped, so a
         // future caller cannot turn a checker into a panic.
         let known: Bindings = self
-            .refs
+            .refs()
             .iter()
             .filter_map(|name| match partial.get(name.as_str()) {
                 Some(Resolved::Known(value)) => Some((name.clone(), value.clone())),
                 _ => None,
             })
             .collect();
-        match crate::core::template::substitute(&self.text, &known) {
+        match crate::core::template::substitute(self.as_str(), &known) {
             Ok(text) => Expanded::Known(text),
             Err(missing) => Expanded::Skipped(vec![missing.name]),
         }

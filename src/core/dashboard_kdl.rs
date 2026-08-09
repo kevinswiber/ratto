@@ -188,7 +188,7 @@ fn set_command(decl: &mut PaneDecl, argv: Vec<Template>, ctx: &Ctx<'_>) -> anyho
         // expansion lands INSIDE the word that held it and never
         // creates a new argv element (INV-7 sub-rule 1).
         [line] => line.reslice(
-            shell_words::split(&line.text)
+            shell_words::split(line.as_str())
                 .map_err(|err| anyhow!("{}: command has unbalanced quoting ({err})", ctx.at))?,
         ),
         argv => argv.to_vec(),
@@ -801,7 +801,7 @@ fn template_of(text: &str, entry: &kdl::KdlEntry, load: &Load<'_>) -> anyhow::Re
     } else {
         Template::extract(text)
     };
-    validate_refs(&template.refs, entry, load)?;
+    validate_refs(template.refs(), entry, load)?;
     Ok(template)
 }
 
@@ -1137,7 +1137,7 @@ fn title_field(
         // A pane id is IDENTITY (INV-3), so a reference here is
         // refused rather than expanded — a computed id would make
         // `ref` unresolvable by reading the file.
-        if !Template::extract(fragment).refs.is_empty() {
+        if !Template::extract(fragment).refs().is_empty() {
             bail!(
                 "title ref \"#{fragment}\": a pane's id is not substitutable — it is the \
                  `RAT_PANE` value, the anchor a `ref` binds to, and a URI fragment. \
@@ -2963,7 +2963,7 @@ variables {{
         // The text is the author's bytes, unexpanded — this walk never
         // expands (INV-2).
         assert_eq!(
-            block.get("plan").map(|v| v.text.text.as_str()),
+            block.get("plan").map(|v| v.text.as_str()),
             Some("/tmp/plans/0028")
         );
         assert_eq!(block.declared_list(), "fishy, head, plan, store");
@@ -2996,7 +2996,7 @@ variables {{
         // Topological: every name appears after everything it references.
         assert_eq!(order, vec!["store", "sel", "cur"]);
         assert_eq!(
-            block.get("cur").map(|v| v.text.refs.as_slice()),
+            block.get("cur").map(|v| v.text.refs()),
             Some(&["sel".to_string()][..])
         );
     }
@@ -3569,22 +3569,22 @@ variables {{
         .expect("parses");
         let pane = &file.panes[0];
         assert_eq!(
-            pane.title.as_ref().map(|t| t.refs.as_slice()),
+            pane.title.as_ref().map(|t| t.refs()),
             Some(&["p".to_string()][..])
         );
         assert_eq!(
-            pane.command.as_ref().unwrap()[2].refs,
+            pane.command.as_ref().unwrap()[2].refs(),
             vec!["p".to_string()]
         );
         assert_eq!(
-            pane.trigger.as_ref().unwrap()[0].refs,
+            pane.trigger.as_ref().unwrap()[0].refs(),
             vec!["p".to_string()]
         );
         // And the walk NEVER expands (INV-2) — the bytes are the author's.
-        assert_eq!(pane.title.as_ref().unwrap().text, "t {{p}}");
+        assert_eq!(pane.title.as_ref().unwrap().as_str(), "t {{p}}");
         // A template-free value records nothing: the common case, and
         // the path spawn-time expansion short-circuits.
-        assert!(pane.interval.as_ref().unwrap().refs.is_empty());
+        assert!(pane.interval.as_ref().unwrap().refs().is_empty());
 
         for bad in [
             "pane \"a\" title=\"{{q}}\" { command \"true\"\nheight 3 }",
@@ -3612,7 +3612,7 @@ variables {{
         )
         .expect("parses");
         assert_eq!(
-            file.defaults.border.as_ref().map(|t| t.refs.as_slice()),
+            file.defaults.border.as_ref().map(|t| t.refs()),
             Some(&["p".to_string()][..])
         );
     }
@@ -3685,7 +3685,7 @@ variables {{
             "pane \"a\" {\n    command \"awk '{{print $1}}' f\"\n    shell #true\n    height 3\n}\n",
         )
         .expect("an awk body is not a template");
-        assert!(file.panes[0].command.as_ref().unwrap()[0].refs.is_empty());
+        assert!(file.panes[0].command.as_ref().unwrap()[0].refs().is_empty());
     }
 
     // ─── Raw strings never interpolate ──────────────────────────────
@@ -3705,13 +3705,13 @@ variables {{
             pane.border.as_ref().unwrap(),
             &pane.command.as_ref().unwrap()[1],
         ] {
-            assert!(t.refs.is_empty(), "{:?} references nothing", t.text);
-            assert!(!t.interpolates);
+            assert!(t.refs().is_empty(), "{:?} references nothing", t.as_str());
+            assert!(!t.interpolates());
             // The braces survive: expansion is a no-op, whatever the map.
             let map = Bindings::from([("p".to_string(), "0028".to_string())]);
-            assert_eq!(t.expand(&map).unwrap(), t.text);
+            assert_eq!(t.expand(&map).unwrap(), t.as_str());
         }
-        assert_eq!(pane.title.as_ref().unwrap().text, "t {{p}}");
+        assert_eq!(pane.title.as_ref().unwrap().as_str(), "t {{p}}");
     }
 
     #[test]
@@ -3723,11 +3723,11 @@ variables {{
         )
         .expect("parses");
         let body = file.panes[0].script.as_ref().expect("a script body");
-        assert!(body.refs.is_empty());
+        assert!(body.refs().is_empty());
         assert!(
-            body.text.contains("{{p}}"),
+            body.as_str().contains("{{p}}"),
             "the braces survive: {:?}",
-            body.text
+            body.as_str()
         );
     }
 
@@ -3744,8 +3744,8 @@ variables {{
             "variables {\n    head \"git rev-parse HEAD\" shell=#true defer=#true\n}\n\npane \"a\" {\n    command \"true\"\n    height 3\n    trigger #\"file:{{head}}/stamp\"#\n    interval #\"{{head}}\"#\n}\n",
         )
         .expect("a raw string is not a template");
-        assert!(file.panes[0].trigger.as_ref().unwrap()[0].refs.is_empty());
-        assert!(file.panes[0].interval.as_ref().unwrap().refs.is_empty());
+        assert!(file.panes[0].trigger.as_ref().unwrap()[0].refs().is_empty());
+        assert!(file.panes[0].interval.as_ref().unwrap().refs().is_empty());
     }
 
     #[test]
@@ -3757,7 +3757,7 @@ variables {{
         )
         .expect("parses");
         assert_eq!(
-            file.panes[0].script.as_ref().unwrap().refs,
+            file.panes[0].script.as_ref().unwrap().refs(),
             vec!["p".to_string()]
         );
     }
@@ -3780,7 +3780,7 @@ variables {{
         let block = vars(&format!(
             "variables {{\n    a \"x\"\n    lit #\"{{{{a}}}}\"#\n}}\n{ONE_PANE}"
         ));
-        assert!(block.get("lit").unwrap().text.refs.is_empty());
+        assert!(block.get("lit").unwrap().text.refs().is_empty());
         // And therefore it is not a graph edge: `lit` depends on nothing.
         assert_eq!(block.tier("lit"), Some(Tier::Load));
     }
@@ -3796,8 +3796,8 @@ variables {{
         .expect("parses");
         let argv = file.panes[0].command.as_ref().unwrap();
         assert_eq!(argv.len(), 3);
-        assert!(argv.iter().all(|w| w.refs.is_empty()));
-        assert_eq!(argv[2].text, "{{p}}");
+        assert!(argv.iter().all(|w| w.refs().is_empty()));
+        assert_eq!(argv[2].as_str(), "{{p}}");
     }
 
     #[test]
@@ -3819,9 +3819,9 @@ variables {{
         .expect("a raw dialect name references nothing");
         match file.panes[0].shell.as_ref().expect("a shell") {
             ShellDecl::Named(t) => {
-                assert!(t.refs.is_empty());
-                assert!(!t.interpolates);
-                assert_eq!(t.text, "{{sh}}");
+                assert!(t.refs().is_empty());
+                assert!(!t.interpolates());
+                assert_eq!(t.as_str(), "{{sh}}");
             }
             other => panic!("expected a named dialect, got {other:?}"),
         }

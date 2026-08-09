@@ -136,22 +136,29 @@ pub fn substitute(text: &str, bindings: &Bindings) -> Result<String, MissingVari
 
 /// A string as written, plus the names it references. Extraction
 /// never expands (INV-2): the walk records, the use site substitutes.
+/// The fields are PRIVATE, deliberately: `pub text` would make
+/// `substitute(&t.text, …)` exactly as reachable as `t.expand(…)`, and
+/// only one of those is correct once a raw string's bytes are
+/// indistinguishable from a normal one's (INV-1). Re-deriving from the
+/// bytes when the answer is already in the record is a bug class that
+/// occurred three times during design alone; a visible `as_str()` is
+/// the same protection the absent `Deref` provides, applied to the
+/// other half.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Template {
     /// The author's bytes, holes and all.
-    pub text: String,
+    text: String,
     /// Every name referenced, in first-appearance order, deduplicated
     /// — a name written twice is one dependency, not two. ALWAYS
     /// empty for a raw string (INV-1), which is what makes raw-ness a
     /// property of the RECORD rather than a re-scan at every use.
-    pub refs: Vec<String>,
+    refs: Vec<String>,
     /// The KDL flavor this came from. Beside `refs` for exactly one
     /// reason: `command` is word-split at load (INV-7), and each word
     /// must be re-recorded under the ORIGINAL value's flavor —
     /// without this a raw `#"{{a}} b"#` would acquire a reference the
-    /// moment it was split. The flavor check that gives it its second
-    /// value comes with raw-string support.
-    pub interpolates: bool,
+    /// moment it was split.
+    interpolates: bool,
 }
 
 impl Template {
@@ -161,6 +168,18 @@ impl Template {
     /// value's bytes indistinguishable from a normal one's.
     pub fn as_str(&self) -> &str {
         &self.text
+    }
+
+    /// Every name this string references — empty for a literal and for
+    /// EVERY raw string, which is what the whole raw rule rests on.
+    pub fn refs(&self) -> &[String] {
+        &self.refs
+    }
+
+    /// The recorded flavor: `true` for a normal string, `false` for a
+    /// raw one (and for `literal`-constructed values generally).
+    pub fn interpolates(&self) -> bool {
+        self.interpolates
     }
 
     /// Record a RAW KDL string: literal end to end, `{{` not even
@@ -350,9 +369,7 @@ mod tests {
         // record says it references nothing is returned VERBATIM without
         // the map being consulted at all. A caller that re-scanned the
         // text instead would expand a raw string.
-        let mut t = Template::extract("plan {{plan}}");
-        t.refs.clear();
-        t.interpolates = false;
+        let t = Template::literal("plan {{plan}}");
         let map = Bindings::from([("plan".to_string(), "0028".to_string())]);
         assert_eq!(t.expand(&map).unwrap(), "plan {{plan}}");
     }
@@ -377,9 +394,7 @@ mod tests {
         assert_eq!(words[2].refs, vec!["plan".to_string()]);
         assert!(words[0].refs.is_empty());
 
-        let mut raw = Template::extract("git -C {{plan}} log");
-        raw.refs.clear();
-        raw.interpolates = false;
+        let raw = Template::literal("git -C {{plan}} log");
         let words = raw.reslice(vec!["git".into(), "{{plan}}".into()]);
         assert!(words[1].refs.is_empty(), "a raw value's words stay literal");
     }
