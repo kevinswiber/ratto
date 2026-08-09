@@ -7,8 +7,8 @@
 
 /// The map a substitution runs against — INV-2's `Map`. A plain
 /// name → text map by design: `substitute` knows nothing about tiers,
-/// KDL, or panes, which is exactly what lets 0029 and 0031 hand it
-/// `variables ∪ that binding's prompt answers`.
+/// KDL, or panes, which is exactly what lets a later key-action or
+/// prompt layer hand it `variables ∪ that binding's prompt answers`.
 ///
 /// `BTreeMap`, not `HashMap`: a teaching error lists the declared set,
 /// and a set that lists in a different order on every run is a
@@ -18,8 +18,8 @@ pub type Bindings = std::collections::BTreeMap<String, String>;
 /// A reference to a name the map does not hold. Carries what a placed
 /// error needs and nothing more: the name, and where in THIS string it
 /// was written. Mapping that offset into a document's line and column
-/// is the caller's job — the split is what lets 0029/0031 reuse
-/// `substitute` behind a completely different error surface.
+/// is the caller's job — the split is what lets other consumers
+/// reuse `substitute` behind a completely different error surface.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct MissingVariable {
     pub name: String,
@@ -155,6 +155,20 @@ pub struct Template {
 }
 
 impl Template {
+    /// Record a RAW KDL string: literal end to end, `{{` not even
+    /// recognized (INV-1). Records zero references, which is what
+    /// makes raw-ness a property of the RECORD rather than a re-scan
+    /// at every use. The flavor check that picks between this and
+    /// `extract` at the KDL extraction sites is raw-string support's
+    /// job; nothing chooses `literal` until it lands.
+    pub fn literal(text: &str) -> Template {
+        Template {
+            text: text.to_string(),
+            refs: Vec::new(),
+            interpolates: false,
+        }
+    }
+
     /// Record a NORMAL KDL string: `{{name}}` interpolates.
     pub fn extract(text: &str) -> Template {
         let mut refs: Vec<String> = Vec::new();
@@ -290,7 +304,7 @@ mod tests {
         let err = substitute("cd {{plan}} && cat {{nope}}", &map).expect_err("nope is unknown");
         assert_eq!(err.name, "nope");
         // The offset is a byte index into THIS string; placing it in a
-        // document is the caller's job (task 1.3).
+        // document is the caller's job.
         assert_eq!(err.offset, "cd {{plan}} && cat ".len());
         // The FIRST unknown name is reported: it is the one the author
         // can act on.
@@ -315,14 +329,15 @@ mod tests {
     fn a_template_free_string_records_no_references() {
         let t = Template::extract("git log --oneline -3");
         assert!(t.refs.is_empty());
-        // The path task 3.1 short-circuits on, and the reason a board with
+        // The path spawn-time expansion short-circuits on, and the
+        // reason a board with
         // no variables carries zero new failure modes.
         assert_eq!(t.expand(&Bindings::new()).unwrap(), "git log --oneline -3");
     }
 
     #[test]
     fn expansion_consults_the_recorded_references_not_the_bytes() {
-        // The pin that makes raw strings work (INV-1, task 1.5) and the
+        // The pin that makes raw strings work (INV-1) and the
         // reason `expand` exists beside `substitute`: a template whose
         // record says it references nothing is returned VERBATIM without
         // the map being consulted at all. A caller that re-scanned the

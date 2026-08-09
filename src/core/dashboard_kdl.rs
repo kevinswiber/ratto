@@ -20,7 +20,9 @@
 use anyhow::{anyhow, bail};
 
 use crate::core::dashboard_file::{DashboardFile, LayoutDecl, PaneDecl};
-use crate::core::registry::ShellMode;
+use crate::core::registry::{ShellDecl, ShellMode};
+use crate::core::template::{Template, is_reference_name};
+use crate::core::variables::{Tier, VarSource, Variable, VariableBlock};
 
 /// The one function that puts a key's value on the declaration. The
 /// variant IS the key's shape: it says what the value looks like, and
@@ -413,8 +415,13 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
     // command split depends on.
     let mut tree: Vec<&kdl::KdlNode> = Vec::new();
     let mut settings: Vec<&'static str> = Vec::new();
+    let mut variables_node: Option<&kdl::KdlNode> = None;
     for node in doc.nodes() {
         match node.name().value() {
+            "variables" => {
+                declared_once("variables", &mut settings)?;
+                variables_node = Some(node);
+            }
             "title" => {
                 declared_once("title", &mut settings)?;
                 file.title = Some(title_field(node)?);
@@ -458,10 +465,15 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
             other => {
                 bail!(
                     "unknown node {other:?} — a dashboard's top level takes \
-                     title, gap, row-gap, defaults, pane, row, or column"
+                     title, gap, row-gap, variables, defaults, pane, row, or column"
                 )
             }
         }
+    }
+    // Built after the whole first pass, like `defaults`: a `variables`
+    // node anywhere in the document still declares the board's names.
+    if let Some(node) = variables_node {
+        file.variables = variables_block(node, text, colored)?;
     }
     // The split cares whether a shell is involved, never which one.
     let default_shell = file
@@ -678,11 +690,22 @@ fn prop_flag(value: &kdl::KdlValue, k: &Key, at: &str) -> anyhow::Result<bool> {
     value.as_bool().ok_or_else(|| prop_shape_err(k, at))
 }
 
-/// Every positional entry of a node — the values a key was written with.
-fn positional(node: &kdl::KdlNode) -> Vec<&kdl::KdlValue> {
+/// Every positional entry of a node, with the ENTRY kept. `positional`
+/// discards it by mapping `kdl::KdlEntry::value`, and a discarded
+/// entry costs both the span an error points at and the string flavor
+/// the raw-string rule reads (INV-1). `variables_block` needs both;
+/// the other extraction sites migrate to it as they need it.
+fn positional_entries(node: &kdl::KdlNode) -> Vec<&kdl::KdlEntry> {
     node.entries()
         .iter()
         .filter(|entry| entry.name().is_none())
+        .collect()
+}
+
+/// Every positional entry of a node — the values a key was written with.
+fn positional(node: &kdl::KdlNode) -> Vec<&kdl::KdlValue> {
+    positional_entries(node)
+        .into_iter()
         .map(kdl::KdlEntry::value)
         .collect()
 }
@@ -1031,6 +1054,384 @@ fn usize_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<usize> {
         _ => bail!("{name} takes one integer — write `{name} 1`"),
     };
     usize::try_from(cells).map_err(|_| anyhow!("{name} must be a non-negative integer"))
+}
+
+/// The `variables` block: every declared variable, checked (INV-3,
+/// INV-9) but never expanded (INV-2). A variable's name obeys the SAME
+/// grammar a reference does (INV-1), so a name that could never be
+/// written as `{{name}}` is refused where it is declared rather than
+/// where it fails to resolve.
+fn variables_block(
+    node: &kdl::KdlNode,
+    text: &str,
+    colored: bool,
+) -> anyhow::Result<VariableBlock> {
+    refuse_annotation(node.ty(), "variables", "variables")?;
+    if !positional(node).is_empty() {
+        bail!("`variables` takes no id — it holds the board's variables, one per line");
+    }
+    let children = node
+        .children()
+        .map(kdl::KdlDocument::nodes)
+        .unwrap_or_default();
+    if children.is_empty() {
+        bail!(
+            "the `variables` block is empty — declare at least one variable, \
+             like `plan \"/path/to/thing\"`, or drop the block"
+        );
+    }
+    let mut vars: Vec<Variable> = Vec::with_capacity(children.len());
+    for child in children {
+        let name = child.name().value();
+        let at = format!("variable {name:?}");
+        if !is_reference_name(name) {
+            bail!(
+                "{at}: a variable's name starts with a letter or `_` and continues \
+                 with letters, digits, `_` or `-` — the same spelling `{{{{{name}}}}}` uses"
+            );
+        }
+        if vars.iter().any(|v| v.name == name) {
+            bail!("{at}: `{name}` is declared twice — declare each variable once");
+        }
+        refuse_annotation(child.ty(), name, &at)?;
+        if child.children().is_some() {
+            bail!("{at}: `{name}` takes one string and holds no block — write `{name} \"value\"`");
+        }
+        let source = variable_source(child, name, &at)?;
+        let entry = match positional_entries(child).as_slice() {
+            [entry] if entry.value().as_string().is_some() => *entry,
+            _ => bail!("{at}: `{name}` takes one string — write `{name} \"value\"`"),
+        };
+        vars.push(Variable {
+            name: name.to_string(),
+            source,
+            // The raw-string rule (INV-1) replaces this with the
+            // flavor-aware pick between `extract` and
+            // `Template::literal`; a raw variable value is literal end
+            // to end and therefore references nothing.
+            text: Template::extract(entry.value().as_string().expect("filtered to strings")),
+            tier: Tier::Load, // replaced by `classify`
+            span: span_range(entry),
+        });
+    }
+    classify(vars, text, colored)
+}
+
+/// `shell` and `defer` are a variable's only properties. Each refusal
+/// here is a DEAD KNOB refused in the house style — the same argument
+/// that deleted `default`: a knob that can never fire is worse than
+/// one that does not exist, because it reads as live.
+fn variable_source(node: &kdl::KdlNode, name: &str, at: &str) -> anyhow::Result<VarSource> {
+    let mut shell: Option<ShellDecl> = None;
+    let mut defer = false;
+    for entry in node.entries() {
+        let Some(prop) = entry.name() else { continue };
+        refuse_annotation(entry.ty(), prop.value(), at)?;
+        match prop.value() {
+            "shell" => {
+                let mode = shell_decl(entry).ok_or_else(|| {
+                    anyhow!("{at}: `shell` takes #true or one string — write `shell=#true`")
+                })?;
+                if !mode.runs_a_shell() {
+                    bail!(
+                        "{at}: `shell=#false` means no shell at all, and a variable with no \
+                         shell is a constant — drop `shell` to make `{name}` a constant, or \
+                         name the shell that runs it"
+                    );
+                }
+                if shell.replace(mode).is_some() {
+                    bail!("{at}: `shell` is declared twice — declare it once");
+                }
+            }
+            "defer" => {
+                defer = entry.value().as_bool().ok_or_else(|| {
+                    anyhow!("{at}: `defer` takes #true or #false — write `defer=#true`")
+                })?;
+            }
+            other => bail!(
+                "{at}: unknown property {other:?} — a variable's properties are shell, defer{}",
+                if other == "default" {
+                    format!(
+                        " — a constant is its own default: write `{name} \"50\"` and \
+                         override it with `-v {name}=200`"
+                    )
+                } else {
+                    String::new()
+                }
+            ),
+        }
+    }
+    Ok(match (shell, defer) {
+        (None, false) => VarSource::Constant,
+        (None, true) => bail!(
+            "{at}: `defer` re-derives a value, and `{name}` derives nothing — it is a \
+             constant, the same bytes at every spawn. Drop `defer`, or give `{name}` a \
+             `shell` command to re-run"
+        ),
+        (Some(mode), false) => VarSource::LoadCommand(mode),
+        (Some(mode), true) => VarSource::SpawnCommand(mode),
+    })
+}
+
+/// A `shell` entry as a [`ShellDecl`] — the template-carrying reader.
+/// `#true` is the platform's shell, `#false` no shell at all, and a
+/// string names the program. An EMPTY string names nothing: `None`
+/// here, a shape error at the call site, never a spawn of `""`.
+///
+/// It takes the ENTRY, not the value, because a dialect name is a
+/// string an author writes: it carries references, and whether they
+/// ARE references depends on the string's flavor (INV-1). Validating
+/// those references is the CALLER's job, because the callers answer it
+/// differently: a pane's shell validates against the declared set,
+/// while a variable's shell becomes a graph edge and is answered by
+/// `classify`.
+///
+/// Private, deliberately: every caller is in this module. It takes a
+/// `kdl::KdlEntry`, so making it public would export a KDL-shaped
+/// parser out of the walk. If a future caller outside this module
+/// genuinely needs to PARSE a shell entry, widen it to `pub(crate)`
+/// and say why here — not to `pub`.
+fn shell_decl(entry: &kdl::KdlEntry) -> Option<ShellDecl> {
+    if let Some(flag) = entry.value().as_bool() {
+        return Some(if flag {
+            ShellDecl::Platform
+        } else {
+            ShellDecl::Direct
+        });
+    }
+    entry
+        .value()
+        .as_string()
+        .filter(|name| !name.trim().is_empty())
+        // The raw-string rule (INV-1) replaces this with the
+        // flavor-aware pick. A raw dialect name that wrongly recorded
+        // a reference would do more than interpolate: a dialect's
+        // references are graph EDGES (`Variable::refs`, in
+        // `variables.rs`), so it could refuse a board for a cycle or a
+        // tier violation INV-1 says cannot exist.
+        .map(|name| ShellDecl::Named(Template::extract(name)))
+}
+
+/// Build the dependency graph, refuse cycles by NAME PATH, order
+/// dependencies first, and classify every effective tier — one
+/// post-order DFS, because a variable's referents are classified
+/// before it is, which is what topological order means (INV-3, INV-9).
+///
+/// Roots are visited in DECLARATION order so a board with two
+/// independent cycles always names the same one; nothing else here
+/// reads position.
+fn classify(mut vars: Vec<Variable>, text: &str, colored: bool) -> anyhow::Result<VariableBlock> {
+    // The adjacency list is built FIRST, and every unknown name is
+    // refused here — so the DFS walks indices only and never has to
+    // borrow `vars` while mutating it.
+    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(vars.len());
+    for var in &vars {
+        let mut edges = Vec::new();
+        // `Variable::refs()`, not the text's refs alone: a templated
+        // `shell` dialect name is a dependency too.
+        for name in var.refs() {
+            match vars.iter().position(|other| other.name == name) {
+                Some(i) if !edges.contains(&i) => edges.push(i),
+                Some(_) => {}
+                None => {
+                    let declared = VariableBlock::new(vars.clone(), Vec::new());
+                    return Err(unknown_variable_err(
+                        text, &var.span, name, &declared, colored,
+                    ));
+                }
+            }
+        }
+        deps.push(edges);
+    }
+
+    #[derive(Copy, Clone, PartialEq)]
+    enum Mark {
+        White,
+        Gray,
+        Black,
+    }
+    let mut mark = vec![Mark::White; vars.len()];
+    let mut order: Vec<usize> = Vec::with_capacity(vars.len());
+    for root in 0..vars.len() {
+        if mark[root] != Mark::White {
+            continue;
+        }
+        // An explicit stack of (index, next-edge cursor) rather than
+        // recursion: a board is small, but a parser that can be made
+        // to blow the stack by a deep file is a parser with a denial
+        // of service in it.
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        mark[root] = Mark::Gray;
+        while let Some(top) = stack.len().checked_sub(1) {
+            let (at, cursor) = stack[top];
+            if let Some(&next) = deps[at].get(cursor) {
+                stack[top].1 += 1;
+                match mark[next] {
+                    Mark::White => {
+                        mark[next] = Mark::Gray;
+                        stack.push((next, 0));
+                    }
+                    Mark::Gray => {
+                        // A Gray referent closes a cycle: the path runs
+                        // from its first appearance on the stack through
+                        // the current variable and back to itself.
+                        let start = stack
+                            .iter()
+                            .position(|&(i, _)| i == next)
+                            .expect("a Gray variable is on the stack");
+                        let path: Vec<&str> = stack[start..]
+                            .iter()
+                            .map(|&(i, _)| vars[i].name.as_str())
+                            .chain(std::iter::once(vars[next].name.as_str()))
+                            .collect();
+                        return Err(cycle_err(text, &vars[next].span, &path, colored));
+                    }
+                    Mark::Black => {}
+                }
+            } else {
+                // Post-order: every referent is Black, so its effective
+                // tier is final (INV-9's topological reading).
+                let declared = vars[at].source.declared_tier();
+                let effective = deps[at]
+                    .iter()
+                    .map(|&d| vars[d].tier)
+                    .fold(declared, Tier::max);
+                if declared == Tier::Load && effective == Tier::Spawn {
+                    let referent = deps[at]
+                        .iter()
+                        .find(|&&d| vars[d].tier == Tier::Spawn)
+                        .map(|&d| vars[d].name.clone())
+                        .expect("a Spawn-tier referent forced the promotion");
+                    return Err(tier_violation_err(
+                        text,
+                        &vars[at].span,
+                        &vars[at].name,
+                        &referent,
+                        colored,
+                    ));
+                }
+                vars[at].tier = effective;
+                mark[at] = Mark::Black;
+                order.push(at);
+                stack.pop();
+            }
+        }
+    }
+    Ok(VariableBlock::new(vars, order))
+}
+
+fn cycle_err(
+    text: &str,
+    span: &std::ops::Range<usize>,
+    path: &[&str],
+    colored: bool,
+) -> anyhow::Error {
+    placed_error(
+        text,
+        span,
+        &format!(
+            "variable cycle: {}",
+            path.iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(" → ")
+        ),
+        Some("a variable cannot derive from itself, however many hops away"),
+        colored,
+    )
+}
+
+/// INV-6's unknown-variable error, defined HERE because the variables
+/// block is its first consumer; the same function applies at every
+/// other string site. The declared-set breadcrumb mirrors `key_list`,
+/// and an empty block says so rather than printing an empty list.
+pub(crate) fn unknown_variable_err(
+    text: &str,
+    span: &std::ops::Range<usize>,
+    name: &str,
+    declared: &VariableBlock,
+    colored: bool,
+) -> anyhow::Error {
+    let help = if declared.is_empty() {
+        "this board declares no variables — add a `variables` block, or write the value literally"
+            .to_string()
+    } else {
+        format!("declared variables are {}", declared.declared_list())
+    };
+    placed_error(
+        text,
+        span,
+        &format!("unknown variable `{name}`"),
+        Some(&help),
+        colored,
+    )
+}
+
+fn tier_violation_err(
+    text: &str,
+    span: &std::ops::Range<usize>,
+    who: &str,
+    referent: &str,
+    colored: bool,
+) -> anyhow::Error {
+    placed_error(
+        text,
+        span,
+        &format!("`{who}` is not deferred but references `{referent}`, which is"),
+        Some(&format!(
+            "add `defer=#true` to `{who}`, or drop it from `{referent}`"
+        )),
+        colored,
+    )
+}
+
+/// A semantic error, placed in the source the way a KDL syntax error
+/// is: the greppable `line N, column M: …` head from
+/// `syntax_error_text`, then miette's snippet block echoing the
+/// offending line. `line_column` walks BYTES — kdl's own span doc says
+/// chars and is wrong, which that function already records.
+fn placed_error(
+    text: &str,
+    span: &std::ops::Range<usize>,
+    message: &str,
+    help: Option<&str>,
+    colored: bool,
+) -> anyhow::Error {
+    use std::fmt::Write;
+    let (line, column) = line_column(text, span.start);
+    let mut out = syntax_error_text(line, column, Some(message));
+    let diagnostic = kdl::KdlDiagnostic {
+        input: std::sync::Arc::new(text.to_string()),
+        span: (span.start, span.len()).into(),
+        message: Some(message.to_string()),
+        label: Some("here".to_string()),
+        help: help.map(str::to_string),
+        severity: miette::Severity::Error,
+    };
+    // Same theme choice and same fixed width as `syntax_error`: the
+    // caller's stream decides, never an env sniff.
+    let theme = if colored {
+        miette::GraphicalTheme {
+            characters: miette::ThemeCharacters::unicode(),
+            styles: miette::ThemeStyles::ansi(),
+        }
+    } else {
+        miette::GraphicalTheme::unicode_nocolor()
+    };
+    let handler = miette::GraphicalReportHandler::new_themed(theme).with_width(80);
+    let mut block = String::new();
+    if handler.render_report(&mut block, &diagnostic).is_ok() {
+        let _ = write!(out, "\n{}", block.trim_end());
+    }
+    anyhow!("{out}")
+}
+
+/// An entry's value span as a byte range. `KdlEntry::span()` covers
+/// the entry as written — `key=value` for a property, the bare value
+/// for a positional — and starts AFTER leading trivia.
+fn span_range(entry: &kdl::KdlEntry) -> std::ops::Range<usize> {
+    let span = entry.span();
+    span.offset()..span.offset() + span.len()
 }
 
 #[cfg(test)]
@@ -1613,10 +2014,10 @@ pane "nested" {
     }
 
     #[test]
-    fn an_unknown_top_level_node_names_the_seven() {
+    fn an_unknown_top_level_node_names_the_eight() {
         assert_eq!(
             container_err("panes {\n    pane \"log\" {\n        command \"date\"\n    }\n}\n"),
-            "unknown node \"panes\" — a dashboard's top level takes title, gap, row-gap, defaults, pane, row, or column"
+            "unknown node \"panes\" — a dashboard's top level takes title, gap, row-gap, variables, defaults, pane, row, or column"
         );
     }
 
@@ -2284,5 +2685,601 @@ pane "log" {
         assert!(err.contains("comand"), "quotes what was written: {err}");
         assert!(err.contains("command"), "{err}");
         assert!(err.contains("interval"), "{err}");
+    }
+
+    // ─── The `variables` block ──────────────────────────────────────
+
+    use crate::core::registry::ShellDecl;
+    use crate::core::template::{Bindings, Template};
+    use crate::core::variables::{
+        Derivation, Expanded, Resolved, Tier, VarSource, VariableBlock, opaque_roots,
+        resolve_partial, resolve_variables,
+    };
+
+    fn vars(text: &str) -> VariableBlock {
+        parse(text).expect("the board parses").variables
+    }
+
+    fn vars_err(text: &str) -> String {
+        format!("{:#}", parse(text).expect_err("the board is refused"))
+    }
+
+    /// The smallest legal board to hang a `variables` block on.
+    const ONE_PANE: &str = "\npane \"a\" { command \"true\"\nheight 3 }\n";
+
+    #[test]
+    fn a_variables_block_declares_constants_and_commands() {
+        let block = vars(&format!(
+            r#"
+variables {{
+    plan  "/tmp/plans/0028"
+    store "git rev-parse --git-common-dir" shell=#true
+    head  "git rev-parse --short HEAD" shell=#true defer=#true
+    fishy "status --porcelain" shell="fish"
+}}
+{ONE_PANE}"#
+        ));
+        assert_eq!(
+            block.get("plan").map(|v| &v.source),
+            Some(&VarSource::Constant)
+        );
+        assert_eq!(
+            block.get("store").map(|v| v.source.clone()),
+            Some(VarSource::LoadCommand(ShellDecl::Platform))
+        );
+        assert_eq!(
+            block.get("head").map(|v| v.source.clone()),
+            Some(VarSource::SpawnCommand(ShellDecl::Platform))
+        );
+        assert_eq!(
+            block.get("fishy").map(|v| v.source.clone()),
+            Some(VarSource::LoadCommand(ShellDecl::Named(Template::extract(
+                "fish"
+            ))))
+        );
+        // The text is the author's bytes, unexpanded — this walk never
+        // expands (INV-2).
+        assert_eq!(
+            block.get("plan").map(|v| v.text.text.as_str()),
+            Some("/tmp/plans/0028")
+        );
+        assert_eq!(block.declared_list(), "fishy, head, plan, store");
+    }
+
+    #[test]
+    fn a_board_with_no_variables_block_has_an_empty_map() {
+        let block = vars(ONE_PANE);
+        assert!(block.is_empty());
+        assert_eq!(block.declared_list(), "");
+    }
+
+    #[test]
+    fn a_reference_resolves_regardless_of_where_it_is_written() {
+        // The unordered-references regression test: `cur` is written
+        // ABOVE the `sel` it
+        // references, and above the `store` that `sel` needs. Under the
+        // retired declaration-order rule this was an unknown-variable
+        // error for a name visible three lines down.
+        let block = vars(&format!(
+            r#"
+variables {{
+    cur   "{{{{sel}}}}.cursor"
+    sel   "{{{{store}}}}/pointbreak-review.sel"
+    store "/tmp/common"
+}}
+{ONE_PANE}"#
+        ));
+        let order: Vec<&str> = block.in_order().map(|v| v.name.as_str()).collect();
+        // Topological: every name appears after everything it references.
+        assert_eq!(order, vec!["store", "sel", "cur"]);
+        assert_eq!(
+            block.get("cur").map(|v| v.text.refs.as_slice()),
+            Some(&["sel".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn a_self_reference_is_refused_and_names_the_cycle() {
+        let err = vars_err(&format!(
+            "variables {{\n    a \"{{{{a}}}}/x\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("variable cycle: `a` → `a`"), "got {err}");
+        assert!(
+            err.starts_with("line 2, column "),
+            "the error is placed: {err}"
+        );
+    }
+
+    #[test]
+    fn a_two_hop_cycle_is_refused_with_the_whole_path() {
+        let err = vars_err(&format!(
+            "variables {{\n    a \"{{{{b}}}}\"\n    b \"{{{{a}}}}\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("variable cycle: `a` → `b` → `a`"), "got {err}");
+    }
+
+    #[test]
+    fn a_three_hop_cycle_renders_every_hop() {
+        // Beyond the degenerate case: the path RENDERER is what is under
+        // test, not the detector.
+        let err = vars_err(&format!(
+            "variables {{\n    a \"{{{{b}}}}\"\n    b \"{{{{c}}}}\"\n    c \"{{{{a}}}}\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.contains("variable cycle: `a` → `b` → `c` → `a`"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_reference_to_an_undeclared_name_inside_the_block_is_refused() {
+        let err = vars_err(&format!(
+            "variables {{\n    a \"{{{{nope}}}}\"\n    b \"x\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("unknown variable `nope`"), "got {err}");
+        assert!(err.contains("declared variables are a, b"), "got {err}");
+    }
+
+    #[test]
+    fn a_constant_that_references_a_command_is_promoted_within_the_load_tier() {
+        // INV-3's own canonical example, and the repeated-derived-path
+        // case variables exist for.
+        // A literal reading of the tier ladder over DECLARED forms would
+        // refuse this; over EFFECTIVE tiers it is legal, and `sel` simply
+        // IS once-at-load, which is also the truth.
+        let block = vars(&format!(
+            r#"
+variables {{
+    sel   "{{{{store}}}}/pointbreak-review.sel"
+    store "git rev-parse --git-common-dir" shell=#true
+}}
+{ONE_PANE}"#
+        ));
+        assert_eq!(block.tier("sel"), Some(Tier::Load));
+        assert_eq!(block.tier("store"), Some(Tier::Load));
+    }
+
+    #[test]
+    fn every_load_to_load_pairing_is_accepted() {
+        // INV-9's accepting rows, one board each: constant→constant,
+        // once-at-load→once-at-load, deferred→deferred, deferred→
+        // once-at-load, deferred→constant.
+        for (body, name, tier) in [
+            ("a \"x\"\n    b \"{{a}}\"", "b", Tier::Load),
+            (
+                "a \"echo x\" shell=#true\n    b \"echo {{a}}\" shell=#true",
+                "b",
+                Tier::Load,
+            ),
+            (
+                "a \"echo x\" shell=#true defer=#true\n    b \"echo {{a}}\" shell=#true defer=#true",
+                "b",
+                Tier::Spawn,
+            ),
+            (
+                "a \"echo x\" shell=#true\n    b \"echo {{a}}\" shell=#true defer=#true",
+                "b",
+                Tier::Spawn,
+            ),
+            (
+                "a \"x\"\n    b \"echo {{a}}\" shell=#true defer=#true",
+                "b",
+                Tier::Spawn,
+            ),
+        ] {
+            let block = vars(&format!("variables {{\n    {body}\n}}\n{ONE_PANE}"));
+            assert_eq!(block.tier(name), Some(tier), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_load_time_variable_referencing_a_deferred_one_is_refused_in_either_order() {
+        // A TIER violation, not a position rule: it holds regardless of
+        // where the two are written, which is the property INV-3's
+        // unordered references made testable.
+        for body in [
+            "sel  \"{{head}}/x\"\n    head \"git rev-parse --short HEAD\" shell=#true defer=#true",
+            "head \"git rev-parse --short HEAD\" shell=#true defer=#true\n    sel  \"{{head}}/x\"",
+        ] {
+            let err = vars_err(&format!("variables {{\n    {body}\n}}\n{ONE_PANE}"));
+            assert!(
+                err.contains("`sel` is not deferred but references `head`, which is"),
+                "names BOTH variables: {err}"
+            );
+            assert!(
+                err.contains("add `defer=#true` to `sel`") && err.contains("drop it from `head`"),
+                "teaches both fixes: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_effective_tier_never_outruns_its_declared_form() {
+        // The pin INV-7's ONE-LEVEL site check rests on. Because
+        // clause 2 refuses load-references-deferred, a variable's
+        // effective tier always EQUALS its declared tier once the block
+        // is accepted — so "is any DIRECTLY referenced name deferred?" is
+        // a complete answer at a site, and no transitive walk is needed.
+        // If someone ever relaxes clause 2 to auto-promotion, this is the
+        // test that fails first.
+        let block = vars(&format!(
+            r#"
+variables {{
+    k "x"
+    l "{{{{k}}}}"
+    m "echo {{{{l}}}}" shell=#true
+    n "echo {{{{m}}}}" shell=#true defer=#true
+    o "echo {{{{n}}}}" shell=#true defer=#true
+}}
+{ONE_PANE}"#
+        ));
+        for v in block.in_order() {
+            assert_eq!(v.tier, v.source.declared_tier(), "{}", v.name);
+        }
+    }
+
+    #[test]
+    fn a_templated_shell_name_is_a_dependency_like_any_other() {
+        // A dialect name is a string an author writes, so it carries
+        // references — and a variable cannot be derived until the shell
+        // that runs it is known. It is therefore a graph EDGE, ordered
+        // like any other, and it participates in tier analysis.
+        let block = vars(&format!(
+            r#"
+variables {{
+    dialect "fish"
+    out     "status --porcelain" shell="{{{{dialect}}}}"
+}}
+{ONE_PANE}"#
+        ));
+        let order: Vec<&str> = block.in_order().map(|v| v.name.as_str()).collect();
+        assert_eq!(order, vec!["dialect", "out"]);
+        assert_eq!(
+            block.get("out").unwrap().refs().collect::<Vec<_>>(),
+            vec!["dialect"]
+        );
+
+        // An unknown name in a shell is the ordinary INV-6 refusal…
+        let err = vars_err(&format!(
+            "variables {{\n    out \"x\" shell=\"{{{{nope}}}}\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("unknown variable `nope`"), "got {err}");
+
+        // …a cycle through a shell is still a cycle…
+        let err = vars_err(&format!(
+            "variables {{\n    a \"x\" shell=\"{{{{b}}}}\"\n    b \"{{{{a}}}}\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("variable cycle: `a` → `b` → `a`"), "got {err}");
+
+        // …and a shell naming a DEFERRED variable is INV-9 clause 2. This
+        // is the route that slips past entirely if the graph reads only
+        // `text.refs`.
+        let err = vars_err(&format!(
+            "variables {{\n    d \"echo fish\" shell=#true defer=#true\n    a \"x\" shell=\"{{{{d}}}}\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.contains("`a` is not deferred but references `d`, which is"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_shell_declaration_keeps_its_switch_forms_and_refuses_a_nameless_one() {
+        let block = vars(&format!(
+            "variables {{\n    p \"echo x\" shell=#true\n    f \"echo x\" shell=\"fish\"\n}}\n{ONE_PANE}"
+        ));
+        assert_eq!(
+            block.get("p").unwrap().source.shell(),
+            Some(&ShellDecl::Platform)
+        );
+        assert_eq!(
+            block.get("f").unwrap().source.shell(),
+            Some(&ShellDecl::Named(Template::extract("fish")))
+        );
+        assert!(
+            block
+                .get("p")
+                .unwrap()
+                .source
+                .shell()
+                .unwrap()
+                .refs()
+                .is_empty()
+        );
+        // An empty name names nothing — never a spawn of `""`.
+        let err = vars_err(&format!(
+            "variables {{\n    a \"x\" shell=\"\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.contains("`shell` takes #true or one string"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_variable_name_is_refused() {
+        let err = vars_err(&format!(
+            "variables {{\n    plan \"a\"\n    plan \"b\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("`plan` is declared twice"), "got {err}");
+    }
+
+    #[test]
+    fn a_variables_block_refuses_the_shapes_that_mean_nothing() {
+        for (body, needle) in [
+            // A name that cannot be REFERENCED cannot be declared: same
+            // identifier grammar as `{{name}}` (INV-1).
+            (
+                "variables {\n    \"2fast\" \"x\"\n}",
+                "a variable's name starts with a letter or `_`",
+            ),
+            // One value, a string.
+            ("variables {\n    a\n}", "`a` takes one string"),
+            ("variables {\n    a \"x\" \"y\"\n}", "`a` takes one string"),
+            ("variables {\n    a 7\n}", "`a` takes one string"),
+            // A variable holds a value, never a block.
+            ("variables {\n    a \"x\" { b \"y\" }\n}", "holds no block"),
+            // The block itself.
+            (
+                "variables \"x\" {\n    a \"y\"\n}",
+                "`variables` takes no id",
+            ),
+            ("variables {\n}", "the `variables` block is empty"),
+            ("variables\n", "the `variables` block is empty"),
+            // Properties: the accepted set, then each dead knob.
+            (
+                "variables {\n    a \"x\" frobnicate=#true\n}",
+                "a variable's properties are shell, defer",
+            ),
+            (
+                "variables {\n    a \"x\" defer=#true\n}",
+                "`defer` re-derives a value, and `a` derives nothing",
+            ),
+            (
+                "variables {\n    a \"echo x\" shell=#false\n}",
+                "a variable with no shell is a constant",
+            ),
+        ] {
+            let err = vars_err(&format!("{body}\n{ONE_PANE}"));
+            assert!(err.contains(needle), "{body:?} → {err}");
+        }
+    }
+
+    #[test]
+    fn a_default_property_names_the_override_that_replaced_it() {
+        // INV-5, retired: `default` is an ordinary unknown property now,
+        // and it carries the one-line hint that explains the deletion.
+        let err = vars_err(&format!(
+            "variables {{\n    limit \"50\" default=\"50\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.contains("a variable's properties are shell, defer"),
+            "got {err}"
+        );
+        assert!(
+            err.contains("a constant is its own default") && err.contains("-v limit=200"),
+            "the hint names the -v alternative: {err}"
+        );
+    }
+
+    #[test]
+    fn the_variables_block_is_declared_once() {
+        let err = vars_err(&format!(
+            "variables {{\n    a \"x\"\n}}\nvariables {{\n    b \"y\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("`variables` is declared twice"), "got {err}");
+    }
+
+    #[test]
+    fn resolving_walks_dependencies_first_and_never_runs_an_overridden_command() {
+        // The evaluator, against a COUNTING stub runner — Phase 1 has no
+        // shell runner, and this is the shape the real one slots into.
+        let block = vars(&format!(
+            r#"
+variables {{
+    sel   "{{{{store}}}}/x"
+    store "git rev-parse --git-common-dir" shell=#true
+    other "echo hi" shell=#true
+}}
+{ONE_PANE}"#
+        ));
+        let mut asked: Vec<String> = Vec::new();
+        let out = resolve_variables(&block, &Bindings::new(), &mut |d: Derivation<'_>| {
+            asked.push(d.name.to_string());
+            Ok(format!("<{}>", d.command))
+        })
+        .expect("resolves");
+        assert_eq!(asked, vec!["store", "other"]);
+        assert_eq!(
+            out.get("store").map(String::as_str),
+            Some("<git rev-parse --git-common-dir>")
+        );
+        // Dependencies first: `sel` saw `store`'s DERIVED value.
+        assert_eq!(
+            out.get("sel").map(String::as_str),
+            Some("<git rev-parse --git-common-dir>/x")
+        );
+
+        // An override wins for the exact name and the command is
+        // suppressed by never being reached (INV-4.4).
+        let mut asked: Vec<String> = Vec::new();
+        let overrides = Bindings::from([("store".to_string(), "/common".to_string())]);
+        let out = resolve_variables(&block, &overrides, &mut |d: Derivation<'_>| {
+            asked.push(d.name.to_string());
+            Ok("unreachable".to_string())
+        })
+        .expect("resolves");
+        assert_eq!(asked, vec!["other"], "`store`'s command never ran");
+        assert_eq!(out.get("sel").map(String::as_str), Some("/common/x"));
+    }
+
+    #[test]
+    fn partial_resolution_knows_constants_and_chains_and_stays_opaque_past_a_command() {
+        // Task 4.1's provider: `check` runs nothing, so a command is
+        // Opaque — but a constant, a chain of constants, and anything a
+        // `-v` supplies are all KNOWN, and a board that is
+        // deterministically wrong must still be catchable.
+        let block = vars(&format!(
+            r#"
+variables {{
+    plan  "/tmp/plans/0028"
+    sub   "{{{{plan}}}}/tasks"
+    store "git rev-parse --git-common-dir" shell=#true
+    sel   "{{{{store}}}}/x"
+    head  "git rev-parse HEAD" shell=#true defer=#true
+}}
+{ONE_PANE}"#
+        ));
+        let partial = resolve_partial(&block, &Bindings::new());
+        assert_eq!(
+            partial.get("plan"),
+            Some(&Resolved::Known("/tmp/plans/0028".into()))
+        );
+        // A chain of constants is Known all the way down.
+        assert_eq!(
+            partial.get("sub"),
+            Some(&Resolved::Known("/tmp/plans/0028/tasks".into()))
+        );
+        assert_eq!(partial.get("store"), Some(&Resolved::Opaque));
+        // Opacity is TRANSITIVE, in the same topological pass.
+        assert_eq!(partial.get("sel"), Some(&Resolved::Opaque));
+        // A deferred name is PRESENT and Opaque — known-to-exist but
+        // unknowable, which is a different answer from missing.
+        assert_eq!(partial.get("head"), Some(&Resolved::Opaque));
+
+        // `-v` suppresses the command, so it makes a command variable
+        // knowable — and everything downstream with it.
+        let partial = resolve_partial(
+            &block,
+            &Bindings::from([("store".into(), "/common".into())]),
+        );
+        assert_eq!(
+            partial.get("store"),
+            Some(&Resolved::Known("/common".into()))
+        );
+        assert_eq!(
+            partial.get("sel"),
+            Some(&Resolved::Known("/common/x".into()))
+        );
+    }
+
+    #[test]
+    fn a_partial_expansion_is_either_exact_bytes_or_names_what_blocked_it() {
+        let block = vars(&format!(
+            "variables {{\n    iv \"bad\"\n    store \"git rev-parse\" shell=#true\n}}\n{ONE_PANE}"
+        ));
+        let partial = resolve_partial(&block, &Bindings::new());
+        // The case that must NOT be skipped: a deterministically wrong
+        // constant. `check` hands these bytes to `parse_interval` and
+        // reports the real error.
+        assert_eq!(
+            Template::extract("{{iv}}").expand_partial(&partial),
+            Expanded::Known("bad".to_string())
+        );
+        // The case that must be skipped, naming exactly what blocked it.
+        assert_eq!(
+            Template::extract("file:{{store}}/events").expand_partial(&partial),
+            Expanded::Skipped(vec!["store".to_string()])
+        );
+        // A template-free string, and every RAW string, are always exact.
+        assert_eq!(
+            Template::extract("file:./stamp").expand_partial(&partial),
+            Expanded::Known("file:./stamp".to_string())
+        );
+        assert_eq!(
+            Template::literal("file:{{store}}").expand_partial(&partial),
+            Expanded::Known("file:{{store}}".to_string())
+        );
+    }
+
+    #[test]
+    fn opacity_traces_back_to_the_command_that_caused_it() {
+        // `Skipped` names what a site DIRECTLY referenced, which points at
+        // the wrong line when that name is a tainted constant. A report
+        // must name the command the reader can act on.
+        let block = vars(&format!(
+            "variables {{\n    store \"git rev-parse\" shell=#true\n    sel \"{{{{store}}}}/x\"\n    p \"lit\"\n}}\n{ONE_PANE}"
+        ));
+        let partial = resolve_partial(&block, &Bindings::new());
+        assert_eq!(
+            Template::extract("{{sel}}").expand_partial(&partial),
+            Expanded::Skipped(vec!["sel".to_string()])
+        );
+        assert_eq!(
+            opaque_roots(&block, &partial, "sel"),
+            vec!["store".to_string()]
+        );
+        assert_eq!(
+            opaque_roots(&block, &partial, "store"),
+            vec!["store".to_string()]
+        );
+        assert!(opaque_roots(&block, &partial, "p").is_empty());
+    }
+
+    #[test]
+    fn every_known_value_on_a_mixed_board_matches_the_real_one() {
+        // The property `check` actually rests on, and the one that can
+        // drift: a board where opacity EXISTS in the graph, so `Known`
+        // propagation has to route around it. If a `Known` value here can
+        // differ from the real one, `check` does not merely miss an error
+        // — it reports a WRONG one, refusing a board that runs fine.
+        let block = vars(&format!(
+            r#"
+variables {{
+    store "git rev-parse --git-common-dir" shell=#true
+    plan  "/a/b"
+    sel   "{{{{plan}}}}/x"
+    tainted "{{{{store}}}}/y"
+    head  "git rev-parse HEAD" shell=#true defer=#true
+}}
+{ONE_PANE}"#
+        ));
+        let full = resolve_variables(&block, &Bindings::new(), &mut |d: Derivation<'_>| {
+            Ok(format!("<{}>", d.name))
+        })
+        .expect("resolves");
+        let partial = resolve_partial(&block, &Bindings::new());
+        // Opacity exists, so this is genuinely the mixed case.
+        assert_eq!(partial.get("store"), Some(&Resolved::Opaque));
+        assert_eq!(partial.get("tainted"), Some(&Resolved::Opaque));
+        // …and every name partial calls Known is byte-identical to real.
+        assert_eq!(partial.get("sel"), Some(&Resolved::Known("/a/b/x".into())));
+        for (name, resolved) in &partial {
+            if let Resolved::Known(value) = resolved {
+                assert_eq!(full.get(name), Some(value), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_and_full_resolution_agree_when_nothing_needs_running() {
+        // The two modes are one walk. On a board with no command
+        // variables they must produce the same bytes for every name, or
+        // `check` and `rat dashboard` disagree about the same file.
+        let block = vars(&format!(
+            "variables {{\n    a \"x\"\n    b \"{{{{a}}}}/y\"\n}}\n{ONE_PANE}"
+        ));
+        let full =
+            resolve_variables(&block, &Bindings::new(), &mut |_| unreachable!()).expect("resolves");
+        let partial = resolve_partial(&block, &Bindings::new());
+        for (name, value) in &full {
+            assert_eq!(
+                partial.get(name),
+                Some(&Resolved::Known(value.clone())),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deferred_variable_has_no_load_time_value() {
+        let block = vars(&format!(
+            "variables {{\n    head \"git rev-parse HEAD\" shell=#true defer=#true\n    p \"x\"\n}}\n{ONE_PANE}"
+        ));
+        let out = resolve_variables(&block, &Bindings::new(), &mut |_| {
+            panic!("a deferred variable is never derived at load")
+        })
+        .expect("resolves");
+        assert_eq!(out.keys().collect::<Vec<_>>(), vec!["p"]);
     }
 }

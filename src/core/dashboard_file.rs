@@ -52,6 +52,14 @@ pub struct DashboardFile {
     /// The whole dashboard's name — a different thing from any pane's
     /// own `title`, which labels one box's border.
     pub title: Option<TitleDecl>,
+    /// The board's declared variables, checked but NOT evaluated —
+    /// the walk never expands (INV-2). `into_registry` reads it to
+    /// enforce INV-7's site rule.
+    ///
+    /// From `variables.rs`, NOT `dashboard_kdl.rs`: this module is
+    /// imported BY the walk, so a field typed from the walk would
+    /// close a cycle.
+    pub variables: crate::core::variables::VariableBlock,
     pub gap: Option<usize>,
     pub row_gap: Option<usize>,
     pub defaults: PaneDecl,

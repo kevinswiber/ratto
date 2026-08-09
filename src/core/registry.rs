@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::bail;
 
 use crate::core::box_model::{BorderPreset, Sides};
+use crate::core::template::{Bindings, Template};
 use crate::core::trigger::TriggerSpec;
 
 /// Stable index of one source: the tag on every outcome and the key of
@@ -41,6 +42,117 @@ impl ShellMode {
         !matches!(self, ShellMode::Direct)
     }
 }
+
+/// A `shell` declaration as WRITTEN — the one spelling every parser in
+/// this crate uses, on a pane, on `defaults`, and on a variable.
+///
+/// It exists because [`ShellMode`] cannot hold a template: its
+/// `Named(String)` would swallow both the references a dialect name
+/// carries and the string flavor that decides whether they are
+/// references at all (INV-1). `ShellMode` is the RESOLVED thing, and
+/// it is constructed only after the name has been expanded — through
+/// [`ShellDecl::resolve`].
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum ShellDecl {
+    /// `shell=#false` — no shell at all.
+    #[default]
+    Direct,
+    /// `shell=#true` — the platform shell, full stop.
+    Platform,
+    /// `shell="fish"`, or `shell="{{dialect}}"`.
+    Named(Template),
+}
+
+impl ShellDecl {
+    /// Whether a shell is involved at all — the ONE thing the command
+    /// SPLIT depends on, and answerable BEFORE expansion, because any
+    /// non-empty name is a shell whatever it expands to. That is what
+    /// keeps the split's timing unchanged by templating.
+    pub fn runs_a_shell(&self) -> bool {
+        !matches!(self, ShellDecl::Direct)
+    }
+
+    /// The names a templated dialect name references — empty for the
+    /// two switch forms. These are graph edges like any other: a
+    /// variable cannot be derived until the shell that runs it is
+    /// known.
+    ///
+    /// Returns a slice where `Variable::refs` (in `variables.rs`)
+    /// returns an iterator, and that difference is deliberate — do not
+    /// "align" them. The reason is what each one HAS, not who calls
+    /// it: this method lends a stored `Vec` (`Named`'s `Template`
+    /// refs), and a slice is the idiomatic way to lend one — callers
+    /// get `.is_empty()` and `.len()` without consuming anything.
+    /// `Variable::refs` computes a chain across two sources and owns
+    /// no collection to lend, so an iterator is the only honest
+    /// return.
+    pub fn refs(&self) -> &[String] {
+        match self {
+            ShellDecl::Named(template) => &template.refs,
+            _ => &[],
+        }
+    }
+
+    /// The resolved mode, once the dialect name has been expanded.
+    /// An expansion that produces an empty or blank name is refused
+    /// here for the same reason `shell ""` is refused at parse: it
+    /// names nothing, and a spawn of `""` is never the answer.
+    ///
+    /// The error is TYPED, not `anyhow`, and the reason is the spawn
+    /// tier: a deferred variable whose dialect is itself derived
+    /// (`head "…" shell="{{d}}" defer=#true`) resolves this at each
+    /// consuming spawn, where there is no load left to refuse and the
+    /// failure has to render in that pane's box through the derivation
+    /// failure adapter. An `anyhow` cannot reach that adapter. Same
+    /// shape as `MissingVariable`: a small feeder carrying WHAT went
+    /// wrong, with WHICH variable added at the boundary that knows it.
+    pub fn resolve(&self, bindings: &Bindings) -> Result<ShellMode, EmptyShellName> {
+        match self {
+            ShellDecl::Direct => Ok(ShellMode::Direct),
+            ShellDecl::Platform => Ok(ShellMode::Platform),
+            ShellDecl::Named(template) => {
+                let blank = || EmptyShellName {
+                    declared: template.text.clone(),
+                };
+                let name = template.expand(bindings).map_err(|_| blank())?;
+                if name.trim().is_empty() {
+                    return Err(blank());
+                }
+                Ok(ShellMode::Named(name))
+            }
+        }
+    }
+}
+
+/// A `shell` dialect name that expanded to nothing.
+///
+/// One arm, not two, though expansion can fail two ways: a reference
+/// that cannot be filled is ALSO reported as blank, because a name we
+/// cannot build is a name that names nothing, and the sentence is true
+/// either way. Both are unreachable by construction — a dialect's
+/// references are graph edges (`Variable::refs`, in `variables.rs`),
+/// so they are resolved before it is at load, and INV-7's site rule
+/// keeps a deferred one out of a load-time site — so collapsing them
+/// keeps the failure total and single-armed rather than adding a third
+/// type for a case that cannot arise.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EmptyShellName {
+    /// The dialect name as the author wrote it, holes and all.
+    pub declared: String,
+}
+
+impl std::fmt::Display for EmptyShellName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`shell` expanded to an empty name (written as {:?}) — a shell name must \
+             name a program",
+            self.declared
+        )
+    }
+}
+
+impl std::error::Error for EmptyShellName {}
 
 /// A parsed `#!` line: the interpreter, and the single optional
 /// argument the one-argument rule allows.
