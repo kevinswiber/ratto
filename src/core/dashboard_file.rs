@@ -283,9 +283,6 @@ impl DashboardFile {
 /// bytes; `Skipped` records the site and its blockers. NEVER a
 /// stand-in value — a sentinel would reach a token parser and refuse
 /// boards that run fine.
-// The check command is this family's production caller; until it
-// lands only tests reach it. Remove these allows with it.
-#[allow(dead_code)]
 fn at_load_partial(template: &Template, partial: &crate::core::variables::Partial) -> Expanded {
     template.expand_partial(partial)
 }
@@ -294,11 +291,14 @@ fn at_load_partial(template: &Template, partial: &crate::core::variables::Partia
 /// `defaults` block every pane inherits from. Only `inherit()`'s
 /// origin bit can still tell them apart by the time a value reaches a
 /// site.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum SiteOrigin {
     Pane(String),
     Defaults,
+    /// The dashboard-level `title` — a different site from any pane's
+    /// `title`, sharing its spelling; the origin is what tells them
+    /// apart in a report.
+    Dashboard,
 }
 
 impl std::fmt::Display for SiteOrigin {
@@ -306,21 +306,24 @@ impl std::fmt::Display for SiteOrigin {
         match self {
             SiteOrigin::Pane(id) => write!(f, "pane {id:?}"),
             SiteOrigin::Defaults => write!(f, "defaults"),
+            SiteOrigin::Dashboard => write!(f, "the dashboard"),
         }
     }
 }
 
-/// One load-time site the audit validated.
-#[allow(dead_code)]
+/// One load-time site the audit validated. Facts only: today's report
+/// prints the UNCHECKED half and this half rides along for whoever
+/// wants a full ledger — the fields are data, not yet consumed.
 #[derive(Debug)]
 pub(crate) struct AuditedSite {
+    #[allow(dead_code)]
     pub origin: SiteOrigin,
     /// The key's own name: "trigger", "interval", "shell", …
+    #[allow(dead_code)]
     pub key: &'static str,
 }
 
 /// A site whose value could not be known without running something.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct UncheckedSite {
     pub origin: SiteOrigin,
@@ -339,7 +342,6 @@ pub(crate) struct UncheckedSite {
 /// unknowable has no coherent registry, and inventing one is how a
 /// checker starts refusing boards that run fine. Full `Registry`
 /// construction stays the exclusive property of the real load path.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct SiteAudit {
     pub checked: Vec<AuditedSite>,
@@ -353,7 +355,6 @@ pub(crate) struct SiteAudit {
 /// brief's intent — the check sits beside the parser that would
 /// otherwise choke), and the correspondence between the two is held by
 /// the per-site route tests rather than by construction.
-#[allow(dead_code)]
 struct LoadSite {
     key: &'static str,
     pick: for<'a> fn(&'a PaneDecl, &'a PaneDecl) -> Vec<(&'a Template, bool)>,
@@ -456,20 +457,25 @@ impl DashboardFile {
     /// malformed one refuses exactly as a run would; only `Skipped`
     /// becomes a row. That asymmetry IS the partial semantics: never
     /// stricter than the runtime, and never laxer either.
-    #[allow(dead_code)]
     pub(crate) fn audit_sites(
         &self,
         partial: &crate::core::variables::Partial,
     ) -> anyhow::Result<SiteAudit> {
         let mut audit = SiteAudit::default();
         let mut visit = |origin: SiteOrigin,
+                         subject: &str,
                          key: &'static str,
                          template: &Template,
+                         inherited: bool,
                          parse: fn(&str, &str) -> anyhow::Result<()>|
          -> anyhow::Result<()> {
+            // The SAME site refusal the run applies (INV-7), through
+            // the same function with the same subject — a checker that
+            // skipped it would accept a board the runtime refuses.
+            refuse_deferred_at_load_site(template, key, inherited, &self.variables, subject)?;
             match at_load_partial(template, partial) {
                 Expanded::Known(text) => {
-                    parse(&text, &origin.to_string())?;
+                    parse(&text, subject)?;
                     audit.checked.push(AuditedSite { origin, key });
                 }
                 Expanded::Skipped(blockers) => {
@@ -491,7 +497,14 @@ impl DashboardFile {
                     } else {
                         SiteOrigin::Pane(pane.clone())
                     };
-                    visit(origin, site.key, template, site.parse)?;
+                    visit(
+                        origin,
+                        &at(&pane),
+                        site.key,
+                        template,
+                        inherited,
+                        site.parse,
+                    )?;
                 }
             }
         }
@@ -502,7 +515,14 @@ impl DashboardFile {
             text: Some(text), ..
         }) = &self.title
         {
-            visit(SiteOrigin::Defaults, "title", text, |_, _| Ok(()))?;
+            visit(
+                SiteOrigin::Dashboard,
+                "the dashboard",
+                "title",
+                text,
+                false,
+                |_, _| Ok(()),
+            )?;
         }
         Ok(audit)
     }

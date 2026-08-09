@@ -2,23 +2,38 @@
 //! construction — the declaration file becomes a [`Registry`], the
 //! flags become a `SessionArgs`, and the watch engine does the rest.
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 
-use crate::cli::DashboardArgs;
+use crate::cli::{CheckArgs, DashboardAction, DashboardArgs};
 use crate::color::ColorProfile;
 use crate::commands::watch::{SessionArgs, run_registry};
-use crate::core::dashboard_file::load;
+use crate::core::dashboard_file::{DashboardFile, SiteAudit, UncheckedSite, load, read_and_parse};
 use crate::core::registry::Registry;
 use crate::core::template::{Bindings, is_reference_name};
 use crate::exit::AppResult;
 use crate::theme::Palette;
 
 pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppResult {
+    // Dispatched first: the subcommand needs no terminal, no tab
+    // title, and no Registry-backed session.
+    match args.action {
+        Some(DashboardAction::Check(check)) => return check_board(check, profile),
+        None => {}
+    }
+    // Honest rather than defensive: `required = true` plus
+    // `subcommand_negates_reqs` makes `None` unreachable once no
+    // subcommand was given, and a silent default would hide a
+    // clap-config regression the bare-`rat dashboard` test exists to
+    // catch.
+    let file = args
+        .file
+        .clone()
+        .expect("clap requires FILE without a subcommand");
     // A load error prints before any UI exists, so the profile is the
     // one color authority it gets: anything above Ascii earns the
     // colored snippet theme.
     let overrides = parse_overrides(&args.variable)?;
-    let (registry, variables) = load(&args.file, profile != ColorProfile::Ascii, &overrides)?;
+    let (registry, variables) = load(&file, profile != ColorProfile::Ascii, &overrides)?;
     let once_timeout = args
         .once_timeout
         .as_deref()
@@ -31,8 +46,7 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
         // the declared title (static or pane-sourced) outranks it at
         // emit time.
         tab_title: Some(
-            args.file
-                .file_stem()
+            file.file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "dashboard".to_string()),
         ),
@@ -243,6 +257,230 @@ const LOOPING_HELP: &[&str] = &[
 ///
 /// `rat dashboard check` reuses this: the same flags must reach the
 /// same verdict there.
+/// One report row: an `UncheckedSite` from the audit, enriched with
+/// the commands actually responsible. Private to the command layer —
+/// `roots` needs the variable graph, and root-cause tracing is report
+/// logic, which is why the core DTO deliberately stops at `blockers`.
+struct SkipRow {
+    site: UncheckedSite,
+    roots: Vec<String>,
+}
+
+/// Validate a declaration file and report, without running anything it
+/// declares: the shared load prefix, then the partial, non-executing
+/// resolver in place of the real one.
+fn check_board(args: CheckArgs, profile: ColorProfile) -> AppResult {
+    use crate::core::variables::{opaque_roots, resolve_partial};
+    let colored = profile != ColorProfile::Ascii;
+    let overrides = parse_overrides(&args.variable)?;
+    // The shared prefix — read + parse + `-v` validation — with BOTH
+    // context strings attached exactly once. `load()` calls this same
+    // function; inlining the steps here is how the byte-identity with
+    // a run's stderr would quietly stop being true.
+    let (_text, file) = read_and_parse(&args.file, colored, &overrides)?;
+    // NOT resolve_variables: no command runs. The partial resolver
+    // walks the same graph and returns Known for constants, -v
+    // overrides, and chains of those — so a malformed CONSTANT still
+    // reaches its token parser and still refuses — and Opaque for
+    // anything a command would have to produce. Infallible: every
+    // refusal already fired during the parse inside the prefix.
+    let partial = resolve_partial(&file.variables, &overrides);
+    // A malformed KNOWN value refuses here, exactly as a run would;
+    // only Skipped becomes a row.
+    let audit = file
+        .audit_sites(&partial)
+        .with_context(|| format!("in {}", args.file.display()))?;
+    let rows: Vec<SkipRow> = audit
+        .unchecked
+        .iter()
+        .map(|site| SkipRow {
+            roots: {
+                let mut roots: Vec<String> = Vec::new();
+                for blocker in &site.blockers {
+                    for root in opaque_roots(&file.variables, &partial, blocker) {
+                        if !roots.contains(&root) {
+                            roots.push(root);
+                        }
+                    }
+                }
+                roots
+            },
+            site: UncheckedSite {
+                origin: site.origin.clone(),
+                key: site.key,
+                blockers: site.blockers.clone(),
+            },
+        })
+        .collect();
+    let _ = SiteAudit::default();
+    print!(
+        "{}",
+        render_report(&file, &partial, &overrides, &rows, &args.file)
+    );
+    Ok(())
+}
+
+/// The names a board's templates reference anywhere — panes, defaults,
+/// the titles, and other variables. What is declared minus this is the
+/// unused-variable notice.
+fn referenced_names(file: &DashboardFile) -> std::collections::BTreeSet<String> {
+    let mut used = std::collections::BTreeSet::new();
+    let mut take = |template: &crate::core::template::Template| {
+        for name in template.refs() {
+            used.insert(name.clone());
+        }
+    };
+    for decl in file.panes.iter().chain(std::iter::once(&file.defaults)) {
+        for template in decl.command.iter().flatten() {
+            take(template);
+        }
+        for template in decl.trigger.iter().flatten() {
+            take(template);
+        }
+        for template in [
+            &decl.script,
+            &decl.interval,
+            &decl.trigger_debounce,
+            &decl.width,
+            &decl.overflow,
+            &decl.border,
+            &decl.padding,
+            &decl.title,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            take(template);
+        }
+        if let Some(crate::core::registry::ShellDecl::Named(name)) = &decl.shell {
+            take(name);
+        }
+    }
+    if let Some(title) = &file.title
+        && let Some(text) = &title.text
+    {
+        take(text);
+    }
+    for name in file.variables.declared_list().split(", ") {
+        if let Some(variable) = file.variables.get(name) {
+            for referent in variable.refs() {
+                used.insert(referent.to_string());
+            }
+        }
+    }
+    used
+}
+
+/// The whole stdout report, as a pure function so its shape is
+/// unit-testable without a process per assertion. Plain text — no
+/// boxes, no frames; `check` never touches the terminal.
+fn render_report(
+    file: &DashboardFile,
+    partial: &crate::core::variables::Partial,
+    overrides: &Bindings,
+    rows: &[SkipRow],
+    path: &std::path::Path,
+) -> String {
+    use std::fmt::Write;
+
+    use crate::core::variables::{Resolved, VarSource};
+    let mut out = String::new();
+    let panes = file.panes.len();
+    let variables = partial.len();
+    let pane_word = if panes == 1 { "pane" } else { "panes" };
+    let variable_word = if variables == 1 {
+        "variable"
+    } else {
+        "variables"
+    };
+    let _ = writeln!(
+        out,
+        "{}: {panes} {pane_word}, {variables} {variable_word} — ok",
+        path.display()
+    );
+    if variables == 0 {
+        return out;
+    }
+    let _ = writeln!(out, "\nvariables");
+    // The partial map holds every declared name (deferred ones
+    // included, as Opaque), and a BTreeMap iterates sorted — the same
+    // scannable order the declared-set breadcrumb uses.
+    let names: Vec<&str> = partial.keys().map(String::as_str).collect();
+    let width = names.iter().map(|name| name.len()).max().unwrap_or(0);
+    for name in &names {
+        let variable = file.variables.get(name).expect("declared");
+        // The EFFECTIVE tier, not the declared form: a constant that
+        // references a once-at-load command IS once-at-load, and the
+        // promotion is the thing the reader most needs to see. A
+        // `-v`-overridden DEFERRED name still shows `deferred`: the
+        // tier is what the site rule reads, and an override never
+        // changes it.
+        let tier = match &variable.source {
+            VarSource::SpawnCommand(_) => "deferred",
+            VarSource::LoadCommand(_) => "once at load",
+            VarSource::Constant => match partial.get(*name) {
+                Some(Resolved::Opaque) if !overrides.contains_key(*name) => "once at load",
+                _ => "constant",
+            },
+        };
+        let status = match partial.get(*name) {
+            Some(Resolved::Known(_)) => "checked",
+            _ => "opaque — derived by a command",
+        };
+        let flag = if overrides.contains_key(*name) {
+            "  (-v)"
+        } else {
+            ""
+        };
+        let _ = writeln!(out, "  {name:width$}  {tier:13} {status}{flag}");
+    }
+    let used = referenced_names(file);
+    let unused: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| !used.contains(*name))
+        .collect();
+    if !unused.is_empty() || !rows.is_empty() {
+        let _ = writeln!(out, "\nnotices");
+        for name in unused {
+            let _ = writeln!(out, "  {name} is declared and never referenced");
+        }
+        if !rows.is_empty() {
+            // One row per DECLARATION: a defaults value inherited by N
+            // panes is one row, because there is one edit.
+            let mut seen: Vec<String> = Vec::new();
+            let mut lines: Vec<String> = Vec::new();
+            for row in rows {
+                let origin = row.site.origin.to_string();
+                let cause = if row.site.blockers == row.roots {
+                    format!("{} is derived by a command", row.roots.join(", "))
+                } else {
+                    format!(
+                        "{} → {}, derived by a command",
+                        row.site.blockers.join(", "),
+                        row.roots.join(", ")
+                    )
+                };
+                let line = format!("    {origin} {key} — {cause}", key = row.site.key);
+                if !seen.contains(&line) {
+                    seen.push(line.clone());
+                    lines.push(line);
+                }
+            }
+            let _ = writeln!(
+                out,
+                "  {} load-time site{} were not checked, because their values derive at run time:",
+                lines.len(),
+                if lines.len() == 1 { "" } else { "s" },
+            );
+            for line in lines {
+                let _ = writeln!(out, "{line}");
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn parse_overrides(args: &[String]) -> anyhow::Result<Bindings> {
     let mut out = Bindings::new();
     for arg in args {
@@ -512,6 +750,68 @@ mod tests {
         // The retargeting sentence is a behavior change to keys the
         // shared reference already documents, so it must be stated here.
         assert!(text.contains("scroll keys"), "the retarget is unstated");
+    }
+
+    #[test]
+    fn the_report_shape_is_pinned() {
+        use crate::core::variables::resolve_partial;
+        let file = crate::core::dashboard_kdl::parse_styled(
+            "variables {\n    plan \"/tmp/x\"\n    store \"git rev-parse\" shell=#true\n    sel \"{{store}}/s\"\n}\n\npane \"events\" {\n    height 3\n    command \"true\"\n    trigger \"file:{{sel}}\"\n    title \"{{plan}}\"\n}\n",
+            false,
+        )
+        .expect("parses");
+        let overrides = Bindings::new();
+        let partial = resolve_partial(&file.variables, &overrides);
+        let audit = file.audit_sites(&partial).expect("audits");
+        let rows: Vec<SkipRow> = audit
+            .unchecked
+            .iter()
+            .map(|site| SkipRow {
+                roots: site
+                    .blockers
+                    .iter()
+                    .flat_map(|blocker| {
+                        crate::core::variables::opaque_roots(&file.variables, &partial, blocker)
+                    })
+                    .collect(),
+                site: UncheckedSite {
+                    origin: site.origin.clone(),
+                    key: site.key,
+                    blockers: site.blockers.clone(),
+                },
+            })
+            .collect();
+        let report = render_report(
+            &file,
+            &partial,
+            &overrides,
+            &rows,
+            std::path::Path::new("board.kdl"),
+        );
+        // The verdict line first, so `head -1` is a summary.
+        assert!(
+            report.starts_with("board.kdl: 1 pane, 3 variables — ok\n"),
+            "{report}"
+        );
+        // The effective tier, not the declared form: `sel` is a
+        // constant promoted by its reference to a command.
+        assert!(report.contains("sel"), "{report}");
+        let sel_line = report
+            .lines()
+            .find(|line| line.trim_start().starts_with("sel"))
+            .expect("sel row");
+        assert!(
+            sel_line.contains("once at load"),
+            "the promotion shows: {sel_line}"
+        );
+        assert!(sel_line.contains("opaque"), "{sel_line}");
+        // The skip row shows the chain: the direct reference is a
+        // tainted constant, the root is the command.
+        assert!(
+            report.contains("sel → store, derived by a command"),
+            "{report}"
+        );
+        assert!(report.contains("pane \"events\" trigger"), "{report}");
     }
 
     #[test]

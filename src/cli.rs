@@ -503,9 +503,13 @@ pub struct WatchArgs {
 }
 
 #[derive(clap::Args)]
+#[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
 pub struct DashboardArgs {
+    #[command(subcommand)]
+    pub action: Option<DashboardAction>,
     /// Dashboard declaration file (KDL)
-    pub file: std::path::PathBuf,
+    #[arg(required = true)]
+    pub file: Option<std::path::PathBuf>,
     /// Run every pane once and exit
     #[arg(long)]
     pub once: bool,
@@ -544,6 +548,21 @@ pub struct DashboardArgs {
     /// Set a variable the board declares: `-v name=value`, repeatable.
     /// Wins for that exact name, and a command variable so overridden
     /// never runs.
+    #[arg(short = 'v', long = "variable", value_name = "NAME=VALUE")]
+    pub variable: Vec<String>,
+}
+
+#[derive(clap::Subcommand)]
+pub enum DashboardAction {
+    /// Validate a declaration file without running anything in it
+    Check(CheckArgs),
+}
+
+#[derive(clap::Args)]
+pub struct CheckArgs {
+    /// Dashboard declaration file (KDL)
+    pub file: std::path::PathBuf,
+    /// Set a variable, as on a run: -v name=value (repeatable)
     #[arg(short = 'v', long = "variable", value_name = "NAME=VALUE")]
     pub variable: Vec<String>,
 }

@@ -234,10 +234,6 @@ pub fn resolve_variables(
 /// Named `Resolved` rather than `Value` deliberately: the KDL walk is
 /// full of `kdl::KdlValue`, and a bare `Value` beside it reads as the
 /// KDL one.
-// The partial-evaluator family below is the no-execution seam the
-// `check` command consumes; until that command lands only tests reach
-// it. Remove these allows with its first production caller.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Resolved {
     /// Final text: a constant, a `-v` override, or a chain of them.
@@ -248,7 +244,6 @@ pub enum Resolved {
     Opaque,
 }
 
-#[allow(dead_code)]
 pub type Partial = std::collections::BTreeMap<String, Resolved>;
 
 /// Resolve as far as is possible WITHOUT running anything — the
@@ -280,7 +275,6 @@ pub type Partial = std::collections::BTreeMap<String, Resolved>;
 /// answer from missing. (A variable with a templated `shell` is a
 /// command variable by definition, so an opaque DIALECT name never
 /// needs a rule of its own.)
-#[allow(dead_code)]
 pub fn resolve_partial(block: &VariableBlock, overrides: &Bindings) -> Partial {
     let mut out = Partial::new();
     for var in block.in_order() {
@@ -300,7 +294,6 @@ pub fn resolve_partial(block: &VariableBlock, overrides: &Bindings) -> Partial {
 }
 
 /// What a site's expansion is worth under a partial map.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Expanded {
     /// Every reference was `Known`: these are the exact bytes the
@@ -322,7 +315,6 @@ impl Template {
     /// So a checker can hand a raw `#"file:{{x}}"#` trigger to the
     /// real trigger parser and catch a malformed one, which is the
     /// whole point of the partial mode.
-    #[allow(dead_code)]
     pub fn expand_partial(&self, partial: &Partial) -> Expanded {
         // A template with no references is final bytes, full stop —
         // and this arm must come FIRST, before anything touches
@@ -397,7 +389,6 @@ pub fn check_overrides(block: &VariableBlock, overrides: &Bindings) -> anyhow::R
 /// is derived by a command"* points at a line the reader can see is a
 /// constant. This returns `store`, which is the line they can act on.
 /// Empty for a `Known` name.
-#[allow(dead_code)]
 pub fn opaque_roots(block: &VariableBlock, partial: &Partial, name: &str) -> Vec<String> {
     let mut roots: Vec<String> = Vec::new();
     let mut seen: Vec<&str> = Vec::new();

@@ -2089,3 +2089,475 @@ fn an_inherited_shell_is_compared_after_expansion() {
             .success();
     }
 }
+
+// ─── rat dashboard check ────────────────────────────────────────────
+
+/// A board whose command variable would append to `counter` if it ever
+/// ran — the only honest way to prove a negative about a subprocess.
+fn counting_board(counter: &std::path::Path, bin: &str) -> String {
+    #[cfg(unix)]
+    let counting = format!("printf x >> {}", counter.display());
+    #[cfg(windows)]
+    let counting = format!("echo x>> \"{}\"", counter.display());
+    format!(
+        "variables {{\n    store \"{counting}\" shell=#true\n}}\n\npane \"p\" {{\n    height 3\n    command \"{bin}\" \"style\" \"{{{{store}}}}\"\n}}\n",
+        counting = counting.replace('\\', "\\\\").replace('"', "\\\""),
+        bin = bin.replace('\\', "\\\\"),
+    )
+}
+
+#[test]
+fn a_valid_board_checks_clean() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    plan \"/tmp/x\"\n}}\n\npane \"p\" {{\n    height 3\n    command \"{bin}\" \"style\" \"{{{{plan}}}}\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .args(["dashboard", "check", &file])
+        .assert()
+        .success()
+        .stderr(predicates::str::is_empty());
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    // The presence anchor for the empty stderr: a clean board produced
+    // a report, not nothing.
+    assert!(stdout.contains("1 pane"), "{stdout}");
+    assert!(stdout.contains("ok"), "{stdout}");
+}
+
+#[test]
+fn check_never_runs_a_command_variable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("runs");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &counting_board(&counter, &rat_bin()),
+    );
+    let assert = rat().args(["dashboard", "check", &file]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    // The presence anchor: the variable was SEEN, at its opaque tier —
+    // exit 0 alone would also hold if check never read the block.
+    assert!(stdout.contains("store"), "{stdout}");
+    assert!(stdout.contains("opaque"), "{stdout}");
+    assert!(!counter.exists(), "check ran the variable's command");
+}
+
+#[test]
+fn check_never_runs_a_pane_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("runs");
+    #[cfg(unix)]
+    let counting = format!("printf x >> {}", counter.display());
+    #[cfg(windows)]
+    let counting = format!("echo x>> \"{}\"", counter.display());
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "pane \"p\" {{\n    height 3\n    shell #true\n    command \"{counting}\"\n}}\n",
+            counting = counting.replace('\\', "\\\\").replace('"', "\\\""),
+        ),
+    );
+    let assert = rat().args(["dashboard", "check", &file]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    // The presence anchor: the pane was seen and deliberately not run.
+    assert!(stdout.contains("1 pane"), "{stdout}");
+    assert!(!counter.exists(), "check ran the pane's command");
+}
+
+#[test]
+fn check_refuses_an_unknown_variable_with_its_place() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    plan \"/tmp/x\"\n}\n\npane \"p\" {\n    height 3\n    command \"true\"\n    title \"{{plna}}\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown variable `plna`"))
+        .stderr(predicates::str::contains("line "))
+        .stderr(predicates::str::contains("column "));
+}
+
+#[test]
+fn check_reports_a_variable_cycle_as_a_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    a \"{{b}}\"\n    b \"{{a}}\"\n}\n\npane \"p\" {\n    height 3\n    command \"true\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("variable cycle: `a` → `b` → `a`"));
+}
+
+#[test]
+fn check_refuses_a_deferred_reference_at_a_load_time_site_by_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    iv \"cd .\" shell=#true defer=#true\n}\n\npane \"p\" {\n    height 3\n    command \"true\"\n    interval \"{{iv}}\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("`iv`"))
+        .stderr(predicates::str::contains("`interval`"));
+}
+
+#[test]
+fn check_prints_exactly_what_a_run_would_print() {
+    // The drift guard: the same failing board through both surfaces,
+    // byte-identical stderr and the same exit code. The fixture's
+    // failure must not depend on execution.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "pane \"p\" {\n    height 3\n    command \"true\"\n    title \"{{nope}}\"\n}\n",
+    );
+    let run = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .failure();
+    let check = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure();
+    assert_eq!(
+        run.get_output().stderr,
+        check.get_output().stderr,
+        "the two surfaces drifted"
+    );
+    assert_eq!(
+        run.get_output().status.code(),
+        check.get_output().status.code()
+    );
+}
+
+#[test]
+fn a_malformed_constant_at_a_load_time_site_is_refused() {
+    // F10 route 1, and the regression test for overrides-only
+    // resolution: a constant needs no command to be known, and "bad"
+    // is not a duration on any machine, ever.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    iv \"bad\"\n}\n\npane \"p\" {\n    height 3\n    command \"true\"\n    interval \"{{iv}}\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invalid duration"));
+}
+
+#[test]
+fn a_command_derived_load_time_site_is_reported_as_skipped() {
+    // F10 route 2: genuinely unknowable without running git, and
+    // saying so is honest — exit 0, with the site AND the cause named.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    store \"git rev-parse\" shell=#true\n}}\n\npane \"events\" {{\n    height 3\n    command \"{bin}\" \"style\" \"x\"\n    trigger \"file:{{{{store}}}}/events\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat().args(["dashboard", "check", &file]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("trigger"), "{stdout}");
+    assert!(stdout.contains("store"), "{stdout}");
+    assert!(stdout.contains("not checked"), "{stdout}");
+}
+
+#[test]
+fn a_constant_chain_is_checked_through_to_the_token() {
+    // Known composes through chains rather than stopping at direct
+    // constants: "5x" is not a duration.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    a \"5\"\n    b \"{{a}}x\"\n}\n\npane \"p\" {\n    height 3\n    command \"true\"\n    interval \"{{b}}\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invalid duration"));
+}
+
+#[test]
+fn an_override_makes_a_once_at_load_variable_checkable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let board = format!(
+        "variables {{\n    store \"git rev-parse\" shell=#true\n}}\n\npane \"events\" {{\n    height 3\n    command \"{bin}\" \"style\" \"x\"\n    trigger \"file:{{{{store}}}}/events\"\n}}\n",
+        bin = rat_bin().replace('\\', "\\\\"),
+    );
+    let file = fixture(dir.path(), "board.kdl", &board);
+    let assert = rat()
+        .args(["dashboard", "check", &file, "-v", "store=/tmp/x"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        !stdout.contains("not checked"),
+        "the override made it checkable: {stdout}"
+    );
+    assert!(stdout.contains("(-v)"), "the override is marked: {stdout}");
+    // And a malformed override REFUSES — check legitimately checks
+    // more with -v, never less.
+    let sited = fixture(
+        dir.path(),
+        "sited.kdl",
+        "variables {\n    iv \"cd .\" shell=#true\n}\n\npane \"p\" {\n    height 3\n    command \"true\"\n    interval \"{{iv}}\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &sited, "-v", "iv=nonsense"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invalid duration"));
+}
+
+#[test]
+fn an_override_does_not_rescue_a_deferred_variable_from_the_site_rule() {
+    // The pair with the test above, differing in one word: defer.
+    // -v makes the value Known but leaves the tier Spawn, and legality
+    // is decided before expansion.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    store \"git rev-parse\" shell=#true defer=#true\n}}\n\npane \"events\" {{\n    height 3\n    command \"{bin}\" \"style\" \"x\"\n    trigger \"file:{{{{store}}}}/events\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file, "-v", "store=/tmp/x"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("`store`"))
+        .stderr(predicates::str::contains("`trigger`"));
+}
+
+#[test]
+fn a_raw_string_at_a_load_time_site_is_still_checked() {
+    // A raw string's refs are empty by construction, so its bytes are
+    // final — Expanded::Known — and a malformed one is CAUGHT. The one
+    // place check is stronger than a reader expects.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "pane \"p\" {\n    height 3\n    command \"true\"\n    trigger #\"not-a-scheme\"#\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("fifo:PATH, file:PATH, or fd:N"));
+}
+
+#[test]
+fn a_skipped_site_names_the_command_not_the_constant() {
+    // `sel` is on screen and is plainly a constant; `store` is the
+    // command actually responsible. The chain answers the question the
+    // reader is about to ask.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    store \"git rev-parse\" shell=#true\n    sel \"{{{{store}}}}/x\"\n}}\n\npane \"events\" {{\n    height 3\n    command \"{bin}\" \"style\" \"x\"\n    trigger \"file:{{{{sel}}}}\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat().args(["dashboard", "check", &file]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("store"), "names the command: {stdout}");
+    assert!(
+        stdout.contains("sel → store") || stdout.contains("sel \u{2192} store"),
+        "shows the chain when the direct reference is a tainted constant: {stdout}"
+    );
+}
+
+#[test]
+fn every_load_time_site_is_reported() {
+    // The consumer-side detector for check walking fewer sites than
+    // load: an opaque variable at ALL TEN load-time string sites — the
+    // nine derived from the pane schema plus the dashboard-level
+    // title — must produce ten skipped rows. A site check never visits
+    // is simply missing from the report, and no other test notices.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    store \"git rev-parse\" shell=#true\n}\ntitle \"{{store}}\"\n\npane \"p\" {\n    height 7\n    command \"true\"\n    shell \"{{store}}\"\n    interval \"{{store}}\"\n    trigger-debounce \"{{store}}\"\n    trigger \"file:{{store}}\"\n    width \"{{store}}\"\n    overflow \"{{store}}\"\n    border \"{{store}}\"\n    padding \"{{store}}\"\n    title \"{{store}}\"\n}\n",
+    );
+    let assert = rat().args(["dashboard", "check", &file]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    for key in [
+        "shell",
+        "interval",
+        "trigger-debounce",
+        "trigger",
+        "width",
+        "overflow",
+        "border",
+        "padding",
+    ] {
+        assert!(stdout.contains(key), "{key} is reported: {stdout}");
+    }
+    assert!(
+        stdout.contains("10 load-time sites were not checked"),
+        "all ten sites, counted: {stdout}"
+    );
+    // The two titles are DIFFERENT sites sharing a spelling; the rows
+    // must distinguish them.
+    assert!(stdout.contains("pane \"p\" title"), "{stdout}");
+    assert!(stdout.contains("the dashboard title"), "{stdout}");
+}
+
+#[test]
+fn an_integer_key_holding_a_template_is_a_shape_error() {
+    // height is outside the substitution surface by construction:
+    // integers never pass the string chokepoint, so this is the
+    // ordinary shape error, never a skipped site.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    h \"7\"\n}\n\npane \"p\" {\n    height \"{{h}}\"\n    command \"true\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("one integer"));
+}
+
+#[test]
+fn an_unused_variable_is_a_notice_not_a_refusal() {
+    // A shipped template may declare a variable a consuming board is
+    // expected to reference; refusing would make init's own output
+    // fail check.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    spare \"x\"\n}\n\npane \"p\" {\n    height 3\n    command \"true\"\n}\n",
+    );
+    let assert = rat().args(["dashboard", "check", &file]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("spare") && stdout.contains("never referenced"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_variable_supplied_on_the_command_line_checks_clean() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("runs");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &counting_board(&counter, &rat_bin()),
+    );
+    let assert = rat()
+        .args(["dashboard", "check", &file, "-v", "store=/given"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    // The presence anchor: the override was APPLIED, not merely the
+    // file never parsed.
+    assert!(stdout.contains("(-v)"), "{stdout}");
+    assert!(!counter.exists(), "the suppressed command ran");
+}
+
+#[test]
+fn check_writes_no_escapes_under_no_color() {
+    use predicates::prelude::*;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "pane \"p\" {\n    height 3\n    command \"true\"\n    title \"{{nope}}\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure()
+        // The anchor: stderr is non-empty and carries the teaching
+        // error — escape-free is trivially true of nothing.
+        .stderr(predicates::str::contains("unknown variable `nope`"))
+        .stderr(predicates::str::contains("\u{1b}").not());
+}
+
+#[test]
+fn check_names_an_unreadable_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing.kdl");
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &missing.display().to_string()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("missing.kdl"));
+}
+
+#[test]
+fn a_bare_dashboard_still_demands_a_file() {
+    // What subcommand_negates_reqs buys, and the reason the flag is
+    // there: exit 2, a usage error, unchanged.
+    rat().args(["dashboard"]).assert().code(2);
+}
+
+#[test]
+fn a_board_named_check_is_reachable_by_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "check",
+        &format!(
+            "pane \"p\" {{\n    height 2\n    chrome #false\n    border \"none\"\n    command \"{bin}\" \"style\" \"board-named-check\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("board-named-check"), "{stdout}");
+}
