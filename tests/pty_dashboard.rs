@@ -6351,3 +6351,144 @@ fn two_overlapping_actions_keep_the_row_truthful() {
         "dashboard should have exited on q"
     );
 }
+
+/// The handoff shape: one key writes a file, three panes read it and are
+/// woken only by it. This is what a board that acts looks like — and it
+/// is also, from the outside, what a pane fed only by other panes looks
+/// like, which is why the badge has to be asked about explicitly. The
+/// panes only READ the path; a pane that touched its own trigger would
+/// be `cycle_board` by accident.
+fn handoff_board(sel: &std::path::Path) -> String {
+    let sel = sel.display();
+    debug_assert!(!format!("{sel}").contains('"'));
+    format!(
+        "row-gap 0\n\n\
+         defaults {{\n    height 3\n    border \"none\"\n    shell #true\n    interval \"never\"\n}}\n\n\
+         key \"x\" {{\n    description \"pick the item\"\n    \
+         command \"echo pick >> {sel}\"\n}}\n\n\
+         pane \"one\"   {{\n    trigger \"file:{sel}\"\n    \
+         command \"printf 'one-%s' $(wc -l < {sel})\"\n}}\n\n\
+         pane \"two\"   {{\n    trigger \"file:{sel}\"\n    \
+         command \"printf 'two-%s' $(wc -l < {sel})\"\n}}\n\n\
+         pane \"three\" {{\n    trigger \"file:{sel}\"\n    \
+         command \"printf 'three-%s' $(wc -l < {sel})\"\n}}\n"
+    )
+}
+
+/// True when some trace line shows `source`'s watched write attributed
+/// to the outside world: at least one exogenous observation (`exo>=1`)
+/// and condition 2's veto cleared (`closed=0`). Read over the whole
+/// trace, not only its last line — the exogenous count is windowed at
+/// 30 s and never falls inside it, so once recorded it persists.
+fn attributed_exogenous(trace: &str, source: usize) -> bool {
+    let tag = format!("| s{source} ");
+    trace.lines().any(|line| {
+        let Some(at) = line.find(&tag) else {
+            return false;
+        };
+        let seg = &line[at + 2..];
+        let seg = &seg[..seg.find(" | ").unwrap_or(seg.len())];
+        let field = |name: &str| {
+            seg.split_whitespace()
+                .find_map(|w| w.strip_prefix(name))
+                .and_then(|v| v.parse::<u32>().ok())
+        };
+        field("exo=").is_some_and(|n| n >= 1) && field("closed=") == Some(0)
+    })
+}
+
+/// This shape cannot be flagged today, and the test exists so that an
+/// action which starts looking like a pane tick fails HERE instead of
+/// on a user's board. Three independent barriers keep the verdict
+/// empty: the threshold (50 trigger respawns in 30 s — one press is
+/// one per pane), the exogenous veto (a write landing with no child in
+/// flight clears every watcher), and the acyclic graph (the panes
+/// write nothing). The threshold alone would keep the badge away even
+/// under the regression this guards — an action acquiring a bracket in
+/// the spawn log, which would suppress the exogenous classification
+/// and credit the write to whichever pane was in flight — so the
+/// attribution facts (`exo>=1`, `closed=0`) are asserted directly from
+/// the trace rather than inferred from the badge's absence.
+#[test]
+fn a_handoff_file_never_earns_the_looping_badge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sel = dir.path().join("sel");
+    // Seeded before the baselines are taken: a path that APPEARS is
+    // itself a change, and this test is about the key press. The empty
+    // seed makes the first paint `one-0`, so `one-1` is unambiguous.
+    std::fs::write(&sel, b"").expect("seed the handoff file");
+    let decl = write_dashboard(dir.path(), &handoff_board(&sel));
+    let trace = dir.path().join("trigger-trace.log");
+    let trace_arg = trace.display().to_string();
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_TRIGGER_TRACE", trace_arg.as_str())],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"one-0", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    // One press at live rest. The counter makes the post-press values
+    // exactly predictable, and ONE ordered capture sees all three — a
+    // consumed paint is never repainted.
+    session.write_bytes(b"x");
+    let mut seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"one-1", b"two-1", b"three-1"],
+        Duration::from_secs(5),
+    );
+    // The non-rest arm: the same press with a pane focused, which also
+    // proves the action fires under focus — nothing else covers that.
+    session.write_bytes(b"\t");
+    session.write_bytes(b"x");
+    seen.extend(wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"one-2", b"two-2", b"three-2"],
+        Duration::from_secs(5),
+    ));
+    // Settle while DRAINING — a file-only wait would let the pty fill
+    // and block the loop's writer.
+    seen.extend(drain_for(&session, Duration::from_millis(700)));
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+    let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+    // The two absence claims. Their presence anchors: the panes turned
+    // over twice (above), the status row painted, and the trace shows
+    // the detector ANSWERING (below) — silence would prove nothing.
+    assert!(
+        !contains(&seen, "· looping".as_bytes()),
+        "the handoff shape earned a badge: {:?}\n--- trigger trace ---\n{trace_text}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !contains(&seen, b"trigger loop suspected"),
+        "the handoff shape earned a loop report: {:?}\n--- trigger trace ---\n{trace_text}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        contains(&seen, b"? help"),
+        "no status row in the capture — did the board load at all?"
+    );
+    // An abstention produces no badge either, and proves nothing.
+    assert!(
+        trace_text
+            .lines()
+            .any(|l| l.contains("-> panes=[] abstain=0")),
+        "the detector never answered with an empty verdict:\n{trace_text}"
+    );
+    // The attribution facts, per watching pane. True today and false
+    // the moment an action acquires a bracket, at any respawn rate —
+    // which the badge's absence alone could never distinguish.
+    for source in 0..3 {
+        assert!(
+            attributed_exogenous(&trace_text, source),
+            "s{source}'s write was never classified exogenous — an open \
+             action bracket would look exactly like this:\n{trace_text}"
+        );
+    }
+}
