@@ -868,9 +868,13 @@ mod tests {
         {
             format!("printf x >> {c}; cat {c}", c = counter.display())
         }
+        // The parens are load-bearing: cmd strips the redirection but
+        // keeps the space that preceded `&`, so a bare `echo x>> f`
+        // appends "x " and the value under test grows a trailing
+        // space — one the trim rule deliberately keeps.
         #[cfg(windows)]
         {
-            format!("echo x>> \"{c}\" & type \"{c}\"", c = counter.display())
+            format!("(echo x)>> \"{c}\" & type \"{c}\"", c = counter.display())
         }
     }
 

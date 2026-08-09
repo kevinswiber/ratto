@@ -10621,8 +10621,12 @@ mod tests {
         fn deferred_counter(name: &str, counter: &std::path::Path) -> SpawnVariables {
             #[cfg(unix)]
             let command = format!("printf x >> {c}; cat {c}", c = counter.display());
+            // The parens are load-bearing: cmd strips the redirection but
+            // keeps the space that preceded `&`, so a bare `echo x>> f`
+            // appends "x " and the value under test grows a trailing
+            // space — one the trim rule deliberately keeps.
             #[cfg(windows)]
-            let command = format!("echo x>> \"{c}\" & type \"{c}\"", c = counter.display());
+            let command = format!("(echo x)>> \"{c}\" & type \"{c}\"", c = counter.display());
             let block = VariableBlock::new(
                 vec![Variable {
                     name: name.to_string(),
