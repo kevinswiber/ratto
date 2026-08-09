@@ -4622,3 +4622,32 @@ fn no_looping_badge_when_a_deferred_variable_reads_a_watched_file() {
     );
     session.kill_if_alive(Duration::from_secs(2));
 }
+
+/// The live leg of route parity — the same fixture and the same
+/// expected needles as tests/cli_dashboard.rs's
+/// `the_three_routes_expand_identically`; keep the two in step.
+#[test]
+fn the_live_route_expands_like_the_piped_ones() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "variables {{\n    v \"echo parity-value\" shell=#true\n    t \"Title-X\"\n}}\n\npane \"p\" {{\n    height 5\n    border \"rounded\"\n    title \"{{{{t}}}}\"\n    command \"{bin}\" \"style\" \"{{{{v}}}}\"\n}}\n",
+            bin = rat_bin(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // ONE ordered capture: both needles land in the same frame, and a
+    // consumed paint is never repainted — the title row renders above
+    // the body, so the order encodes the whole assertion. Panics with
+    // the unmatched needle on timeout.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"Title-X", b"parity-value"],
+        Duration::from_secs(5),
+    );
+    session.kill_if_alive(Duration::from_secs(2));
+}

@@ -1728,3 +1728,364 @@ fn an_override_supplies_a_deferred_value_without_changing_its_tier() {
             "is read when the dashboard loads",
         ));
 }
+
+// ─── Load-time site expansion ───────────────────────────────────────
+
+#[test]
+fn a_trigger_expands_at_load() {
+    // The headline route: a watcher registered on the LITERAL
+    // `{{dir}}/shared` never moves, so only expansion at load can make
+    // the second read succeed.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shared = dir.path().join("shared");
+    std::fs::write(&shared, "v0").expect("seed");
+    let decl = dir.path().join("dash.kdl");
+    std::fs::write(
+        &decl,
+        format!(
+            "variables {{\n    dir \"{d}\"\n}}\n\ndefaults {{\n    height 1\n    border \"none\"\n    chrome #false\n    interval \"never\"\n    trigger-debounce \"0ms\"\n}}\n\npane \"beta\" {{\n    command \"{rat}\" \"__cat\" \"{shared}\"\n    trigger \"file:{{{{dir}}}}/shared\"\n}}\n",
+            d = dir.path().display().to_string().escape_default(),
+            rat = rat_bin().escape_default(),
+            shared = shared.display().to_string().escape_default(),
+        ),
+    )
+    .expect("write declaration");
+    let dash = std::process::Command::new(rat_bin())
+        .args(["dashboard", &decl.display().to_string()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat dashboard piped");
+    let mut dash = KillOnDrop(dash);
+    let stream = stdout_stream(dash.0.stdout.take().expect("piped stdout"));
+    let mut seen = String::new();
+    read_until(&stream, &mut seen, "v0");
+    std::fs::write(&shared, "v1").expect("mtime change");
+    read_until(&stream, &mut seen, "v1");
+}
+
+#[test]
+fn an_interval_expands_at_load() {
+    // Pre-fix this board is REFUSED: parse_interval("{{iv}}") fails.
+    // Post-fix it loads and the pane re-runs at the expanded cadence.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let watched = dir.path().join("watched");
+    std::fs::write(&watched, "v0").expect("seed");
+    let decl = dir.path().join("dash.kdl");
+    std::fs::write(
+        &decl,
+        format!(
+            "variables {{\n    iv \"50ms\"\n}}\n\npane \"p\" {{\n    height 1\n    border \"none\"\n    chrome #false\n    interval \"{{{{iv}}}}\"\n    command \"{rat}\" \"__cat\" \"{watched}\"\n}}\n",
+            rat = rat_bin().escape_default(),
+            watched = watched.display().to_string().escape_default(),
+        ),
+    )
+    .expect("write declaration");
+    let dash = std::process::Command::new(rat_bin())
+        .args(["dashboard", &decl.display().to_string()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat dashboard piped");
+    let mut dash = KillOnDrop(dash);
+    let stream = stdout_stream(dash.0.stdout.take().expect("piped stdout"));
+    let mut seen = String::new();
+    read_until(&stream, &mut seen, "v0");
+    std::fs::write(&watched, "v1").expect("rewrite");
+    // Only an interval-driven re-run can pick this up: no trigger is
+    // declared.
+    read_until(&stream, &mut seen, "v1");
+}
+
+#[test]
+fn a_trigger_debounce_expands_at_load() {
+    // The second parse_interval call site is a separate line, and this
+    // schema's history is that a rule holds on one spelling and not
+    // the other.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shared = dir.path().join("shared");
+    std::fs::write(&shared, "v0").expect("seed");
+    let decl = dir.path().join("dash.kdl");
+    std::fs::write(
+        &decl,
+        format!(
+            "variables {{\n    db \"0ms\"\n}}\n\npane \"p\" {{\n    height 1\n    border \"none\"\n    chrome #false\n    interval \"never\"\n    trigger-debounce \"{{{{db}}}}\"\n    command \"{rat}\" \"__cat\" \"{shared}\"\n    trigger \"file:{shared}\"\n}}\n",
+            rat = rat_bin().escape_default(),
+            shared = shared.display().to_string().escape_default(),
+        ),
+    )
+    .expect("write declaration");
+    let dash = std::process::Command::new(rat_bin())
+        .args(["dashboard", &decl.display().to_string()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat dashboard piped");
+    let mut dash = KillOnDrop(dash);
+    let stream = stdout_stream(dash.0.stdout.take().expect("piped stdout"));
+    let mut seen = String::new();
+    read_until(&stream, &mut seen, "v0");
+    std::fs::write(&shared, "v1").expect("mtime change");
+    read_until(&stream, &mut seen, "v1");
+}
+
+#[test]
+fn geometry_expands_at_load() {
+    // width, border, and padding all parse EXPANDED text; pre-fix the
+    // board refuses at parse_width / parse_border / parse_sides.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    w \"24\"\n    b \"rounded\"\n    p \"0 2\"\n}}\n\npane \"p\" {{\n    height 3\n    chrome #false\n    width \"{{{{w}}}}\"\n    border \"{{{{b}}}}\"\n    padding \"{{{{p}}}}\"\n    command \"{bin}\" \"style\" \"boxed\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let top = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with('╭'))
+        .unwrap_or_else(|| panic!("no rounded border rendered: {stdout}"));
+    assert_eq!(
+        top.trim_end().chars().count(),
+        24,
+        "the box is the expanded width: {stdout}"
+    );
+}
+
+#[test]
+fn a_pane_title_and_the_dashboard_title_expand_at_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    t \"Pane-Label\"\n}}\ntitle \"board {{{{t}}}}\"\n\npane \"p\" {{\n    height 5\n    border \"rounded\"\n    title \"{{{{t}}}}\"\n    command \"{bin}\" \"style\" \"body\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("Pane-Label"), "{stdout}");
+    assert!(!stdout.contains("{{t}}"), "{stdout}");
+
+    // A `ref` fragment is an ID, never substituted: the unknown-ref
+    // error names the WRITTEN fragment even when a variable shares its
+    // name.
+    let sited = fixture(
+        dir.path(),
+        "ref.kdl",
+        &format!(
+            "variables {{\n    nope \"p\"\n}}\ntitle ref=\"#nope\"\n\npane \"p\" {{\n    height 3\n    command \"{bin}\" \"style\" \"x\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &sited, "--once"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("#nope"));
+}
+
+/// Classification agreement over template text: green since spawn-time
+/// expansion landed — a regression pin, not a Red.
+#[cfg(unix)]
+#[test]
+fn a_shebang_body_with_later_templates_still_classifies_as_a_script() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    msg \"expanded-later\"\n}\n\npane \"p\" {\n    height 3\n    chrome #false\n    border \"none\"\n    script \"#!/bin/sh\\necho from-sh\\necho {{msg}}\"\n}\n",
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("from-sh"), "{stdout}");
+    assert!(stdout.contains("expanded-later"), "{stdout}");
+}
+
+/// The acceptance test for the plan's original motivation: a board
+/// whose trigger is derived from `git rev-parse --git-common-dir`
+/// resolves to the COMMON dir in a linked worktree, where `.git` is a
+/// file — so the board is a distributable artifact, not a per-machine
+/// hand edit. The pane's `command` half is already green (spawn-time
+/// expansion); the trigger is the load half under test, so pre-fix the
+/// FIRST read succeeds and the SECOND times out.
+#[cfg(unix)]
+#[test]
+fn the_q2_linked_worktree_board_resolves_its_trigger() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {:?}", out);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let primary = dir.path().join("primary");
+    std::fs::create_dir(&primary).expect("mkdir");
+    git(&["init", "-q"], &primary);
+    git(&["config", "user.name", "t"], &primary);
+    git(&["config", "user.email", "t@example.invalid"], &primary);
+    std::fs::write(primary.join("seed"), "s").expect("seed file");
+    git(&["add", "."], &primary);
+    git(&["commit", "-q", "-m", "seed"], &primary);
+    git(&["worktree", "add", "-q", "../linked"], &primary);
+    let linked = dir.path().join("linked");
+    assert!(
+        linked.join(".git").is_file(),
+        ".git is a FILE in a linked worktree — the whole point"
+    );
+    // The independently-derived truth, canonicalized (macOS /var →
+    // /private/var), proving the store resolves OUTSIDE linked/.
+    let common = std::path::PathBuf::from(git(&["rev-parse", "--git-common-dir"], &linked));
+    let common = std::fs::canonicalize(&common).expect("canonicalize");
+    assert!(
+        !common.starts_with(std::fs::canonicalize(&linked).expect("canonicalize")),
+        "the common dir lives outside the linked worktree: {common:?}"
+    );
+    let store = common.join("pointbreak");
+    std::fs::create_dir_all(&store).expect("store");
+    let events = store.join("events");
+    std::fs::write(&events, "seeded").expect("seed events");
+
+    let decl = linked.join("board.kdl");
+    std::fs::write(
+        &decl,
+        format!(
+            "variables {{\n    store \"git rev-parse --git-common-dir\" shell=#true\n    events \"{{{{store}}}}/pointbreak/events\"\n}}\n\npane \"header\" {{\n    height 1\n    border \"none\"\n    chrome #false\n    interval \"never\"\n    trigger-debounce \"0ms\"\n    command \"{rat}\" \"__cat\" \"{{{{events}}}}\"\n    trigger \"file:{{{{events}}}}\"\n}}\n",
+            rat = rat_bin().escape_default(),
+        ),
+    )
+    .expect("write declaration");
+    let dash = std::process::Command::new(rat_bin())
+        .args(["dashboard", "board.kdl"])
+        .current_dir(&linked)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat dashboard piped");
+    let mut dash = KillOnDrop(dash);
+    let stream = stdout_stream(dash.0.stdout.take().expect("piped stdout"));
+    let mut seen = String::new();
+    read_until(&stream, &mut seen, "seeded");
+    std::fs::write(&events, "review-landed").expect("the writer moves the store");
+    read_until(&stream, &mut seen, "review-landed");
+}
+
+#[test]
+fn the_three_routes_expand_identically() {
+    // Parity, portable legs: a once-at-load COMMAND variable in the
+    // pane's command (a spawn site) and a constant in its title (a
+    // load site), one board, two routes here and the live third in
+    // tests/pty_dashboard.rs (`the_live_route_expands_like_the_piped_
+    // ones` — the shared needles must not drift apart). The CONTENT
+    // assertion is what makes this a test: three routes agreeing on
+    // the wrong bytes would satisfy equality alone.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let board = format!(
+        "variables {{\n    v \"echo parity-value\" shell=#true\n    t \"Title-X\"\n}}\n\npane \"p\" {{\n    height 5\n    border \"rounded\"\n    title \"{{{{t}}}}\"\n    command \"{bin}\" \"style\" \"{{{{v}}}}\"\n}}\n",
+        bin = rat_bin().replace('\\', "\\\\"),
+    );
+    let file = fixture(dir.path(), "board.kdl", &board);
+    let once = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let once_out = String::from_utf8_lossy(&once.get_output().stdout).into_owned();
+    assert!(once_out.contains("parity-value"), "{once_out}");
+    assert!(once_out.contains("Title-X"), "{once_out}");
+
+    let dash = std::process::Command::new(rat_bin())
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat dashboard piped");
+    let mut dash = KillOnDrop(dash);
+    let stream = stdout_stream(dash.0.stdout.take().expect("piped stdout"));
+    let mut seen = String::new();
+    read_until(&stream, &mut seen, "parity-value");
+    read_until(&stream, &mut seen, "Title-X");
+    let row_of = |text: &str, needle: &str| -> String {
+        text.lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_default()
+            .trim_end()
+            .to_string()
+    };
+    assert_eq!(
+        row_of(&once_out, "parity-value"),
+        row_of(&seen, "parity-value"),
+        "the two piped routes agree byte for byte"
+    );
+    assert_eq!(row_of(&once_out, "Title-X"), row_of(&seen, "Title-X"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_shell_dialect_name_expands_at_load() {
+    // Only a SHELL turns `|` into a pipeline: a direct spawn of a
+    // program named `echo hi | tr i X` fails, and a dialect left as
+    // the literal `{{sh}}` names no program at all.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    sh \"sh\"\n}\n\npane \"p\" {\n    height 2\n    chrome #false\n    border \"none\"\n    shell \"{{sh}}\"\n    command \"echo hi | tr i X\"\n}\n",
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("hX"),
+        "the shell ran the pipeline: {stdout}"
+    );
+    assert!(!stdout.contains("os error"), "{stdout}");
+}
+
+#[test]
+fn an_inherited_shell_is_compared_after_expansion() {
+    // `defaults { shell "fish" }` beside a pane's `shell="{{sh}}"` with
+    // sh = "fish" is unequal AS WRITTEN and equal AS RUN. The
+    // inherit-guards' own justification is the dialect the inherited
+    // program was WRITTEN for, so resolved is the correct comparison —
+    // and both guards (command and script) must take the same edit.
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, program_line) in [
+        ("cmd.kdl", "command \"echo hi\""),
+        ("script.kdl", "script \"echo hi\""),
+    ] {
+        let file = fixture(
+            dir.path(),
+            name,
+            &format!(
+                "variables {{\n    sh \"fish\"\n}}\n\ndefaults {{\n    height 3\n    shell \"fish\"\n    {program_line}\n}}\n\npane \"p\" shell=\"{{{{sh}}}}\" {{\n}}\n"
+            ),
+        );
+        // A spawn of a missing `fish` is frame content, not an exit
+        // code; a LOAD refusal is. The success assertion is the test.
+        rat()
+            .env("NO_COLOR", "1")
+            .args(["dashboard", &file, "--once"])
+            .assert()
+            .success();
+    }
+}

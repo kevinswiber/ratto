@@ -26,9 +26,9 @@ use crate::core::registry::{
     LayoutNode, Overflow, PaneBox, PaneWidth, Registry, ShellDecl, ShellMode, SourceId,
     SourceProgram, SourceSpec, TitleSource, shebang,
 };
-use crate::core::template::{Template, reference_at};
+use crate::core::template::{Bindings, Template, reference_at};
 use crate::core::trigger::parse_trigger;
-use crate::core::variables::{Tier, VariableBlock};
+use crate::core::variables::{Expanded, Tier, VariableBlock};
 
 /// `rat watch --trigger-debounce`'s default, reused verbatim so a pane
 /// and a watch behave the same when neither says otherwise.
@@ -149,14 +149,7 @@ impl DashboardFile {
     /// The ONE validation path: resolve defaults, parse every token,
     /// check the layout, build the registry. Every error names the
     /// pane and the fix.
-    pub fn into_registry(
-        self,
-        bindings: &crate::core::template::Bindings,
-    ) -> anyhow::Result<Registry> {
-        // Not consumed yet: load-time site expansion is what reads the
-        // map, and it lands with the load-time-sites task. Taking the
-        // parameter NOW is what that task wrote itself against.
-        let _ = bindings;
+    pub fn into_registry(self, bindings: &Bindings) -> anyhow::Result<Registry> {
         if self.panes.is_empty() {
             bail!("no panes declared: a dashboard needs at least one pane");
         }
@@ -175,8 +168,20 @@ impl DashboardFile {
         let mut sources = Vec::with_capacity(self.panes.len());
         let mut boxes = Vec::with_capacity(self.panes.len());
         for (decl, name) in self.panes.iter().zip(&names) {
-            sources.push(resolve_source(decl, &self.defaults, &self.variables, name)?);
-            boxes.push(resolve_box(decl, &self.defaults, &self.variables, name)?);
+            sources.push(resolve_source(
+                decl,
+                &self.defaults,
+                &self.variables,
+                bindings,
+                name,
+            )?);
+            boxes.push(resolve_box(
+                decl,
+                &self.defaults,
+                &self.variables,
+                bindings,
+                name,
+            )?);
         }
         let layout = resolve_layout(self.layout.as_deref(), &names)?;
         Ok(Registry::panes(
@@ -186,7 +191,7 @@ impl DashboardFile {
             self.gap.unwrap_or(0),
             self.row_gap.unwrap_or(0),
         )?
-        .with_title(self.resolve_title(&names)?)
+        .with_title(self.resolve_title(&names, bindings)?)
         .with_diagnostics(Self::collect_diagnostics(&names)))
     }
 
@@ -194,7 +199,7 @@ impl DashboardFile {
     /// the FIRST pane with the id (the same first-win rule refs
     /// follow everywhere); an id nothing declares is a load error
     /// that lists what exists.
-    fn resolve_title(&self, names: &[String]) -> anyhow::Result<TitleSource> {
+    fn resolve_title(&self, names: &[String], bindings: &Bindings) -> anyhow::Result<TitleSource> {
         if let Some(TitleDecl {
             text: Some(text), ..
         }) = &self.title
@@ -209,9 +214,7 @@ impl DashboardFile {
                 text,
                 reference: None,
             }) => TitleSource::Static(
-                text.expect("the parser requires text or ref")
-                    .as_str()
-                    .to_string(),
+                at_load(&text.expect("the parser requires text or ref"), bindings)?.into_owned(),
             ),
             Some(TitleDecl {
                 text,
@@ -229,7 +232,13 @@ impl DashboardFile {
                     })?;
                 TitleSource::Pane {
                     source,
-                    fallback: text.map(|fallback| fallback.as_str().to_string()),
+                    // The TEXT expands; the `reference` fragment never
+                    // does — an id is identity (INV-3), and the
+                    // unknown-ref error above names the WRITTEN
+                    // fragment.
+                    fallback: text
+                        .map(|fallback| at_load(&fallback, bindings).map(|t| t.into_owned()))
+                        .transpose()?,
                 }
             }
         })
@@ -270,6 +279,235 @@ impl DashboardFile {
     }
 }
 
+/// `at_load`'s partial twin: `Known` hands the real parser exact
+/// bytes; `Skipped` records the site and its blockers. NEVER a
+/// stand-in value — a sentinel would reach a token parser and refuse
+/// boards that run fine.
+// The check command is this family's production caller; until it
+// lands only tests reach it. Remove these allows with it.
+#[allow(dead_code)]
+fn at_load_partial(template: &Template, partial: &crate::core::variables::Partial) -> Expanded {
+    template.expand_partial(partial)
+}
+
+/// Where a load-time site was written: the pane's own block, or the
+/// `defaults` block every pane inherits from. Only `inherit()`'s
+/// origin bit can still tell them apart by the time a value reaches a
+/// site.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) enum SiteOrigin {
+    Pane(String),
+    Defaults,
+}
+
+impl std::fmt::Display for SiteOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SiteOrigin::Pane(id) => write!(f, "pane {id:?}"),
+            SiteOrigin::Defaults => write!(f, "defaults"),
+        }
+    }
+}
+
+/// One load-time site the audit validated.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct AuditedSite {
+    pub origin: SiteOrigin,
+    /// The key's own name: "trigger", "interval", "shell", …
+    pub key: &'static str,
+}
+
+/// A site whose value could not be known without running something.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct UncheckedSite {
+    pub origin: SiteOrigin,
+    pub key: &'static str,
+    /// The references that blocked it, verbatim — NOT the root causes:
+    /// tracing a blocker back to the command responsible needs the
+    /// variable graph and belongs to the report layer.
+    pub blockers: Vec<String>,
+}
+
+/// What a checker learns without running anything: every load-time
+/// site that WAS validated, and every one that could not be.
+///
+/// Deliberately NOT convertible into a [`Registry`], and there is no
+/// constructor that would let it become one: a board whose values are
+/// unknowable has no coherent registry, and inventing one is how a
+/// checker starts refusing boards that run fine. Full `Registry`
+/// construction stays the exclusive property of the real load path.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub(crate) struct SiteAudit {
+    pub checked: Vec<AuditedSite>,
+    pub unchecked: Vec<UncheckedSite>,
+}
+
+/// One row of the shared load-time site list: the key, how to read its
+/// values (with origin) off a `(decl, defaults)` pair, and the REAL
+/// token grammar over the expanded text. `audit_sites` walks this
+/// table; `into_registry` expands inline beside each parser (the
+/// brief's intent — the check sits beside the parser that would
+/// otherwise choke), and the correspondence between the two is held by
+/// the per-site route tests rather than by construction.
+#[allow(dead_code)]
+struct LoadSite {
+    key: &'static str,
+    pick: for<'a> fn(&'a PaneDecl, &'a PaneDecl) -> Vec<(&'a Template, bool)>,
+    parse: fn(&str, &str) -> anyhow::Result<()>,
+}
+
+fn one_site<'a>(
+    own: Option<&'a Template>,
+    defaults: Option<&'a Template>,
+) -> Vec<(&'a Template, bool)> {
+    inherit(own, defaults).into_iter().collect()
+}
+
+const LOAD_SITES: &[LoadSite] = &[
+    LoadSite {
+        key: "trigger",
+        pick: |decl, defaults| match inherit(decl.trigger.as_ref(), defaults.trigger.as_ref()) {
+            Some((specs, inherited)) => specs.iter().map(|spec| (spec, inherited)).collect(),
+            None => Vec::new(),
+        },
+        parse: |text, id| parse_trigger(text).with_context(|| at(id)).map(|_| ()),
+    },
+    LoadSite {
+        key: "interval",
+        pick: |decl, defaults| one_site(decl.interval.as_ref(), defaults.interval.as_ref()),
+        parse: |text, id| {
+            if text == "never" {
+                return Ok(());
+            }
+            parse_interval(text).with_context(|| at(id)).map(|_| ())
+        },
+    },
+    LoadSite {
+        key: "trigger-debounce",
+        pick: |decl, defaults| {
+            one_site(
+                decl.trigger_debounce.as_ref(),
+                defaults.trigger_debounce.as_ref(),
+            )
+        },
+        parse: |text, id| parse_interval(text).with_context(|| at(id)).map(|_| ()),
+    },
+    LoadSite {
+        key: "width",
+        pick: |decl, defaults| one_site(decl.width.as_ref(), defaults.width.as_ref()),
+        parse: |text, id| {
+            if text == "auto" {
+                return Ok(());
+            }
+            parse_width(text, id).map(|_| ())
+        },
+    },
+    LoadSite {
+        key: "overflow",
+        pick: |decl, defaults| one_site(decl.overflow.as_ref(), defaults.overflow.as_ref()),
+        parse: |text, id| overflow_token(text, id).map(|_| ()),
+    },
+    LoadSite {
+        key: "border",
+        pick: |decl, defaults| one_site(decl.border.as_ref(), defaults.border.as_ref()),
+        parse: |text, id| parse_border(text, id).map(|_| ()),
+    },
+    LoadSite {
+        key: "padding",
+        pick: |decl, defaults| one_site(decl.padding.as_ref(), defaults.padding.as_ref()),
+        parse: |text, id| parse_sides(text).with_context(|| at(id)).map(|_| ()),
+    },
+    LoadSite {
+        key: "title",
+        pick: |decl, defaults| one_site(decl.title.as_ref(), defaults.title.as_ref()),
+        // A render decision, not a token: any text is a title.
+        parse: |_, _| Ok(()),
+    },
+    LoadSite {
+        key: "shell",
+        pick: |decl, defaults| match inherit(decl.shell.as_ref(), defaults.shell.as_ref()) {
+            Some((ShellDecl::Named(name), inherited)) => vec![(name, inherited)],
+            _ => Vec::new(),
+        },
+        parse: |text, id| {
+            if text.trim().is_empty() {
+                bail!(
+                    "{}: `shell` expanded to an empty name — a shell name must name a program",
+                    at(id)
+                );
+            }
+            Ok(())
+        },
+    },
+];
+
+impl DashboardFile {
+    /// The `check` entry point, beside `into_registry` and walking the
+    /// same sites. `&self`, never `self`: it consumes nothing, because
+    /// unlike `into_registry` it is not building anything the file
+    /// becomes — and the report layer reads the file again after the
+    /// audit returns.
+    ///
+    /// A `Known` value still runs the REAL token grammar, so a
+    /// malformed one refuses exactly as a run would; only `Skipped`
+    /// becomes a row. That asymmetry IS the partial semantics: never
+    /// stricter than the runtime, and never laxer either.
+    #[allow(dead_code)]
+    pub(crate) fn audit_sites(
+        &self,
+        partial: &crate::core::variables::Partial,
+    ) -> anyhow::Result<SiteAudit> {
+        let mut audit = SiteAudit::default();
+        let mut visit = |origin: SiteOrigin,
+                         key: &'static str,
+                         template: &Template,
+                         parse: fn(&str, &str) -> anyhow::Result<()>|
+         -> anyhow::Result<()> {
+            match at_load_partial(template, partial) {
+                Expanded::Known(text) => {
+                    parse(&text, &origin.to_string())?;
+                    audit.checked.push(AuditedSite { origin, key });
+                }
+                Expanded::Skipped(blockers) => {
+                    audit.unchecked.push(UncheckedSite {
+                        origin,
+                        key,
+                        blockers,
+                    });
+                }
+            }
+            Ok(())
+        };
+        for decl in &self.panes {
+            let pane = decl.id.clone().unwrap_or_default();
+            for site in LOAD_SITES {
+                for (template, inherited) in (site.pick)(decl, &self.defaults) {
+                    let origin = if inherited {
+                        SiteOrigin::Defaults
+                    } else {
+                        SiteOrigin::Pane(pane.clone())
+                    };
+                    visit(origin, site.key, template, site.parse)?;
+                }
+            }
+        }
+        // The dashboard-level `title` text is NOT a pane key, so a
+        // derivation over the table above cannot see it — the one
+        // explicit case beside the derived nine.
+        if let Some(TitleDecl {
+            text: Some(text), ..
+        }) = &self.title
+        {
+            visit(SiteOrigin::Defaults, "title", text, |_, _| Ok(()))?;
+        }
+        Ok(audit)
+    }
+}
+
 /// Every error a pane can raise names the pane first — the file may
 /// have a dozen, and "invalid overflow" alone does not say which one
 /// to edit.
@@ -287,23 +525,38 @@ fn shell_label(decl: &ShellDecl) -> String {
     }
 }
 
-/// The Phase-1 bridge from the declared shell to the resolved mode a
-/// [`SourceSpec`] carries: nothing expands yet, so a templated dialect
-/// name passes through as its written bytes — byte-identical to the
-/// old behavior for every template-free board. Load-time expansion
-/// replaces this with `ShellDecl::resolve(bindings)`; when it does,
-/// the inherit-guards in `resolve_source`/`resolve_script` must move
-/// from comparing DECLARED shells to comparing RESOLVED modes in the
-/// same change — `shell="{{sh}}"` with `sh = "fish"` beside
-/// `defaults { shell "fish" }` compares unequal as written and equal
-/// as run, and the guard's own justification is about the dialect the
-/// command was written for.
-fn shell_mode(decl: &ShellDecl) -> ShellMode {
-    match decl {
-        ShellDecl::Direct => ShellMode::Direct,
-        ShellDecl::Platform => ShellMode::Platform,
-        ShellDecl::Named(name) => ShellMode::Named(name.as_str().to_string()),
+/// How a RESOLVED mode reads inside an error — the inherit-guards
+/// compare and name resolved modes, because their justification is the
+/// dialect the inherited program was written for.
+fn mode_label(mode: &ShellMode) -> String {
+    match mode {
+        ShellMode::Direct => "no shell".to_string(),
+        ShellMode::Platform => "the platform shell".to_string(),
+        ShellMode::Named(name) => format!("`{name}`"),
     }
+}
+
+/// Fill a LOAD-TIME site's holes before its parser sees the text.
+///
+/// Takes the recorded `Template`, never a raw `&str`: a `&str`
+/// signature could not tell a raw string from a normal one and would
+/// expand a raw value's braces (INV-1) — reading the record is the
+/// same rule the site check and the spawn resolver apply. The map is
+/// complete here by construction: no deferred reference survives at a
+/// load-time site, and every once-at-load command has already run and
+/// been memoized, so this cannot reach the runner.
+///
+/// Borrowed straight through when the template holds no references —
+/// the path a board with no variables (or a raw-string value) takes,
+/// and the reason such a board carries zero new failure modes.
+fn at_load<'a>(
+    template: &'a Template,
+    bindings: &Bindings,
+) -> anyhow::Result<std::borrow::Cow<'a, str>> {
+    if template.refs().is_empty() {
+        return Ok(std::borrow::Cow::Borrowed(template.as_str()));
+    }
+    Ok(std::borrow::Cow::Owned(template.expand(bindings)?))
 }
 
 /// The effective value AND where it was written. Replaces the bare
@@ -419,7 +672,13 @@ fn script_first_bytes(body: &Template, subject: &str) -> anyhow::Result<()> {
 fn resolve_source(
     decl: &PaneDecl,
     defaults: &PaneDecl,
+    // TWO maps, two questions, never collapsed: the BLOCK answers
+    // "what tier is this name?" (the site check) and the BINDINGS
+    // answer "what is its value?" (the expansion). A checker runs the
+    // tier question without ever having evaluated anything, which only
+    // works while these stay separate parameters.
     block: &VariableBlock,
+    bindings: &Bindings,
     id: &str,
 ) -> anyhow::Result<SourceSpec> {
     let defaults_shell = defaults.shell.clone().unwrap_or_default();
@@ -433,6 +692,14 @@ fn resolve_source(
     {
         refuse_deferred_at_load_site(name, "shell", inherited, block, &at(id))?;
     }
+    // The dialect name expands at LOAD — `ShellMode` is built only
+    // from an expanded name — and BOTH inherit-guards below compare
+    // RESOLVED modes: `shell="{{sh}}"` with `sh = "fish"` beside
+    // `defaults { shell "fish" }` is unequal as written and equal as
+    // run, and the guards' own justification is the dialect the
+    // inherited program was WRITTEN for.
+    let resolved_shell = shell.resolve(bindings).with_context(|| at(id))?;
+    let resolved_defaults_shell = defaults_shell.resolve(bindings).with_context(|| at(id))?;
     let live = decl.live.or(defaults.live).unwrap_or(false);
     if decl.command.is_some() && decl.script.is_some() {
         bail!(
@@ -455,8 +722,8 @@ fn resolve_source(
             body,
             decl,
             defaults,
-            &shell,
-            &defaults_shell,
+            &resolved_shell,
+            &resolved_defaults_shell,
             inherits_program,
             id,
         )?
@@ -467,15 +734,15 @@ fn resolve_source(
         // inherits the defaults' program while changing `shell`, in
         // either direction or to a different shell, would run a
         // command nobody wrote for it. Fail with the fix instead.
-        if inherits_program && shell != defaults_shell {
+        if inherits_program && resolved_shell != resolved_defaults_shell {
             bail!(
                 "{}: inherits `command` from `defaults` but overrides `shell` — \
                  the inherited command was read and written under the defaults' \
                  shell mode ({}), not this pane's ({}); declare the pane's own \
                  `command`",
                 at(id),
-                shell_label(&defaults_shell),
-                shell_label(&shell),
+                mode_label(&resolved_defaults_shell),
+                mode_label(&resolved_shell),
             );
         }
         let command = decl
@@ -486,7 +753,7 @@ fn resolve_source(
             .ok_or_else(|| anyhow!("{}: needs a `command` or a `script`", at(id)))?;
         // The templates ride to spawn per element, flavor and all —
         // expansion happens there, against that spawn's map (INV-2).
-        (SourceProgram::Argv(command), shell)
+        (SourceProgram::Argv(command), resolved_shell)
     };
 
     let picked_triggers = inherit(decl.trigger.as_ref(), defaults.trigger.as_ref());
@@ -501,15 +768,21 @@ fn resolve_source(
         .map(|(specs, _)| specs.clone())
         .unwrap_or_default()
         .iter()
-        .map(|spec| parse_trigger(spec.as_str()).with_context(|| at(id)))
+        .map(|spec| parse_trigger(&at_load(spec, bindings)?).with_context(|| at(id)))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let picked_interval = inherit(decl.interval.as_ref(), defaults.interval.as_ref());
     if let Some((value, inherited)) = picked_interval {
         refuse_deferred_at_load_site(value, "interval", inherited, block, &at(id))?;
     }
-    let token = picked_interval.map(|(value, _)| value.as_str());
-    let interval = match (token, triggers.is_empty()) {
+    let token = picked_interval
+        .map(|(value, _)| at_load(value, bindings))
+        .transpose()?;
+    // `"never"` is compared against the EXPANDED text, so
+    // `interval "{{iv}}"` with `iv = "never"` means never — the
+    // alternative silently makes one legal value unreachable through a
+    // variable.
+    let interval = match (token.as_deref(), triggers.is_empty()) {
         (Some("never"), _) => None,
         (Some(token), _) => Some(parse_interval(token).with_context(|| at(id))?),
         (None, false) => None,
@@ -523,7 +796,11 @@ fn resolve_source(
     if let Some((value, inherited)) = picked_debounce {
         refuse_deferred_at_load_site(value, "trigger-debounce", inherited, block, &at(id))?;
     }
-    let debounce = match picked_debounce.map(|(value, _)| value.as_str()) {
+    let debounce = match picked_debounce
+        .map(|(value, _)| at_load(value, bindings))
+        .transpose()?
+        .as_deref()
+    {
         Some(token) => parse_interval(token).with_context(|| at(id))?,
         None => DEFAULT_DEBOUNCE,
     };
@@ -534,7 +811,7 @@ fn resolve_source(
         // round-trips through split-then-join, and a body's bytes are
         // the author's.
         program,
-        shell: shell_mode(&shell),
+        shell,
         interval,
         triggers,
         debounce,
@@ -557,11 +834,11 @@ fn resolve_script(
     body: &Template,
     decl: &PaneDecl,
     defaults: &PaneDecl,
-    shell: &ShellDecl,
-    defaults_shell: &ShellDecl,
+    shell: &ShellMode,
+    defaults_shell: &ShellMode,
     inherited: bool,
     id: &str,
-) -> anyhow::Result<(SourceProgram, ShellDecl)> {
+) -> anyhow::Result<(SourceProgram, ShellMode)> {
     if body.as_str().trim().is_empty() {
         bail!(
             "{}: `script` has no body — write the script inside a `\"\"\"` \
@@ -620,12 +897,12 @@ fn resolve_script(
                      defaults' shell mode ({}), not this pane's ({}); declare \
                      the pane's own `script`",
                     at(id),
-                    shell_label(defaults_shell),
-                    shell_label(shell),
+                    mode_label(defaults_shell),
+                    mode_label(shell),
                 );
             }
             let shell = match shell {
-                ShellDecl::Direct => ShellDecl::Platform,
+                ShellMode::Direct => ShellMode::Platform,
                 other => other.clone(),
             };
             Ok((SourceProgram::Script(body.clone()), shell))
@@ -637,6 +914,7 @@ fn resolve_box(
     decl: &PaneDecl,
     defaults: &PaneDecl,
     block: &VariableBlock,
+    bindings: &Bindings,
     id: &str,
 ) -> anyhow::Result<PaneBox> {
     // `height` takes no site check: it is an integer, and integers
@@ -652,7 +930,11 @@ fn resolve_box(
     if let Some((value, inherited)) = picked_width {
         refuse_deferred_at_load_site(value, "width", inherited, block, &at(id))?;
     }
-    let width = match picked_width.map(|(value, _)| value.as_str()) {
+    let width = match picked_width
+        .map(|(value, _)| at_load(value, bindings))
+        .transpose()?
+        .as_deref()
+    {
         None | Some("auto") => PaneWidth::Weight(1),
         Some(token) => parse_width(token, id)?,
     };
@@ -666,29 +948,36 @@ fn resolve_box(
     if let Some((value, inherited)) = picked_overflow {
         refuse_deferred_at_load_site(value, "overflow", inherited, block, &at(id))?;
     }
-    let declared_overflow = picked_overflow.map(|(value, _)| value.as_str());
-    let overflow = match (declared_overflow, live) {
+    let declared_overflow = picked_overflow
+        .map(|(value, _)| at_load(value, bindings))
+        .transpose()?;
+    let declared_overflow = declared_overflow.as_deref();
+    let overflow = match (
+        declared_overflow
+            .map(|token| overflow_token(token, id))
+            .transpose()?,
+        live,
+    ) {
         (None, true) => Overflow::KeepBottom,
         (None, false) => Overflow::KeepTop,
-        (Some("keep-top"), true) => bail!(
+        (Some(Overflow::KeepTop), true) => bail!(
             "{}: `overflow \"keep-top\"` cannot be combined with `live`: a live \
              pane is read at its tail, and keeping the head silently disables the \
              `D` and `c` change markers. Use `overflow \"keep-bottom\"`, or drop \
              `live`.",
             at(id)
         ),
-        (Some("keep-top"), false) => Overflow::KeepTop,
-        (Some("keep-bottom"), _) => Overflow::KeepBottom,
-        (Some(other), _) => bail!(
-            "{}: unknown overflow {other:?}: expected keep-top or keep-bottom",
-            at(id)
-        ),
+        (Some(declared), _) => declared,
     };
     let picked_border = inherit(decl.border.as_ref(), defaults.border.as_ref());
     if let Some((value, inherited)) = picked_border {
         refuse_deferred_at_load_site(value, "border", inherited, block, &at(id))?;
     }
-    let border = match picked_border.map(|(value, _)| value.as_str()) {
+    let border = match picked_border
+        .map(|(value, _)| at_load(value, bindings))
+        .transpose()?
+        .as_deref()
+    {
         None => BorderPreset::None,
         Some(token) => parse_border(token, id)?,
     };
@@ -696,7 +985,11 @@ fn resolve_box(
     if let Some((value, inherited)) = picked_padding {
         refuse_deferred_at_load_site(value, "padding", inherited, block, &at(id))?;
     }
-    let padding = match picked_padding.map(|(value, _)| value.as_str()) {
+    let padding = match picked_padding
+        .map(|(value, _)| at_load(value, bindings))
+        .transpose()?
+        .as_deref()
+    {
         None => Sides::default(),
         Some(token) => parse_sides(token).with_context(|| at(id))?,
     };
@@ -711,11 +1004,28 @@ fn resolve_box(
             if let Some((value, inherited)) = picked {
                 refuse_deferred_at_load_site(value, "title", inherited, block, &at(id))?;
             }
-            picked.map(|(title, _)| title.as_str().to_string())
+            picked
+                .map(|(title, _)| at_load(title, bindings).map(|text| text.into_owned()))
+                .transpose()?
         },
         chrome: decl.chrome.or(defaults.chrome).unwrap_or(true),
         focusable: decl.focusable.or(defaults.focusable).unwrap_or(true),
     })
+}
+
+/// The overflow token's grammar, shared by `resolve_box` and the
+/// audit so the accepted set cannot drift between the two. The
+/// keep-top × live interaction stays in `resolve_box`, which is the
+/// only place that knows `live`.
+fn overflow_token(token: &str, id: &str) -> anyhow::Result<Overflow> {
+    match token {
+        "keep-top" => Ok(Overflow::KeepTop),
+        "keep-bottom" => Ok(Overflow::KeepBottom),
+        other => bail!(
+            "{}: unknown overflow {other:?}: expected keep-top or keep-bottom",
+            at(id)
+        ),
+    }
 }
 
 /// `"40"` = exact cells, `"2fr"` = a share of what is left, `"auto"` =
@@ -840,20 +1150,36 @@ fn resolve_node(
 
 /// Read + parse + validate. `colored` styles the syntax-error
 /// snippets for the caller's stream; it changes no parse outcome.
-pub fn load(
+/// Read the file, parse it, and validate the `-v` set — everything
+/// `load` and `check` do identically, and the ONE place the
+/// `reading {path}` / `in {path}` context strings live. Deliberately
+/// stops before evaluation: it builds no spawn context and runs no
+/// command, which is what lets a checker reuse it without inheriting
+/// the load path's execution. The document text rides along because
+/// placed errors need it.
+pub(crate) fn read_and_parse(
     path: &std::path::Path,
     colored: bool,
-    // `Bindings` lives in `core::template`, NOT in the walk —
-    // `dashboard_file.rs` may not name `dashboard_kdl.rs`, which
-    // imports it.
-    overrides: &crate::core::template::Bindings,
-) -> anyhow::Result<(Registry, crate::core::shell::SpawnVariables)> {
+    overrides: &Bindings,
+) -> anyhow::Result<(String, DashboardFile)> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file = crate::core::dashboard_kdl::parse_styled(&text, colored)
         .with_context(|| format!("in {}", path.display()))?;
     crate::core::variables::check_overrides(&file.variables, overrides)
         .with_context(|| format!("in {}", path.display()))?;
+    Ok((text, file))
+}
+
+pub fn load(
+    path: &std::path::Path,
+    colored: bool,
+    // `Bindings` lives in `core::template`, NOT in the walk —
+    // `dashboard_file.rs` may not name `dashboard_kdl.rs`, which
+    // imports it.
+    overrides: &Bindings,
+) -> anyhow::Result<(Registry, crate::core::shell::SpawnVariables)> {
+    let (text, file) = read_and_parse(path, colored, overrides)?;
     // The runner is passed as a PARAMETER, not called from inside
     // `resolve_variables`: that inversion is what lets the graph walk
     // be tested with no subprocess, lets a checker hold a
@@ -2101,6 +2427,88 @@ mod tests {
             "pane \"p\" {\n    script \"{{ rev }} says hi\"\n    height 3\n    shell #true\n}\n",
         )
         .expect("inner whitespace is literal text");
+    }
+
+    #[test]
+    fn an_inherited_value_expands_byte_identically_to_a_declared_one() {
+        // INV-2's declaration-position claim, at the value level: the
+        // same trigger written in `defaults` and on the pane resolves
+        // to the same TriggerSpec — and to the EXPECTED one, which is
+        // the half that cannot pass vacuously while both sides hold
+        // unexpanded text.
+        let inherited = "variables {\n    dir \"/tmp/zz\"\n}\n\ndefaults {\n    trigger \"file:{{dir}}/s\"\n    height 3\n}\n\npane \"p\" {\n    command \"true\"\n}\n";
+        let declared = "variables {\n    dir \"/tmp/zz\"\n}\n\npane \"p\" {\n    command \"true\"\n    height 3\n    trigger \"file:{{dir}}/s\"\n}\n";
+        let spec_of = |text: &str| {
+            crate::core::dashboard_kdl::parse_styled(text, false)
+                .expect("parses")
+                .into_registry(&Bindings::from([(
+                    "dir".to_string(),
+                    "/tmp/zz".to_string(),
+                )]))
+                .expect("resolves")
+                .spec(SourceId(0))
+                .triggers
+                .clone()
+        };
+        let expected = vec![parse_trigger("file:/tmp/zz/s").expect("parses")];
+        assert_eq!(spec_of(inherited), expected);
+        assert_eq!(spec_of(declared), expected);
+    }
+
+    #[test]
+    fn a_shell_dialect_resolves_to_the_expanded_mode() {
+        // The unit half of the dialect route: a dialect that expanded
+        // to a VALID but wrong shell would run silently, so the route
+        // test's loud failure is an accident of `{{sh}}` naming no
+        // program — this is the assertion that survives that case.
+        let registry = crate::core::dashboard_kdl::parse_styled(
+            "variables {\n    sh \"sh\"\n}\n\npane \"p\" {\n    command \"echo hi\"\n    height 3\n    shell \"{{sh}}\"\n}\n",
+            false,
+        )
+        .expect("parses")
+        .into_registry(&Bindings::from([("sh".to_string(), "sh".to_string())]))
+        .expect("resolves");
+        assert_eq!(
+            registry.spec(SourceId(0)).shell,
+            crate::core::registry::ShellMode::Named("sh".to_string())
+        );
+    }
+
+    #[test]
+    fn the_audit_checks_known_sites_and_records_opaque_ones() {
+        // The partial semantics in one board: a Known value runs the
+        // REAL token grammar (a malformed one refuses exactly as a run
+        // would), an opaque one becomes a row rather than a guess, and
+        // nothing here ever built a Registry.
+        use crate::core::variables::resolve_partial;
+        let file = crate::core::dashboard_kdl::parse_styled(
+            "variables {\n    iv \"5s\"\n    store \"git rev-parse\" shell=#true\n}\n\npane \"p\" {\n    command \"true\"\n    height 3\n    interval \"{{iv}}\"\n    trigger \"file:{{store}}/events\"\n}\n",
+            false,
+        )
+        .expect("parses");
+        let partial = resolve_partial(&file.variables, &Bindings::new());
+        let audit = file.audit_sites(&partial).expect("audits");
+        assert!(
+            audit.checked.iter().any(|site| site.key == "interval"),
+            "the knowable site was checked: {audit:?}"
+        );
+        let skipped = audit
+            .unchecked
+            .iter()
+            .find(|site| site.key == "trigger")
+            .expect("the opaque site is a row, not a guess");
+        assert_eq!(skipped.blockers, vec!["store".to_string()]);
+
+        // The deterministically-wrong constant refuses — check is never
+        // laxer than the runtime.
+        let bad = crate::core::dashboard_kdl::parse_styled(
+            "variables {\n    iv \"bad\"\n}\n\npane \"p\" {\n    command \"true\"\n    height 3\n    interval \"{{iv}}\"\n}\n",
+            false,
+        )
+        .expect("parses");
+        let partial = resolve_partial(&bad.variables, &Bindings::new());
+        let err = format!("{:#}", bad.audit_sites(&partial).expect_err("refuses"));
+        assert!(err.contains("invalid duration"), "{err}");
     }
 
     #[test]
