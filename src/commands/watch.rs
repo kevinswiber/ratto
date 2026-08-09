@@ -23,7 +23,7 @@ use crate::color::{ColorProfile, SystemEnv};
 use crate::core::child::{
     ChildSlot, ShutdownGuard, TickEvent, not_started, run_tick, spawn_live_tick, spawn_tick,
 };
-use crate::core::duration::parse_interval;
+use crate::core::duration::{brief_duration, parse_interval};
 use crate::core::layout::{
     PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
     render_pane_collapsed, scroll_badge,
@@ -4763,15 +4763,6 @@ fn pane_list(registry: &Registry, waiting: &[SourceId]) -> String {
         .join(", ");
     let noun = if waiting.len() == 1 { "pane" } else { "panes" };
     format!("{noun} {names}")
-}
-
-/// `5s` / `300ms` — a wait, briefly.
-fn brief_duration(d: Duration) -> String {
-    if d.subsec_millis() == 0 {
-        format!("{}s", d.as_secs())
-    } else {
-        format!("{}ms", d.as_millis())
-    }
 }
 
 /// The one-shot stderr notice for a `--once` run that has gone quiet:

@@ -173,3 +173,14 @@ pub fn parse_interval(s: &str) -> anyhow::Result<std::time::Duration> {
     }
     Ok(std::time::Duration::from_secs(secs as u64))
 }
+
+/// `5s` / `300ms` — a wait, briefly. Parse and render live side by
+/// side: this is the one spelling every surface uses for a bound, so
+/// two of them cannot drift.
+pub(crate) fn brief_duration(d: std::time::Duration) -> String {
+    if d.subsec_millis() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
+    }
+}

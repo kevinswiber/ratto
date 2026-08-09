@@ -719,9 +719,28 @@ pub fn load(
     let bindings = crate::core::variables::resolve_variables(&file.variables, overrides, &mut {
         |request: crate::core::variables::Derivation<'_>| {
             crate::core::shell::derive(&request).map_err(|failure| {
-                // Placeholder wording: the failure-rendering layer owns
-                // the teaching sentence for each variant.
-                anyhow::anyhow!("variable `{}`: {failure}", request.name)
+                let refusal = crate::core::shell::refusal(request.name, request.command, &failure);
+                // Placed at the variable's declaration: the span is on
+                // the block, and the document text is only in scope
+                // HERE — `refusal` itself stays a pure
+                // name+command+failure → message function the spawn
+                // tier can reuse where there is no document to point
+                // into.
+                match file.variables.get(request.name) {
+                    Some(variable) => {
+                        let (line, column) =
+                            crate::core::dashboard_kdl::line_column(&text, variable.span.start);
+                        anyhow::anyhow!(
+                            "{}",
+                            crate::core::dashboard_kdl::syntax_error_text(
+                                line,
+                                column,
+                                Some(&format!("{refusal:#}")),
+                            )
+                        )
+                    }
+                    None => refusal,
+                }
             })
         }
     })

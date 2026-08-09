@@ -330,7 +330,7 @@ fn record(seen: &mut Vec<&'static str>, k: &'static Key, at: &str) -> anyhow::Re
 /// column (CRLF turns the line at its `\n`), a mid-char offset lands
 /// after that char, and an offset past the end clamps to wherever the
 /// walk stops — nothing here can panic or index out of bounds.
-fn line_column(text: &str, offset: usize) -> (usize, usize) {
+pub(crate) fn line_column(text: &str, offset: usize) -> (usize, usize) {
     let mut line = 1;
     let mut column = 1;
     for (i, ch) in text.char_indices() {
@@ -356,7 +356,7 @@ fn line_column(text: &str, offset: usize) -> (usize, usize) {
 /// live in the miette snippet blocks `syntax_error` renders below,
 /// which echo and point into the source at a bounded width (the
 /// budgeted echo the original one-line-only rule was waiting for).
-fn syntax_error_text(line: usize, column: usize, message: Option<&str>) -> String {
+pub(crate) fn syntax_error_text(line: usize, column: usize, message: Option<&str>) -> String {
     format!(
         "line {line}, column {column}: {}",
         message.unwrap_or("invalid KDL")

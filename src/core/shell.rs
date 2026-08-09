@@ -128,10 +128,17 @@ pub(crate) const DERIVE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// The value's byte ceiling. A variable's value is a path, a revision,
 /// a flag string — 64 KiB is far past any of those, and past it the
 /// failure is LOUD (`Truncated`), never a silently dropped value.
+///
+/// A BYTE cap, not a line cap: a value is one line in every motivating
+/// case, so a line count would let a pathological single line through
+/// while rejecting a harmless 65-line one. The number was picked, not
+/// measured — what is under test is that a bound exists and that
+/// overflowing it is loud, so a real measurement may change it freely.
 const VALUE_CAP: usize = 64 * 1024;
 
 /// How much stderr an error message echoes: a bounded, human-readable
-/// diagnostic, not a transcript.
+/// diagnostic, not a transcript — the error prints to a terminal with
+/// no scrollback control. Picked, not measured, like `VALUE_CAP`.
 const STDERR_ECHO_LINES: usize = 5;
 
 /// Every way a derivation can fail. Declared HERE because this module
@@ -344,8 +351,13 @@ fn derive_with(
                     )
                 });
             let value = bounded_read(stdout, VALUE_CAP);
-            let (err_lines, _dropped) =
+            let (mut err_lines, dropped) =
                 err_reader.map_or_else(|_| (Vec::new(), 0), |h| h.join().unwrap_or_default());
+            if dropped > 0 {
+                // The echo is bounded; say so rather than ending
+                // mid-diagnostic as if that were all the child said.
+                err_lines.push("…".as_bytes().to_vec());
+            }
             let _ = tx.send((value, err_lines));
         });
     let drained = reader.ok().and_then(|_| rx.recv_timeout(timeout).ok());
@@ -378,6 +390,91 @@ fn derive_with(
     // hints to stderr while succeeding, and a variable's value is its
     // stdout. Do not "fix" this by echoing it anywhere.
     classify_value(stdout, truncated)
+}
+
+/// A variable's errors name it first, for the same reason a pane's
+/// do: a block may hold a dozen, and "the command exited 128" alone
+/// does not say which line to edit.
+fn at_variable(name: &str) -> String {
+    format!("variable {name:?}")
+}
+
+/// The ONE fallback spelling every message teaches. A constant so two
+/// messages cannot drift into teaching different fixes for the same
+/// fix.
+const FALLBACK: &str =
+    "write the fallback where the shell already has the operator: `… 2>/dev/null || echo -`";
+
+/// The child's stderr as an indented block beneath the sentence, or
+/// nothing when it printed none. Multi-line messages are house-legal:
+/// everything prints through `rat: {err:#}` with the head line first.
+fn echo(stderr: &str) -> String {
+    if stderr.trim().is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n  the command's own diagnostic:");
+    for line in stderr.lines() {
+        out.push_str("\n    ");
+        out.push_str(line);
+    }
+    out
+}
+
+/// The load-tier boundary: every way a derivation can fail, as a
+/// teaching load error in the house shape — the subject first, what
+/// happened, why it matters, and the fix spelled out. The spawn tier
+/// renders the SAME words through its own adapter; neither tier
+/// re-formats a sentence of its own.
+pub(crate) fn refusal(name: &str, command: &str, failure: &DerivationFailure) -> anyhow::Error {
+    use anyhow::anyhow;
+    let at = at_variable(name);
+    match failure {
+        // Unreachable after load-time name validation; worded anyway
+        // because the type is total.
+        DerivationFailure::Expansion(missing) => {
+            anyhow!("{at}: the command references {missing} — declare it in the `variables` block")
+        }
+        DerivationFailure::EmptyShell(empty) => anyhow!(
+            "{at}: `shell` names nothing — the dialect (written as {declared:?}) came back \
+             empty; name the program, or use `shell=#true` for the platform's shell",
+            declared = empty.declared,
+        ),
+        // The SHELL, never the command: under `shell="fish"` the
+        // command text is `git rev-parse …` while the missing program
+        // is `fish`, and presenting the command as the program sends
+        // the reader hunting for the wrong thing.
+        DerivationFailure::Spawn { program, source } => anyhow!(
+            "{at}: could not start `{program}` ({source}) — that is the shell the \
+             command runs through, not the command itself; name a shell that exists, \
+             or use `shell=#true` for the platform's shell"
+        ),
+        DerivationFailure::Exit { code, stderr } => anyhow!(
+            "{at}: the command exited {how} — a command variable's output IS its \
+             value, so a failure has no value to give: `{command}`. If a fallback is \
+             meant, {FALLBACK}{echoed}",
+            how = match code {
+                Some(code) => code.to_string(),
+                None => "on a signal".to_string(),
+            },
+            echoed = echo(stderr),
+        ),
+        DerivationFailure::Truncated { cap } => anyhow!(
+            "{at}: the command printed more than {cap} bytes — a value is a path or \
+             a token, not a listing; narrow the command (`… | head -1`): `{command}`"
+        ),
+        DerivationFailure::Empty => anyhow!(
+            "{at}: the command printed nothing — a silently empty value would expand \
+             into a plausible-looking wrong path that fails much later, which is worse \
+             than not starting: `{command}`. If empty is meaningful here, {FALLBACK}"
+        ),
+        DerivationFailure::Timeout(bound) => anyhow!(
+            "{at}: the command was still running after {bound} — a once-at-load \
+             variable runs before the first frame, so a hanging command hangs startup \
+             with no UI to explain it: `{command}`. Bound the command itself \
+             (`timeout 2 …`), or derive the value another way",
+            bound = crate::core::duration::brief_duration(*bound),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -518,12 +615,16 @@ mod tests {
         let marker = dir.path().join("marker");
         // The marker is written AFTER the sleep, so a bound that
         // returns while leaving the child running shows up as the
-        // marker appearing later.
+        // marker appearing later. The sleeper's own streams are
+        // redirected away so the orphan (the kill lands on the shell)
+        // does not hold our pipes open for its remaining nap — the
+        // readers exit at EOF either way, but a held pipe reads as a
+        // leaked handle in the test runner.
         #[cfg(unix)]
-        let command = format!("sleep 2; echo x > {}", marker.display());
+        let command = format!("sleep 2 > /dev/null 2>&1; echo x > {}", marker.display());
         #[cfg(windows)]
         let command = format!(
-            "ping -n 3 127.0.0.1 > NUL & echo x > \"{}\"",
+            "ping -n 3 127.0.0.1 > NUL 2>&1 & echo x > \"{}\"",
             marker.display()
         );
         let bound = Duration::from_millis(200);
@@ -548,6 +649,175 @@ mod tests {
         // sleeper is a direct child here, so the kill provably lands.)
         std::thread::sleep(Duration::from_secs(3));
         assert!(!marker.exists(), "the kill reached the child");
+    }
+
+    #[test]
+    fn a_nonzero_exit_names_the_variable_the_code_and_the_command() {
+        let err = refusal(
+            "store",
+            "exit 128",
+            &DerivationFailure::Exit {
+                code: Some(128),
+                stderr: "fatal: not a git repository\n".into(),
+            },
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains(r#"variable "store""#), "{text}");
+        assert!(text.contains("128"), "{text}");
+        // The command, echoed back so the author can paste it.
+        assert!(text.contains("exit 128"), "{text}");
+        // The child's own diagnostic.
+        assert!(text.contains("fatal: not a git repository"), "{text}");
+        // The fallback the shell already has.
+        assert!(text.contains("||"), "{text}");
+
+        // A signalled child has no code — name the signal's absence
+        // rather than inventing one.
+        let err = refusal(
+            "store",
+            "exit 128",
+            &DerivationFailure::Exit {
+                code: None,
+                stderr: String::new(),
+            },
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains("signal"), "{text}");
+    }
+
+    #[test]
+    fn empty_output_explains_the_masking_it_prevents() {
+        let err = refusal("store", "true", &DerivationFailure::Empty);
+        let text = format!("{err:#}");
+        assert!(text.contains(r#"variable "store""#), "{text}");
+        assert!(text.contains("printed nothing"), "{text}");
+        // The same fallback spelling as the exit arm.
+        assert!(text.contains("||"), "{text}");
+        // The REASON, because this is the failure an author will most
+        // want to argue with: a silently-empty value expands into a
+        // plausible-looking wrong path.
+        assert!(text.contains("plausible"), "carries the rationale: {text}");
+
+        // Whitespace-only output takes this arm, not the success arm.
+        assert!(matches!(
+            classify_value(b"   \n".to_vec(), false),
+            Err(DerivationFailure::Empty)
+        ));
+    }
+
+    #[test]
+    fn a_spawn_failure_names_the_shell_not_the_command() {
+        let err = refusal(
+            "store",
+            "git rev-parse --git-common-dir",
+            &DerivationFailure::Spawn {
+                program: "definitely-not-a-shell".into(),
+                source: std::io::Error::from_raw_os_error(2),
+            },
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains(r#"variable "store""#), "{text}");
+        // The program that failed to start…
+        assert!(text.contains("definitely-not-a-shell"), "{text}");
+        // …with the OS reason, never an OS-specific sentence pinned.
+        assert!(text.contains("os error"), "{text}");
+        // The negative half: a reader who sees the COMMAND presented as
+        // the missing program goes looking for git when the shell is
+        // what is missing.
+        assert!(!text.contains("git rev-parse"), "{text}");
+    }
+
+    #[test]
+    fn a_timeout_names_the_variable_and_the_bound() {
+        let err = refusal(
+            "store",
+            "some-slow-thing",
+            &DerivationFailure::Timeout(DERIVE_TIMEOUT),
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains(r#"variable "store""#), "{text}");
+        // The bound, in the file's own duration spelling — never Debug.
+        assert!(text.contains("5s"), "{text}");
+        assert!(!text.contains("5.0s"), "{text}");
+        // The WHY: a once-at-load command runs before the first frame,
+        // so a hanging one hangs startup with no UI to explain it.
+        assert!(text.contains("before the first frame"), "{text}");
+        // Deferring a hang moves the stall onto the frame loop — worse,
+        // and not obviously so. The fix must not be `defer`.
+        assert!(!text.contains("defer"), "{text}");
+    }
+
+    #[test]
+    fn a_dialect_that_expanded_to_nothing_names_the_variable_and_the_shell_reference() {
+        let err = refusal(
+            "store",
+            "git rev-parse --git-common-dir",
+            &DerivationFailure::EmptyShell(crate::core::registry::EmptyShellName {
+                declared: "{{d}}".into(),
+            }),
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains(r#"variable "store""#), "{text}");
+        assert!(text.contains("shell"), "{text}");
+        // The dialect AS WRITTEN, holes and all — the thing the author
+        // can go edit, not the blank it produced.
+        assert!(text.contains("{{d}}"), "{text}");
+    }
+
+    #[test]
+    fn output_that_overflows_its_bound_is_a_loud_failure() {
+        let err = refusal(
+            "listing",
+            "find /",
+            &DerivationFailure::Truncated { cap: VALUE_CAP },
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains(r#"variable "listing""#), "{text}");
+        // The message spells a narrowing fix.
+        assert!(text.contains("head -1"), "{text}");
+    }
+
+    #[test]
+    fn every_failure_variant_names_its_variable() {
+        // The exhaustive pin: constructed one per variant, and the
+        // `match` below is what turns "someone added an eighth variant
+        // and forgot the rule" into a compile error rather than a gap.
+        let all = [
+            DerivationFailure::Expansion(crate::core::template::MissingVariable {
+                name: "x".into(),
+                offset: 0,
+            }),
+            DerivationFailure::EmptyShell(crate::core::registry::EmptyShellName {
+                declared: "{{d}}".into(),
+            }),
+            DerivationFailure::Spawn {
+                program: "sh".into(),
+                source: std::io::Error::from_raw_os_error(2),
+            },
+            DerivationFailure::Exit {
+                code: Some(1),
+                stderr: String::new(),
+            },
+            DerivationFailure::Truncated { cap: 1 },
+            DerivationFailure::Empty,
+            DerivationFailure::Timeout(Duration::from_secs(5)),
+        ];
+        for failure in all {
+            match &failure {
+                DerivationFailure::Expansion(_)
+                | DerivationFailure::EmptyShell(_)
+                | DerivationFailure::Spawn { .. }
+                | DerivationFailure::Exit { .. }
+                | DerivationFailure::Truncated { .. }
+                | DerivationFailure::Empty
+                | DerivationFailure::Timeout(_) => {}
+            }
+            let text = format!("{:#}", refusal("the-name", "cmd", &failure));
+            assert!(
+                text.contains(r#"variable "the-name""#),
+                "{failure:?} → {text}"
+            );
+        }
     }
 
     #[cfg(unix)]

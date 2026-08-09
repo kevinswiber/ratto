@@ -1403,3 +1403,57 @@ fn a_once_at_load_variable_expands_to_the_same_bytes_on_every_spawn() {
     // with the spawn-time phase.
     todo!("drive a live board through several spawns once expansion lands");
 }
+
+#[test]
+fn each_failure_refuses_the_board_and_writes_no_frame() {
+    // One board per failure mode. Each refuses end-to-end: non-zero
+    // exit, NO frame on stdout (a partial dashboard is worse than a
+    // refusal), and stderr naming both the variable and the file.
+    let dir = tempfile::tempdir().expect("tempdir");
+    #[cfg(unix)]
+    let hang = "sleep 7";
+    #[cfg(windows)]
+    let hang = "ping -n 8 127.0.0.1 > NUL";
+    let boards = [
+        (
+            "exits.kdl",
+            "bad",
+            "variables {\n    bad \"exit 3\" shell=#true\n}\n".to_string(),
+        ),
+        (
+            "empty.kdl",
+            "quiet",
+            "variables {\n    quiet \"cd .\" shell=#true\n}\n".to_string(),
+        ),
+        (
+            "spawnless.kdl",
+            "lost",
+            "variables {\n    lost \"cd .\" shell=\"definitely-not-a-shell-xyz\"\n}\n".to_string(),
+        ),
+        (
+            "hangs.kdl",
+            "slow",
+            format!("variables {{\n    slow \"{hang}\" shell=#true\n}}\n"),
+        ),
+    ];
+    for (name, variable, variables) in boards {
+        let file = fixture(
+            dir.path(),
+            name,
+            &format!(
+                "{variables}\npane \"a\" {{\n    command \"{bin}\" \"style\" \"ok\"\n    height 3\n    chrome #false\n}}\n",
+                bin = rat_bin().replace('\\', "\\\\"),
+            ),
+        );
+        rat()
+            .env("NO_COLOR", "1")
+            .args(["dashboard", &file, "--once"])
+            .assert()
+            .failure()
+            .stdout(predicates::str::is_empty())
+            .stderr(predicates::str::contains(format!(
+                "variable \"{variable}\""
+            )))
+            .stderr(predicates::str::contains(name));
+    }
+}
