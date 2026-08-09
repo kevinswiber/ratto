@@ -1,0 +1,75 @@
+// A review console you can ship: every path derives at load, so the
+// SAME file works in a primary checkout, a linked worktree, or a fresh
+// clone — nothing is hand-edited per machine. Run from any git
+// repository:
+//
+//   rat dashboard examples/review.kdl
+//
+// The board reads its selection from a handoff file: a small file
+// something else writes and these panes trigger on. The state lives in
+// that file, in the filesystem — the dashboard only reads it. Until a
+// key binding writes it from inside the dashboard, drive it by hand
+// from another terminal:
+//
+//   echo src/main.rs > "$(git rev-parse --git-common-dir)/review.sel"
+
+title "review"
+
+variables {
+    // Once at load, memoized. A linked worktree's `.git` is a FILE, so
+    // the store lives under the common dir, and a hardcoded ".git/…"
+    // path is correct only in a primary worktree. This line is what
+    // makes the board shippable instead of hand-edited per machine.
+    store "git rev-parse --git-common-dir" shell=#true
+
+    // The handoff file: where a selection lands, and what the panes
+    // below trigger on. A constant that references a command variable
+    // is itself once-at-load — it cannot be known before `store` runs.
+    sel "{{store}}/review.sel"
+
+    // Deferred: re-derived at every consuming spawn, so a pane always
+    // reads the CURRENT selection, not the one from load time. The
+    // `test -s` guard is not decoration: empty output FAILS the spawn,
+    // and a handoff file is empty in two ways — it does not exist yet,
+    // or a write was interrupted and left it zero bytes. `cat`
+    // SUCCEEDS on that second one, so `cat … || echo -` alone would
+    // still derive empty. The quotes matter too: the path comes from
+    // git and may contain spaces. And this string must interpolate, so
+    // it cannot be raw — the inner quotes are escaped instead, because
+    // a literal can be raw or interpolating, never both.
+    cur "test -s \"{{sel}}\" && cat \"{{sel}}\" || echo -" shell=#true defer=#true
+}
+
+defaults {
+    height 6
+    border "rounded"
+}
+
+pane "selection" {
+    title "current selection"
+    // Event-driven: `interval "never"` plus a trigger on the handoff
+    // file, so this pane runs only when the selection changes. A
+    // trigger on a path that does not exist yet is fine — the watch
+    // simply fires when the file appears.
+    interval "never"
+    trigger "file:{{sel}}"
+    shell #true
+    command "echo {{cur}}"
+}
+
+pane "diff" {
+    title "what changed"
+    height 14
+    interval "never"
+    trigger "file:{{sel}}"
+    // `-` is the empty-selection sentinel `cur` derives when the
+    // handoff file is absent or empty.
+    shell #true
+    command "test \"{{cur}}\" = - && echo select a file to review || git diff HEAD -- \"{{cur}}\""
+}
+
+// When key actions ship, a binding declared here will write the
+// handoff file from inside the dashboard — press a key, pick a changed
+// file, and the selection lands in the file above for these panes to
+// read. Until then, the echo in this file's header is the whole write
+// path.

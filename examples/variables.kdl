@@ -1,0 +1,70 @@
+// Variables: declare a name once, reference it anywhere a string is
+// written with {{name}}. Run from a git repository:
+//
+//   rat dashboard examples/variables.kdl
+//
+// Five facts an author cannot guess:
+//
+// 1. A plain variable is a constant — and a parameter: `-v limit=8`
+//    overrides it for one run. A constant is its own default.
+// 2. `shell=#true` derives the value by running the command ONCE at
+//    load, memoized for the session. A failure, empty output, or a
+//    hang refuses the board by name: a plausible-looking wrong value
+//    that a board then watches forever is worse than not starting.
+// 3. `defer=#true` re-derives at EVERY consuming spawn — fresh, and
+//    paid for per spawn. A deferred value may appear only where a
+//    value is consumed at spawn (command argv, script bodies), never
+//    in values parsed at load (trigger, interval, geometry, titles).
+// 4. Normal strings interpolate; raw `#"…"#` strings never do — the
+//    same deal double and single quotes make in a shell.
+// 5. Variables never read the environment and never consult the
+//    `defaults` block: a board's meaning is the board plus its `-v`
+//    flags, nothing ambient.
+
+title "variables"
+
+variables {
+    // A constant, and the -v parameter: `-v limit=8` wins for one run.
+    limit "3"
+    // Once at load, memoized: the repo root, wherever the board runs.
+    root "git rev-parse --show-toplevel" shell=#true
+    // A constant that references a command variable is itself
+    // once-at-load: it cannot be known before `root` has run.
+    readme "{{root}}/README.md"
+    // Deferred: re-derived at every spawn of every pane that
+    // references it, so the pane always answers for the current
+    // moment rather than the moment the board loaded.
+    head "git rev-parse --short HEAD" shell=#true defer=#true
+}
+
+defaults {
+    height 6
+    border "rounded"
+}
+
+pane "log" {
+    // Constants expand wherever they are consumed — the title at
+    // load, the argv element at spawn — and an expansion lands INSIDE
+    // the element that held it, never re-split.
+    title "last {{limit}} commits"
+    command "git" "log" "--oneline" "-{{limit}}"
+}
+
+pane "head" {
+    // A raw string is literal end to end: the braces below reach the
+    // border verbatim, which is how you write the reference SHAPE
+    // without the reference.
+    title #"{{head}} means: re-derived per spawn"#
+    shell #true
+    command "echo now at {{head}}"
+    interval "10s"
+}
+
+pane "readme" {
+    // A derived path is legal at a load-time site because `readme` is
+    // load-tier: the trigger registers once, on the expanded path.
+    title "README (touch it to refresh)"
+    trigger "file:{{readme}}"
+    interval "never"
+    command "head" "-4" "{{readme}}"
+}

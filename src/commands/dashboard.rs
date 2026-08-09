@@ -4,7 +4,7 @@
 
 use anyhow::{Context, bail};
 
-use crate::cli::{CheckArgs, DashboardAction, DashboardArgs};
+use crate::cli::{CheckArgs, DashboardAction, DashboardArgs, InitArgs};
 use crate::color::ColorProfile;
 use crate::commands::watch::{SessionArgs, run_registry};
 use crate::core::dashboard_file::{DashboardFile, SiteAudit, UncheckedSite, load, read_and_parse};
@@ -18,6 +18,7 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
     // title, and no Registry-backed session.
     match args.action {
         Some(DashboardAction::Check(check)) => return check_board(check, profile),
+        Some(DashboardAction::Init(init_args)) => return init(init_args),
         None => {}
     }
     // Honest rather than defensive: `required = true` plus
@@ -257,6 +258,118 @@ const LOOPING_HELP: &[&str] = &[
 ///
 /// `rat dashboard check` reuses this: the same flags must reach the
 /// same verdict there.
+/// Every shipped example, reachable from an installed binary. The
+/// name is the file's stem, so the README's link and the template
+/// name are the same string — the templates ARE the shipped examples,
+/// embedded at compile time because no `examples/` directory exists
+/// after `cargo install`, and self-contained because they run from
+/// wherever `init` lands them.
+struct BoardTemplate {
+    name: &'static str,
+    summary: &'static str,
+    body: &'static str,
+}
+
+const TEMPLATES: &[BoardTemplate] = &[
+    BoardTemplate {
+        name: "panes",
+        summary: "three commands, three cadences, one frame (the default)",
+        body: include_str!("../../examples/panes.kdl"),
+    },
+    // NOT registered: examples/panes-nested.kdl. Its dashboard-in-a-
+    // dashboard pane needs a second board file on disk BY CONSTRUCTION
+    // — that is the feature it demonstrates — so it cannot stand alone
+    // outside a clone. It stays an example; the registry rule is
+    // "every shipped example that is self-contained", applied.
+    BoardTemplate {
+        name: "script",
+        summary: "multi-line script bodies, with and without a #! line",
+        body: include_str!("../../examples/script.kdl"),
+    },
+    BoardTemplate {
+        name: "follow",
+        summary: "a live log follower beside a batch pane",
+        body: include_str!("../../examples/follow.kdl"),
+    },
+    BoardTemplate {
+        name: "tail",
+        summary: "the follower made self-feeding — needs no second terminal",
+        body: include_str!("../../examples/tail.kdl"),
+    },
+    BoardTemplate {
+        name: "tail-windows",
+        summary: "the same board for cmd.exe",
+        body: include_str!("../../examples/tail-windows.kdl"),
+    },
+    BoardTemplate {
+        name: "variables",
+        summary: "the three evaluation forms, and a raw string that stays literal",
+        body: include_str!("../../examples/variables.kdl"),
+    },
+    BoardTemplate {
+        name: "review",
+        summary: "a review console: derived paths, the handoff file, event triggers",
+        body: include_str!("../../examples/review.kdl"),
+    },
+];
+
+/// `panes` because it is the README's own first example: `init` with
+/// no flags produces the board a reader has already seen.
+const DEFAULT_TEMPLATE: &str = "panes";
+
+/// `init` takes no color profile and no palette, deliberately: the
+/// output is a FILE, and a function that cannot see the palette
+/// cannot accidentally style it.
+fn init(args: InitArgs) -> AppResult {
+    if args.list {
+        for template in TEMPLATES {
+            println!("{:<14} {}", template.name, template.summary);
+        }
+        return Ok(());
+    }
+    let name = args.template.as_deref().unwrap_or(DEFAULT_TEMPLATE);
+    let template = TEMPLATES.iter().find(|t| t.name == name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown template {name:?} — the templates are {}",
+            TEMPLATES
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    match &args.output {
+        None => print!("{}", template.body),
+        Some(path) => write_new(path, template.body)?,
+    }
+    Ok(())
+}
+
+/// Write the template, refusing to overwrite: `create_new` checks and
+/// claims in one syscall. No retry suffix, deliberately — the user
+/// NAMED this file, and silently writing a `-2` sibling would hide the
+/// collision behind a path they did not ask for. Overwriting is
+/// `rat dashboard init > board.kdl`, which already means what it says.
+fn write_new(path: &std::path::Path, body: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file
+            .write_all(body.as_bytes())
+            .with_context(|| format!("writing {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "{} already exists — pick another path, or redirect stdout",
+                path.display()
+            )
+        }
+        Err(err) => Err(anyhow::Error::new(err).context(format!("writing {}", path.display()))),
+    }
+}
+
 /// One report row: an `UncheckedSite` from the audit, enriched with
 /// the commands actually responsible. Private to the command layer —
 /// `roots` needs the variable graph, and root-cause tracing is report
@@ -750,6 +863,141 @@ mod tests {
         // The retargeting sentence is a behavior change to keys the
         // shared reference already documents, so it must be stated here.
         assert!(text.contains("scroll keys"), "the retarget is unstated");
+    }
+
+    #[test]
+    fn every_registered_template_validates() {
+        // Over the REGISTRY, so a template added to `init` is a
+        // template this test covers — a hand-copied list drifts the
+        // moment someone adds a row and forgets the other file. Local
+        // to this module because the registry is private and stays so.
+        use crate::core::variables::resolve_partial;
+        assert!(!TEMPLATES.is_empty());
+        for template in TEMPLATES {
+            let file = crate::core::dashboard_kdl::parse_styled(template.body, false)
+                .unwrap_or_else(|err| panic!("{} parses: {err:#}", template.name));
+            // No commands run: a template's shell=#true variables are
+            // Opaque here, exactly as under `rat dashboard check`.
+            let partial = resolve_partial(&file.variables, &Bindings::default());
+            file.audit_sites(&partial)
+                .unwrap_or_else(|err| panic!("{} validates: {err:#}", template.name));
+        }
+    }
+
+    #[test]
+    fn the_review_template_exercises_a_derived_site() {
+        // The positive form of an emptiness check: a blanket
+        // `unchecked.is_empty()` across the registry would forbid the
+        // derived-trigger path this template exists to demonstrate.
+        // Non-empty AND naming `store` proves the demo is still there.
+        use crate::core::variables::resolve_partial;
+        let review = TEMPLATES
+            .iter()
+            .find(|t| t.name == "review")
+            .expect("registered");
+        let file = crate::core::dashboard_kdl::parse_styled(review.body, false).expect("parses");
+        let partial = resolve_partial(&file.variables, &Bindings::default());
+        let audit = file.audit_sites(&partial).expect("validates");
+        assert!(
+            !audit.unchecked.is_empty(),
+            "the derived-site demo was removed"
+        );
+        assert!(
+            audit
+                .unchecked
+                .iter()
+                .any(|site| site.blockers.iter().any(|b| b == "sel" || b == "store")),
+            "the skip traces to the derived store: {:?}",
+            audit.unchecked
+        );
+    }
+
+    #[test]
+    fn no_template_carries_a_private_reference() {
+        // Assembled rather than written: this file ships in the public
+        // repo, and a literal here would be the very leak the
+        // assertion forbids. Each fragment is inert on its own; only
+        // the concatenation matches.
+        assert!(!TEMPLATES.is_empty());
+        let bare = [["gum", "bo"].concat(), ["point", "break"].concat()];
+        let paths = ["/users/", "c:\\users", "plans/"];
+        for template in TEMPLATES {
+            let hay = template.body.to_lowercase();
+            for token in &bare {
+                assert!(
+                    !hay.contains(token.as_str()),
+                    "{} leaks a private name",
+                    template.name
+                );
+                assert!(
+                    !hay.contains(&format!(".{token}")),
+                    "{} leaks a private path",
+                    template.name
+                );
+            }
+            for needle in paths {
+                assert!(!hay.contains(needle), "{} leaks {needle:?}", template.name);
+            }
+        }
+    }
+
+    #[test]
+    fn no_template_assumes_it_lives_in_a_clone() {
+        // Scanned over the PARSED board, never the raw bytes: every
+        // example's header comment carries its own
+        // `rat dashboard examples/…` run line, which documents where
+        // the file lives — a repo-relative path in a COMMAND value is
+        // the runtime dependency this forbids. `panes-nested` is the
+        // one real violator, which is why it is excluded from the
+        // registry rather than rewritten.
+        let mut values_scanned = 0usize;
+        for template in TEMPLATES {
+            let file = crate::core::dashboard_kdl::parse_styled(template.body, false)
+                .unwrap_or_else(|err| panic!("{} parses: {err:#}", template.name));
+            for decl in file.panes.iter().chain(std::iter::once(&file.defaults)) {
+                let mut check_value = |value: &crate::core::template::Template| {
+                    values_scanned += 1;
+                    assert!(
+                        !value.as_str().contains("examples/"),
+                        "{} reaches into the repository: {:?}",
+                        template.name,
+                        value.as_str()
+                    );
+                };
+                for value in decl.command.iter().flatten() {
+                    check_value(value);
+                }
+                for value in decl.trigger.iter().flatten() {
+                    check_value(value);
+                }
+                if let Some(body) = &decl.script {
+                    check_value(body);
+                }
+            }
+        }
+        // The presence anchor: a parse that yielded nothing to check
+        // would satisfy the loop vacuously.
+        assert!(values_scanned > 0, "no command values were scanned");
+    }
+
+    #[test]
+    fn every_template_name_is_unique_and_the_default_exists() {
+        let mut seen: Vec<&str> = Vec::new();
+        for template in TEMPLATES {
+            assert!(
+                !seen.contains(&template.name),
+                "duplicate {}",
+                template.name
+            );
+            assert!(!template.body.is_empty(), "{} is empty", template.name);
+            assert!(
+                !template.summary.is_empty(),
+                "{} has no summary",
+                template.name
+            );
+            seen.push(template.name);
+        }
+        assert!(seen.contains(&DEFAULT_TEMPLATE), "the default resolves");
     }
 
     #[test]

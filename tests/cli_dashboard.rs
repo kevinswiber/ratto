@@ -2561,3 +2561,178 @@ fn a_board_named_check_is_reachable_by_path() {
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
     assert!(stdout.contains("board-named-check"), "{stdout}");
 }
+
+// ─── rat dashboard init ─────────────────────────────────────────────
+
+#[test]
+fn init_writes_a_board_to_stdout() {
+    // Bare `rat dashboard init` exits 1 TODAY (it reads `init` as a
+    // filename), so the exit code alone is a vacuous red — the stdout
+    // content is the assertion.
+    let assert = rat().args(["dashboard", "init"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("pane "), "{stdout}");
+}
+
+#[test]
+fn the_written_board_is_one_rat_can_run() {
+    // init and check prove each other.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("board.kdl");
+    let assert = rat().args(["dashboard", "init"]).assert().success();
+    std::fs::write(&out, &assert.get_output().stdout).expect("write");
+    rat()
+        .args(["dashboard", "check", &out.display().to_string()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn list_names_every_template() {
+    let assert = rat()
+        .args(["dashboard", "init", "--list"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    for name in ["panes", "variables", "review"] {
+        assert!(
+            stdout.lines().any(|line| line.starts_with(name)),
+            "{name} listed: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_template_lists_the_accepted_names() {
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "init", "--template", "nope"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("nope"))
+        .stderr(predicates::str::contains("panes"));
+}
+
+#[test]
+fn output_writes_the_file_and_says_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("board.kdl");
+    rat()
+        .args(["dashboard", "init", "--output", &out.display().to_string()])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_empty());
+    // The presence anchor for the empty stdout: the bytes landed in
+    // the file instead.
+    let written = std::fs::read_to_string(&out).expect("the file exists");
+    assert!(written.contains("pane "), "{written}");
+}
+
+#[test]
+fn output_refuses_to_overwrite_and_leaves_the_file_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("board.kdl");
+    std::fs::write(&out, "keep-me").expect("seed");
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "init", "--output", &out.display().to_string()])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("board.kdl"));
+    // The byte assertion is the point, not the exit code.
+    assert_eq!(
+        std::fs::read_to_string(&out).expect("still there"),
+        "keep-me"
+    );
+}
+
+#[test]
+fn the_review_template_declares_its_variables() {
+    let assert = rat()
+        .args(["dashboard", "init", "--template", "review"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("variables {"), "{stdout}");
+    assert!(stdout.contains("shell=#true"), "{stdout}");
+    assert!(stdout.contains("defer=#true"), "{stdout}");
+}
+
+#[test]
+fn the_review_template_names_the_handoff_file() {
+    let assert = rat()
+        .args(["dashboard", "init", "--template", "review"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("handoff file"), "{stdout}");
+}
+
+#[test]
+fn the_review_template_ships_no_syntax_this_release_cannot_parse() {
+    // What keeps the commented action half commented.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("review.kdl");
+    let assert = rat()
+        .args(["dashboard", "init", "--template", "review"])
+        .assert()
+        .success();
+    std::fs::write(&out, &assert.get_output().stdout).expect("write");
+    rat()
+        .args(["dashboard", "check", &out.display().to_string()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn init_is_plain_text_under_every_profile() {
+    // A declaration file is bytes for a file, never a frame — even a
+    // FORCED color profile must not reach it. The presence anchor:
+    // bytes were actually produced.
+    for (key, value) in [("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")] {
+        let assert = rat()
+            .env(key, value)
+            .args(["dashboard", "init"])
+            .assert()
+            .success();
+        let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+        assert!(stdout.contains("pane "), "{stdout}");
+        assert!(!stdout.contains('\u{1b}'), "{key}: {stdout}");
+    }
+}
+
+#[test]
+fn every_template_checks_clean_from_an_unrelated_directory() {
+    // The LOAD gate, not a self-containment gate: check runs nothing,
+    // and even a real run exits 0 with a missing inner board (a pane
+    // failure renders in its own box). The static value-site scan is
+    // the self-containment gate, and it lives beside the registry.
+    let list = rat()
+        .args(["dashboard", "init", "--list"])
+        .assert()
+        .success();
+    let names: Vec<String> = String::from_utf8_lossy(&list.get_output().stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect();
+    assert!(!names.is_empty(), "the registry is non-empty");
+    let dir = tempfile::tempdir().expect("a directory outside the repo");
+    for name in names {
+        let out = dir.path().join(format!("{name}.kdl"));
+        rat()
+            .args([
+                "dashboard",
+                "init",
+                "--template",
+                &name,
+                "--output",
+                &out.display().to_string(),
+            ])
+            .assert()
+            .success();
+        rat()
+            .args(["dashboard", "check", &out.display().to_string()])
+            .assert()
+            .success();
+    }
+}

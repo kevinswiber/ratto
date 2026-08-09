@@ -556,6 +556,21 @@ pub struct DashboardArgs {
 pub enum DashboardAction {
     /// Validate a declaration file without running anything in it
     Check(CheckArgs),
+    /// Write a starter declaration file to stdout or a path
+    Init(InitArgs),
+}
+
+#[derive(clap::Args)]
+pub struct InitArgs {
+    /// Which starter board to write (default: panes)
+    #[arg(long, value_name = "NAME", conflicts_with = "list")]
+    pub template: Option<String>,
+    /// Write to this path instead of stdout; refuses to overwrite
+    #[arg(long, short = 'o', value_name = "PATH", conflicts_with = "list")]
+    pub output: Option<std::path::PathBuf>,
+    /// List the available templates and exit
+    #[arg(long)]
+    pub list: bool,
 }
 
 #[derive(clap::Args)]
