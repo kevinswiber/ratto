@@ -4402,7 +4402,7 @@ fn live_notice(
     hidden: usize,
     time_seg: &str,
     dropped: Option<&str>,
-    focus_seg: Option<&str>,
+    tail_seg: Option<&str>,
 ) -> String {
     let mut row = if hidden > 0 {
         format!("… {hidden} more lines · {time_seg}")
@@ -4413,9 +4413,9 @@ fn live_notice(
         row.push_str(" · ");
         row.push_str(dropped);
     }
-    if let Some(focus) = focus_seg {
+    if let Some(seg) = tail_seg {
         row.push_str(" · ");
-        row.push_str(focus);
+        row.push_str(seg);
     }
     row
 }
@@ -4442,7 +4442,7 @@ fn repaint(
     profile: ColorProfile,
     history: &History,
 ) -> anyhow::Result<PaintKey> {
-    let focus_seg = tail.text.as_deref();
+    let tail_seg = tail.text.as_deref();
     let age_secs = displayed_age_key(
         pause,
         live_scroll,
@@ -4540,7 +4540,7 @@ fn repaint(
         &mark_cell,
         &solid_mark,
         live.dropped.as_deref(),
-        focus_seg,
+        tail_seg,
     )?;
     Ok(key)
 }
@@ -4836,7 +4836,7 @@ fn paint_frame(
     mark_cell: &str,
     solid_mark: &str,
     dropped: Option<&str>,
-    focus_seg: Option<&str>,
+    tail_seg: Option<&str>,
 ) -> anyhow::Result<()> {
     let kept = frame_rows(
         lines,
@@ -4856,7 +4856,7 @@ fn paint_frame(
         mark_cell,
         solid_mark,
         dropped,
-        focus_seg,
+        tail_seg,
     );
     renderer.draw(&kept, size.0).context("writing frame")?;
     Ok(())
@@ -4884,7 +4884,7 @@ fn frame_rows(
     mark_cell: &str,
     solid_mark: &str,
     dropped: Option<&str>,
-    focus_seg: Option<&str>,
+    tail_seg: Option<&str>,
 ) -> Vec<String> {
     let (cols, rows) = size;
     // Fullscreen pins the status row to the bottom screen row and
@@ -4973,9 +4973,9 @@ fn frame_rows(
             // in the same trailing position the live row uses.
             let mut row =
                 scrolled_notice(time_seg_live, live_tail, offset, kept.len(), lines.len());
-            if let Some(focus) = focus_seg {
+            if let Some(seg) = tail_seg {
                 row.push_str(" · ");
-                row.push_str(focus);
+                row.push_str(seg);
             }
             row
         }
@@ -4983,7 +4983,7 @@ fn frame_rows(
             hidden,
             &format!("{time_seg_live}{live_tail}"),
             dropped,
-            focus_seg,
+            tail_seg,
         ),
     };
     kept.push(faint.render(&status, profile));
