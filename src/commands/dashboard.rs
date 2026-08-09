@@ -130,7 +130,7 @@ fn pane_help(registry: &Registry) -> Vec<String> {
 const PANE_GESTURE_HELP: &[&str] = &[
     "",
     "  pane gestures (while the frame is live — not the `live` label):",
-    "    Tab, BackTab     cycle focus between focusable panes — a zoom rides along",
+    "    Tab, BackTab     cycle focus between panes — a zoom rides along",
     "    Alt-h/j/k/l      move focus directionally",
     "    Alt-1..9         jump straight to a numbered focusable pane",
     "    Esc              unzoom, then drop focus, then the frame scroll",
@@ -440,8 +440,7 @@ mod tests {
                 "    b  every 5s".to_string(),
                 String::new(),
                 "  pane gestures (while the frame is live — not the `live` label):".to_string(),
-                "    Tab, BackTab     cycle focus between focusable panes — a zoom rides along"
-                    .to_string(),
+                "    Tab, BackTab     cycle focus between panes — a zoom rides along".to_string(),
                 "    Alt-h/j/k/l      move focus directionally".to_string(),
                 "    Alt-1..9         jump straight to a numbered focusable pane".to_string(),
                 "    Esc              unzoom, then drop focus, then the frame scroll".to_string(),
