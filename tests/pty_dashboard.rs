@@ -5277,3 +5277,335 @@ fn the_dispositions_hold_on_a_frame_scrolled_board() {
         "dashboard should have exited on q"
     );
 }
+
+/// A one-pane board with one CONFIRMED counting binding on `r`.
+fn confirm_board(counter: &std::path::Path) -> String {
+    format!(
+        "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+         key \"r\" {{\n    description \"guarded count\"\n    confirm \"Really run it?\"\n    command \"{counter_cmd}\"\n}}\n\n\
+         pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+        counter_cmd = counter_cmd(counter),
+    )
+}
+
+/// The affirmative half of the protocol: the question paints, `y` runs
+/// the command, exactly once.
+#[test]
+fn a_confirmed_binding_runs_after_y() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &confirm_board(&counter));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"Really run it?",
+            Duration::from_secs(5)
+        ),
+        "the question never painted"
+    );
+    session.write_bytes(b"y");
+    wait_for_counter(&counter, 1);
+    assert_counter_settled_at(&counter, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The negative half, presence-anchored: the cancellation line proves
+/// the whole chain ran and THEN declined — a counter at zero alone is
+/// satisfied by a board that never started.
+#[test]
+fn a_declined_binding_never_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &confirm_board(&counter));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"Really run it?",
+            Duration::from_secs(5)
+        ),
+        "the question never painted"
+    );
+    session.write_bytes(b"n");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`r` cancelled"],
+        Duration::from_secs(5),
+    );
+    assert_counter_settled_at(&counter, 0);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The reason the question lives on the STATUS row: it survives pane
+/// repaints. Shape (b) — after several ticks, `y` still runs the
+/// command, proving the gate was still pending; the lane itself is
+/// pinned by the unit test beside `focus_segment`.
+#[test]
+fn the_question_survives_a_pane_tick() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let fast = dir.path().join("fast");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"guarded count\"\n    confirm \"Still here?\"\n    command \"{counter_cmd}\"\n}}\n\n\
+             pane \"fast\" {{\n    interval \"100ms\"\n    command \"{fast_cmd}\"\n}}\n",
+            counter_cmd = counter_cmd(&counter),
+            fast_cmd = labeled_counter_cmd(&fast, "fast"),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"fast-1", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"Still here?",
+            Duration::from_secs(5)
+        ),
+        "the question never painted"
+    );
+    // Several pane ticks go by with the question pending.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"fast-4", b"fast-6"],
+        Duration::from_secs(8),
+    );
+    session.write_bytes(b"y");
+    wait_for_counter(&counter, 1);
+    assert_counter_settled_at(&counter, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The escape hatch that must never be conditional: Ctrl-C falls
+/// through the intercept and still aborts while a question is pending.
+#[test]
+fn ctrl_c_still_aborts_while_a_confirm_is_pending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &confirm_board(&counter));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"Really run it?",
+            Duration::from_secs(5)
+        ),
+        "the question never painted"
+    );
+    session.write_bytes(b"\x03");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !session.exited() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Ctrl-C was swallowed by the pending confirm"
+        );
+        let _ = session.read_available(Duration::from_millis(50));
+    }
+    assert_counter_settled_at(&counter, 0);
+}
+
+/// One activation in the gate: a second binding key cancels the pending
+/// one and starts NOTHING — it does not queue, and it does not arm a
+/// second question.
+#[test]
+fn a_second_binding_key_cancels_and_starts_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"one\"\n    confirm \"First question?\"\n    command \"{first_cmd}\"\n}}\n\n\
+             key \"e\" {{\n    description \"two\"\n    confirm \"Second question?\"\n    command \"{second_cmd}\"\n}}\n\n\
+             pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+            first_cmd = counter_cmd(&first),
+            second_cmd = counter_cmd(&second),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"First question?",
+            Duration::from_secs(5)
+        ),
+        "the first question never painted"
+    );
+    session.write_bytes(b"e");
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`r` cancelled"],
+        Duration::from_secs(5),
+    );
+    assert!(
+        !contains(&seen, b"Second question?"),
+        "a second question was armed: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert_counter_settled_at(&first, 0);
+    assert_counter_settled_at(&second, 0);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The non-rest arm: the confirm's both edges — the question and the
+/// affirmative run — work from a FRAME-SCROLLED board.
+#[test]
+fn a_confirm_works_from_a_frame_scrolled_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"guarded count\"\n    confirm \"From down here?\"\n    command \"{counter_cmd}\"\n}}\n\n\
+             pane \"a\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n\
+             pane \"b\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}}\n",
+            counter_cmd = counter_cmd(&counter),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(3)),
+        "the frame never scrolled — the binding would press at live rest"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"From down here?",
+            Duration::from_secs(5)
+        ),
+        "the question never painted on the scrolled row"
+    );
+    session.write_bytes(b"y");
+    wait_for_counter(&counter, 1);
+    assert_counter_settled_at(&counter, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The non-regression that keeps the gate from becoming mandatory: no
+/// `confirm`, no question, one press runs it.
+#[test]
+fn no_confirm_means_no_gate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &binding_board(&counter, true, ""));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"x");
+    wait_for_counter(&counter, 1);
+    let settled = drain_for(&session, Duration::from_millis(400));
+    assert!(
+        !contains(&settled, b"[y/N]"),
+        "a question appeared for an unconfirmed binding: {:?}",
+        String::from_utf8_lossy(&settled)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}

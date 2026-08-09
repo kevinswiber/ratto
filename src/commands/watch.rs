@@ -620,6 +620,14 @@ pub(crate) fn run_registry(
     let mut live: Option<Live> = None;
     let mut pause: Option<PauseState> = None;
     let mut live_scroll: Option<LiveScroll> = None;
+    // The ONE activation currently in its gate. `None` means the
+    // keyboard is free. Transient UI state, in the same family as
+    // `pause`, `live_scroll`, `PaneView` and the in-flight
+    // `VerifyState`: it holds which binding is waiting for an answer
+    // and nothing about the world. It is NOT the state the scope rule
+    // forbids — that rule is about the state a COMMAND mutates, which
+    // ratto still never owns. Discarded the moment the answer arrives.
+    let mut gate: Option<Gate> = None;
     let mut history = History::new();
     // `append && interactive` ⟺ append && !once (append implies
     // is_tty), and live_suffix returns "" under --once — so this also
@@ -1188,7 +1196,7 @@ pub(crate) fn run_registry(
                         &palette,
                         view,
                         panes.key(),
-                        focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                        focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref()).as_deref(),
                         None,
                         size,
                         session.max_height,
@@ -1444,7 +1452,7 @@ pub(crate) fn run_registry(
                     &palette,
                     view,
                     panes.key(),
-                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                    focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref()).as_deref(),
                     (!notices.is_empty()).then(|| notices.join(" · ")),
                     crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
@@ -1526,7 +1534,7 @@ pub(crate) fn run_registry(
                     &palette,
                     view,
                     panes.key(),
-                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                    focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref()).as_deref(),
                     None,
                     size,
                     session.max_height,
@@ -1668,7 +1676,7 @@ pub(crate) fn run_registry(
                     &palette,
                     view,
                     panes.key(),
-                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                    focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref()).as_deref(),
                     None,
                     crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
@@ -1773,13 +1781,89 @@ pub(crate) fn run_registry(
                     let action = match event {
                         TapEvent::Key(key) => {
                             let mode = mode_of(pause.as_ref(), live_scroll);
-                            let action = resolve_page_or_zoom(action_for(key, mode), mode, &panes);
-                            let action = resolve_esc(action, &panes);
-                            // Last in the chain, and it reads that way
-                            // for a reason: it fires only on a declined
-                            // key, so a built-in has already had every
-                            // chance to answer.
-                            resolve_binding(action, mode, key, &session.bindings)
+                            // The gate's own dispatch, BEFORE the shared
+                            // match — the same position and the same
+                            // reason as append mode's: while a question
+                            // is pending the built-in table must not
+                            // also answer, or one press would have two
+                            // effects. Ctrl-C is the ONE key that falls
+                            // through, deliberately: it is the abort,
+                            // and an escape hatch a mode can disable is
+                            // one that can wedge a terminal.
+                            let pending = gate
+                                .as_ref()
+                                .map(|Gate::Confirming { binding, .. }| *binding);
+                            let answered = pending
+                                .filter(|_| confirm_answer(key) != ConfirmAnswer::FallThrough);
+                            if let Some(index) = answered {
+                                gate = None;
+                                let notice = if confirm_answer(key) == ConfirmAnswer::Confirm {
+                                    let activation = ActivationId(next_activation);
+                                    next_activation += 1;
+                                    launch_activation(
+                                        &session.bindings[index],
+                                        index,
+                                        activation,
+                                        &session.variables,
+                                        &scripts,
+                                        palette.appearance,
+                                        &tx,
+                                    );
+                                    None
+                                } else {
+                                    // Cancelled: consumed, never
+                                    // re-dispatched — one key, one
+                                    // effect. Composed through the one
+                                    // closed report kind.
+                                    let width =
+                                        crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+                                    action_line(
+                                        &session.bindings[index],
+                                        ActionReport::Cancelled,
+                                        width,
+                                    )
+                                };
+                                // Repaint at the edge: the row changes
+                                // NOW, not on the next pane tick.
+                                if let Some(l) = live.as_ref() {
+                                    let size = crossterm::terminal::size().unwrap_or((80, 24));
+                                    previous_key = Some(repaint(
+                                        &mut renderer,
+                                        pause.as_ref(),
+                                        live_scroll,
+                                        l,
+                                        &live_tail,
+                                        &palette,
+                                        view,
+                                        panes.key(),
+                                        focus_segment(
+                                            &registry,
+                                            &runtime,
+                                            &geom,
+                                            &panes,
+                                            gate.as_ref(),
+                                        )
+                                        .as_deref(),
+                                        notice,
+                                        size,
+                                        session.max_height,
+                                        fullscreen,
+                                        &faint,
+                                        profile,
+                                        &history,
+                                    )?);
+                                }
+                                WatchAction::Ignore
+                            } else {
+                                let action =
+                                    resolve_page_or_zoom(action_for(key, mode), mode, &panes);
+                                let action = resolve_esc(action, &panes);
+                                // Last in the chain, and it reads that
+                                // way for a reason: it fires only on a
+                                // declined key, so a built-in has
+                                // already had every chance to answer.
+                                resolve_binding(action, mode, key, &session.bindings)
+                            }
                         }
                         // Gated on LIVE capture, not just the flag: a
                         // terminal that keeps reporting after a release
@@ -1865,7 +1949,14 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                    focus_segment(
+                                        &registry,
+                                        &runtime,
+                                        &geom,
+                                        &panes,
+                                        gate.as_ref(),
+                                    )
+                                    .as_deref(),
                                     pager_notice,
                                     size,
                                     session.max_height,
@@ -1926,7 +2017,14 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                    focus_segment(
+                                        &registry,
+                                        &runtime,
+                                        &geom,
+                                        &panes,
+                                        gate.as_ref(),
+                                    )
+                                    .as_deref(),
                                     None,
                                     size,
                                     session.max_height,
@@ -1980,7 +2078,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2012,7 +2111,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2048,7 +2148,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2104,7 +2205,14 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                    focus_segment(
+                                        &registry,
+                                        &runtime,
+                                        &geom,
+                                        &panes,
+                                        gate.as_ref(),
+                                    )
+                                    .as_deref(),
                                     None,
                                     size,
                                     session.max_height,
@@ -2142,7 +2250,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2208,7 +2317,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2279,7 +2389,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2360,7 +2471,14 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                    focus_segment(
+                                        &registry,
+                                        &runtime,
+                                        &geom,
+                                        &panes,
+                                        gate.as_ref(),
+                                    )
+                                    .as_deref(),
                                     None,
                                     size,
                                     session.max_height,
@@ -2446,7 +2564,14 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                    focus_segment(
+                                        &registry,
+                                        &runtime,
+                                        &geom,
+                                        &panes,
+                                        gate.as_ref(),
+                                    )
+                                    .as_deref(),
                                     None,
                                     size,
                                     session.max_height,
@@ -2527,7 +2652,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2638,7 +2764,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2675,7 +2802,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 Some(text.to_string()),
                                 size,
                                 session.max_height,
@@ -2705,7 +2833,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 Some(text),
                                 size,
                                 session.max_height,
@@ -2722,41 +2851,59 @@ pub(crate) fn run_registry(
                         // the simplest thing that can work: resolve,
                         // build, launch, forget.
                         WatchAction::RunBinding(index) => {
+                            // ONE decision point: the ordered gate —
+                            // when, confirm — encloses this; today the
+                            // confirm is the whole of it.
                             let binding = &session.bindings[index];
-                            let activation = ActivationId(next_activation);
-                            next_activation += 1;
-                            let spawned = resolve_action(
-                                binding,
-                                index,
-                                activation,
-                                &session.variables,
-                                &scripts,
-                                palette.appearance,
-                            )
-                            .and_then(|spawn| {
-                                spawn_action(
-                                    spawn,
-                                    activation,
-                                    index,
-                                    ActionRung::Command,
-                                    tx.clone(),
-                                    retention_for_action(),
-                                )
-                            });
-                            if let Err(err) = spawned {
-                                // The failure reaches a reader through
-                                // the disposition path rather than
-                                // vanishing — the same shape a live
-                                // worker the OS refused takes.
-                                let _ = tx.send(TickEvent::ActionDone(ActionOutcome {
-                                    activation,
+                            if binding.confirm.is_some() {
+                                let width =
+                                    crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+                                gate = Some(Gate::Confirming {
                                     binding: index,
-                                    rung: ActionRung::Command,
-                                    stdout: Vec::new(),
-                                    stderr: Vec::new(),
-                                    result: ActionResult::NotStarted(err),
-                                    dropped: 0,
-                                }));
+                                    question: confirm_question(binding, width),
+                                });
+                                // Repaint at the edge: the question
+                                // appears NOW, not on the next tick.
+                                if let Some(l) = live.as_ref() {
+                                    let size = crossterm::terminal::size().unwrap_or((80, 24));
+                                    previous_key = Some(repaint(
+                                        &mut renderer,
+                                        pause.as_ref(),
+                                        live_scroll,
+                                        l,
+                                        &live_tail,
+                                        &palette,
+                                        view,
+                                        panes.key(),
+                                        focus_segment(
+                                            &registry,
+                                            &runtime,
+                                            &geom,
+                                            &panes,
+                                            gate.as_ref(),
+                                        )
+                                        .as_deref(),
+                                        None,
+                                        size,
+                                        session.max_height,
+                                        fullscreen,
+                                        &faint,
+                                        profile,
+                                        &history,
+                                    )?);
+                                }
+                            } else {
+                                let activation = ActivationId(next_activation);
+                                next_activation += 1;
+                                launch_activation(
+                                    binding,
+                                    index,
+                                    activation,
+                                    &session.variables,
+                                    &scripts,
+                                    palette.appearance,
+                                    &tx,
+                                );
                             }
                         }
                         WatchAction::Ignore => {}
@@ -2796,7 +2943,8 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
+                                    .as_deref(),
                                 debug_notice,
                                 size,
                                 session.max_height,
@@ -4762,6 +4910,43 @@ fn resolve_spawn<'a>(
     Ok(ResolvedSpawn { program, script })
 }
 
+/// Resolve, build, launch, forget — one activation past its gate. A
+/// failure to even start reaches the reader through the disposition
+/// path rather than vanishing — the same shape a live worker the OS
+/// refused takes.
+fn launch_activation(
+    binding: &KeyBinding,
+    index: usize,
+    activation: ActivationId,
+    vars: &SpawnVariables,
+    scripts: &ScriptFiles,
+    appearance: Appearance,
+    tx: &std::sync::mpsc::Sender<TickEvent>,
+) {
+    let spawned =
+        resolve_action(binding, index, activation, vars, scripts, appearance).and_then(|spawn| {
+            spawn_action(
+                spawn,
+                activation,
+                index,
+                ActionRung::Command,
+                tx.clone(),
+                retention_for_action(),
+            )
+        });
+    if let Err(err) = spawned {
+        let _ = tx.send(TickEvent::ActionDone(ActionOutcome {
+            activation,
+            binding: index,
+            rung: ActionRung::Command,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            result: ActionResult::NotStarted(err),
+            dropped: 0,
+        }));
+    }
+}
+
 /// Resolve one activation's program — the binding sibling of
 /// `resolve_spawn`: derive the deferred variables this activation
 /// actually references, expand every element against that map, write a
@@ -5545,6 +5730,62 @@ fn pane_body(
 /// The chrome row's failure badge: a nonzero exit, and nothing else. A
 /// spawn error's text IS the body, so it carries no badge; a successful
 /// tick returns `None`, which is how the badge clears.
+/// The ONE activation currently in its gate — see the loop-local
+/// `gate` field for why this state is legitimate. The precondition
+/// rung gives this enum its other arms and owns the ordering; do not
+/// add a second pending-activation field beside it, or "one activation
+/// at a time" stops being a guarantee.
+enum Gate {
+    /// The question is on the status row; the next KEY decides.
+    Confirming {
+        binding: usize,
+        /// Composed at arming, clip and all, so the status-row lane
+        /// carries text and never calls a composer.
+        question: String,
+    },
+}
+
+/// What one key means to a pending confirm.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ConfirmAnswer {
+    Confirm,
+    Cancel,
+    /// Not intercepted at all — `Ctrl-C` only, deliberately: it is the
+    /// abort, and an escape hatch a mode can disable is one that can
+    /// wedge a terminal.
+    FallThrough,
+}
+
+/// The confirm protocol: only `y`/`Y` affirms — a confirm is a guard,
+/// so the set of keys that mean "yes" is as small as it can be — and
+/// everything else cancels and is CONSUMED, never re-dispatched (one
+/// key, one effect). `Enter` deliberately does not confirm: it is
+/// `PageOrZoom`, a key readers press reflexively on this board, and if
+/// it also confirmed, the muscle memory that zooms a pane would fire a
+/// destructive action.
+fn confirm_answer(key: Key) -> ConfirmAnswer {
+    match key {
+        Key::Char('y') | Key::Char('Y') => ConfirmAnswer::Confirm,
+        Key::CtrlC => ConfirmAnswer::FallThrough,
+        _ => ConfirmAnswer::Cancel,
+    }
+}
+
+/// The status-row question for one pending confirm: the binding, the
+/// author's text verbatim, and the protocol — which the reader cannot
+/// guess and the `?` table does not teach, so the clip takes the
+/// QUESTION and never the `[y/N]`.
+fn confirm_question(binding: &KeyBinding, width: usize) -> String {
+    const PROTOCOL: &str = " [y/N]";
+    let head = format!(
+        "confirm {}: {}",
+        action_label(binding),
+        binding.confirm.as_deref().unwrap_or_default()
+    );
+    let budget = width.saturating_sub(crate::core::measure::display_width(PROTOCOL));
+    format!("{}{PROTOCOL}", truncate_display(&head, budget, "…"))
+}
+
 /// What is being reported about an action. A CLOSED kind, so the set
 /// of things that can be said about a binding is enumerable by the
 /// compiler rather than by hand.
@@ -5566,7 +5807,6 @@ enum ActionReport<'a> {
     #[allow(dead_code)] // The gate constructs this next; the composer already speaks it.
     Declined { rung: Rung, detail: Option<&'a str> },
     /// The reader answered a confirm with anything but `y`.
-    #[allow(dead_code)] // The confirm gate constructs this next.
     Cancelled,
     /// A binding key arrived while another activation held the gate.
     #[allow(dead_code)] // The gate constructs this next.
@@ -5911,36 +6151,48 @@ fn focus_segment(
     runtime: &[SourceRuntime],
     geom: &[PaneGeometry],
     view: &PaneView,
+    gate: Option<&Gate>,
 ) -> Option<String> {
-    let id = view.focus?;
-    let mut seg = format!("focus {}", pane_display_name(registry, id));
-    // D5: a `chrome = #false` pane is scrollable and has nowhere on
-    // itself to say where its window is, so the footer says it. A
-    // chromed pane already carries the badge, and saying it twice would
-    // move the footer for something the reader can already see.
-    if let Some(pane) = registry.pane(id)
-        && !pane.chrome
-        && let Some(badge) = pane_scroll_badge(
-            view.scroll[id.0],
-            pane.overflow,
-            runtime[id.0].output.as_ref().map_or(0, Vec::len),
-            geom[id.0].inner_rows as usize,
-        )
-    {
-        seg.push_str(" · ");
-        seg.push_str(&badge);
+    let mut segments: Vec<String> = Vec::new();
+    if let Some(id) = view.focus {
+        let mut seg = format!("focus {}", pane_display_name(registry, id));
+        // D5: a `chrome = #false` pane is scrollable and has nowhere on
+        // itself to say where its window is, so the footer says it. A
+        // chromed pane already carries the badge, and saying it twice
+        // would move the footer for something the reader can already
+        // see.
+        if let Some(pane) = registry.pane(id)
+            && !pane.chrome
+            && let Some(badge) = pane_scroll_badge(
+                view.scroll[id.0],
+                pane.overflow,
+                runtime[id.0].output.as_ref().map_or(0, Vec::len),
+                geom[id.0].inner_rows as usize,
+            )
+        {
+            seg.push_str(" · ");
+            seg.push_str(&badge);
+        }
+        // The same D5 rule for the zoom cursor: a chrome-less pane
+        // has nowhere on itself to say where the zoom cycle stands.
+        if view.zoomed == Some(id)
+            && let Some(pane) = registry.pane(id)
+            && !pane.chrome
+            && let Composition::Panes { layout, .. } = registry.composition()
+        {
+            seg.push_str(" · ");
+            seg.push_str(&zoom_badge(&focus_order(registry, layout), id));
+        }
+        segments.push(seg);
     }
-    // The same D5 rule for the zoom cursor: a chrome-less pane has
-    // nowhere on itself to say where the zoom cycle stands.
-    if view.zoomed == Some(id)
-        && let Some(pane) = registry.pane(id)
-        && !pane.chrome
-        && let Composition::Panes { layout, .. } = registry.composition()
-    {
-        seg.push_str(" · ");
-        seg.push_str(&zoom_badge(&focus_order(registry, layout), id));
+    // The pending question rides the same lane — a STATE on the state
+    // surface, so it survives every repaint until answered — and it
+    // does NOT depend on a focused pane: a reader can arm a confirm
+    // with nothing focused at all.
+    if let Some(Gate::Confirming { question, .. }) = gate {
+        segments.push(question.clone());
     }
-    Some(seg)
+    (!segments.is_empty()).then(|| segments.join(" · "))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7423,10 +7675,13 @@ mod tests {
         let runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
         let geom = registry.geometry((80, 24));
         let mut panes = PaneView::new(registry.len());
-        assert_eq!(focus_segment(&registry, &runtime, &geom, &panes), None);
+        assert_eq!(
+            focus_segment(&registry, &runtime, &geom, &panes, None),
+            None
+        );
         panes.focus = Some(SourceId(1));
         assert_eq!(
-            focus_segment(&registry, &runtime, &geom, &panes),
+            focus_segment(&registry, &runtime, &geom, &panes, None),
             Some("focus right".to_string())
         );
     }
@@ -12584,5 +12839,103 @@ mod tests {
         .expect("a failure speaks");
         assert!(line.contains("boom"), "{line}");
         assert!(!line.contains("\x1b["), "stripped: {line:?}");
+    }
+    // ─── The confirm gate ───────────────────────────────────────────
+
+    /// The whole closed key vocabulary, for protocol matrices: the
+    /// spellable universe plus the members no board can name.
+    fn key_vocabulary() -> Vec<Key> {
+        crate::core::key_spelling::ascii_spellable()
+            .into_iter()
+            .chain([
+                Key::CtrlA,
+                Key::CtrlC,
+                Key::CtrlE,
+                Key::CtrlU,
+                Key::CtrlW,
+                Key::Backspace,
+                Key::Delete,
+            ])
+            .collect()
+    }
+
+    #[test]
+    fn a_pending_confirm_answers_yes_to_y_and_cancels_everything_else() {
+        // Enumerated over the vocabulary, never sampled: a "no key
+        // does the wrong thing" claim needs the matrix.
+        for key in key_vocabulary() {
+            let want = match key {
+                Key::Char('y') | Key::Char('Y') => ConfirmAnswer::Confirm,
+                Key::CtrlC => ConfirmAnswer::FallThrough,
+                _ => ConfirmAnswer::Cancel,
+            };
+            assert_eq!(confirm_answer(key), want, "{key:?}");
+        }
+    }
+
+    /// A REGRESSION NAME: the assertion a future "make Enter work like
+    /// it does everywhere else" change must trip over. `Enter` is
+    /// `PageOrZoom` — a key readers press reflexively on this board —
+    /// and if it also confirmed, the muscle memory that zooms a pane
+    /// would fire a destructive action.
+    #[test]
+    fn enter_does_not_confirm() {
+        assert_eq!(confirm_answer(Key::Enter), ConfirmAnswer::Cancel);
+    }
+
+    #[test]
+    fn the_pending_question_names_the_binding_and_the_protocol() {
+        let mut binding = declared_binding(Key::Char('e'));
+        binding.confirm = Some("Run the full suite?".to_string());
+        let question = confirm_question(&binding, 120);
+        assert!(question.contains("`e`"), "{question}");
+        assert!(question.contains("Run the full suite?"), "{question}");
+        assert!(question.contains("[y/N]"), "{question}");
+    }
+
+    #[test]
+    fn a_long_question_is_clipped_and_keeps_the_protocol() {
+        // The protocol is the part a reader cannot guess, so the clip
+        // takes the question, never the `[y/N]`.
+        let mut binding = declared_binding(Key::Char('e'));
+        binding.confirm = Some("x".repeat(5000));
+        let question = confirm_question(&binding, 60);
+        assert!(
+            crate::core::measure::display_width(&question) <= 60,
+            "{}",
+            question.len()
+        );
+        assert!(question.ends_with("[y/N]"), "{question}");
+    }
+
+    #[test]
+    fn the_status_row_carries_the_question_beside_the_focus_segment() {
+        // The lane, not the string: with a focused pane AND a pending
+        // confirm the row carries both segments, ` · `-joined.
+        let registry = two_weighted_panes();
+        let runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let geom = registry.geometry((80, 24));
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(0));
+        let gate = Gate::Confirming {
+            binding: 0,
+            question: "confirm `e`: Really? [y/N]".to_string(),
+        };
+        let row = focus_segment(&registry, &runtime, &geom, &panes, Some(&gate))
+            .expect("both segments compose");
+        assert!(row.contains("focus "), "{row}");
+        assert!(row.contains(" · confirm `e`"), "{row}");
+        assert!(row.contains("[y/N]"), "{row}");
+        // And with no focus at all the question still shows: a pending
+        // state must not depend on the reader having focused something.
+        let bare = focus_segment(
+            &registry,
+            &runtime,
+            &geom,
+            &PaneView::new(registry.len()),
+            Some(&gate),
+        )
+        .expect("the question alone composes");
+        assert!(bare.contains("confirm `e`"), "{bare}");
     }
 }
