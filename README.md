@@ -595,6 +595,11 @@ than guess, and a loop of slow commands is the kind it misses. Treat
 the paragraph above as the fix and the badge as a warning you might
 not get.
 
+One shape looks like the second half of that and is not: a file
+written by a key action changes while the dashboard is busy, but it
+changes because someone pressed a key, and it does not come back for
+more. See Key actions below.
+
 Cost, rather than correctness, has a lever: a pane declared
 `interval "never"` with a `trigger` runs only when its trigger says
 something changed, so an expensive command can sit behind a cheap file
@@ -772,6 +777,69 @@ result, no output buffer that outlives the status line, no "last
 action". A key action changes the world, and the board finds out the
 way it finds out about everything else — its panes re-run, on their
 intervals and on their triggers.
+
+**The handoff file.** An action often decides something the panes
+need to know — which branch, which revision, which filter — and rat
+will not remember it for you. Write it to a file, and have the panes
+that need it trigger on that file:
+
+```kdl
+key "P" {
+    description "pin the branch the log pane follows"
+    shell #true
+    output "hide"
+    command "git branch --show-current > /tmp/board-branch"
+}
+
+pane "log" {
+    shell #true
+    interval "never"
+    trigger "file:/tmp/board-branch"
+    command "git log --oneline -20 $(cat /tmp/board-branch)"
+}
+```
+
+The file is the handoff between the action and the panes, and it is
+where the choice lives — in the filesystem rather than in rat. That
+is the same rule as "rat keeps nothing", read from the other side,
+and it is why the choice survives the keypress at all. Anything a
+session decides mid-flight travels this way: a branch, a filter
+string, a mode.
+
+**Guard the empty state in `when`.** A handoff file has a beginning —
+it does not exist yet, or a write left it empty — and every binding
+that *consumes* the choice has to cope with that:
+
+```kdl
+key "e" {
+    description "examine the diff against the pinned branch"
+    when "test -s /tmp/board-branch"
+    confirm "Diff against the pinned branch?"
+    output "pager"
+    shell #true
+    command "git diff $(cat /tmp/board-branch)"
+}
+```
+
+`when` runs before the confirm, so a binding with nothing to work on
+declines the instant it is pressed — and the further a binding gets
+before it declines, the more of someone's work it throws away.
+
+**It is not instant, and the shape is worth knowing.** The action
+runs on a worker; when it writes the file, the pane's trigger notices
+on the next pass and waits out its debounce window before re-running.
+So the delay is the command's own runtime plus that window —
+`trigger-debounce`, `250ms` by default, declared on a pane or in
+`defaults`. Panes turning over a moment after the command finishes is
+the feature working, not a stall. A pane declared `interval "never"`
+with a trigger runs only on that signal, which is what makes an
+expensive pane cheap to hang off a handoff file.
+
+**A handoff file is not a loop.** `· looping` is about a *pane's*
+command touching a path some pane triggers on, which sustains itself
+for as long as the board runs. A key action's write happens because
+someone pressed a key: it does not repeat on its own, so a board
+built this way does not earn the badge.
 
 `?` lists every key the board declares, with its description.
 
