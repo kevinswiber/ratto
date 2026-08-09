@@ -319,6 +319,13 @@ pub(crate) fn run_registry(
     // keypress and nowhere else, so two in-flight activations of one
     // binding stay distinguishable in every consumer.
     let mut ids = ActivationIds::default();
+    // Every activation whose COMMAND is in flight, by identity — a
+    // SET, not a slot: the gate is serialized but running commands are
+    // not, so two activations of one binding are two members. Holds
+    // identity and binding index only, never anything about what the
+    // command did. Inserted where the command is spawned, removed by
+    // identity when its completion drains.
+    let mut running: Vec<(ActivationId, usize)> = Vec::new();
     let _raw_guard = if interactive {
         Some(RawModeGuard::enable().context("enabling raw mode")?)
     } else {
@@ -1143,6 +1150,18 @@ pub(crate) fn run_registry(
             // new child output and adopted palettes do not repaint, but
             // scroll, resize, the aging paused row, and the one-shot notice
             // still do.
+            // The trailing tail is built ONCE per iteration: the gate
+            // key below and the repaint both read it, so the text and
+            // the digest cannot diverge between the two.
+            let tail = status_tail(
+                &registry,
+                &runtime,
+                &geom,
+                &panes,
+                gate.as_ref(),
+                &running,
+                &session.bindings,
+            );
             let key = paint_key(
                 pause.as_ref(),
                 live_scroll,
@@ -1158,6 +1177,7 @@ pub(crate) fn run_registry(
                     current.changed_at,
                     current.panes.as_ref().map_or(&[][..], |p| &p.ages),
                 ),
+                tail.activity,
             );
             // Once mode emits exactly ONE complete frame: a partial
             // wave (some panes still running) composes and records but
@@ -1196,7 +1216,7 @@ pub(crate) fn run_registry(
                         &palette,
                         view,
                         panes.key(),
-                        focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref()).as_deref(),
+                        &tail,
                         None,
                         size,
                         session.max_height,
@@ -1445,6 +1465,7 @@ pub(crate) fn run_registry(
                                 palette.appearance,
                                 &tx,
                                 width,
+                                &mut running,
                             );
                             gate = next;
                             if let Some(line) = line {
@@ -1463,6 +1484,22 @@ pub(crate) fn run_registry(
             for outcome in actions.drain(..) {
                 let binding = &session.bindings[outcome.binding];
                 let width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+                if outcome.rung == ActionRung::Command {
+                    // Retire ONLY this activation — by identity, never
+                    // by binding index: retaining on the index would
+                    // drop BOTH activations when one binding runs
+                    // twice. An action that never started posted a
+                    // completion too, so it is retired the same way
+                    // and no segment outlives it.
+                    // The membership change is a STATE change the
+                    // batch paint must show even when the completion
+                    // line is hidden.
+                    let before = running.len();
+                    running.retain(|(id, _)| *id != outcome.activation);
+                    if running.len() != before {
+                        gate_moved = true;
+                    }
+                }
                 if outcome.rung == ActionRung::Guard {
                     if !gate_claims(&gate, outcome.activation) {
                         continue;
@@ -1522,6 +1559,7 @@ pub(crate) fn run_registry(
                             palette.appearance,
                             &tx,
                             width,
+                            &mut running,
                         );
                         gate = next;
                         if let Some(line) = line {
@@ -1602,7 +1640,15 @@ pub(crate) fn run_registry(
                     &palette,
                     view,
                     panes.key(),
-                    focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref()).as_deref(),
+                    &status_tail(
+                        &registry,
+                        &runtime,
+                        &geom,
+                        &panes,
+                        gate.as_ref(),
+                        &running,
+                        &session.bindings,
+                    ),
                     (!notices.is_empty()).then(|| notices.join(" · ")),
                     crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
@@ -1684,7 +1730,15 @@ pub(crate) fn run_registry(
                     &palette,
                     view,
                     panes.key(),
-                    focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref()).as_deref(),
+                    &status_tail(
+                        &registry,
+                        &runtime,
+                        &geom,
+                        &panes,
+                        gate.as_ref(),
+                        &running,
+                        &session.bindings,
+                    ),
                     None,
                     size,
                     session.max_height,
@@ -1826,7 +1880,15 @@ pub(crate) fn run_registry(
                     &palette,
                     view,
                     panes.key(),
-                    focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref()).as_deref(),
+                    &status_tail(
+                        &registry,
+                        &runtime,
+                        &geom,
+                        &panes,
+                        gate.as_ref(),
+                        &running,
+                        &session.bindings,
+                    ),
                     None,
                     crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
@@ -1970,6 +2032,7 @@ pub(crate) fn run_registry(
                                                 palette.appearance,
                                                 &tx,
                                                 width,
+                                                &mut running,
                                             );
                                             gate = next;
                                             line
@@ -2000,14 +2063,15 @@ pub(crate) fn run_registry(
                                         &palette,
                                         view,
                                         panes.key(),
-                                        focus_segment(
+                                        &status_tail(
                                             &registry,
                                             &runtime,
                                             &geom,
                                             &panes,
                                             gate.as_ref(),
-                                        )
-                                        .as_deref(),
+                                            &running,
+                                            &session.bindings,
+                                        ),
                                         notice,
                                         size,
                                         session.max_height,
@@ -2113,14 +2177,15 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(
+                                    &status_tail(
                                         &registry,
                                         &runtime,
                                         &geom,
                                         &panes,
                                         gate.as_ref(),
-                                    )
-                                    .as_deref(),
+                                        &running,
+                                        &session.bindings,
+                                    ),
                                     pager_notice,
                                     size,
                                     session.max_height,
@@ -2181,14 +2246,15 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(
+                                    &status_tail(
                                         &registry,
                                         &runtime,
                                         &geom,
                                         &panes,
                                         gate.as_ref(),
-                                    )
-                                    .as_deref(),
+                                        &running,
+                                        &session.bindings,
+                                    ),
                                     None,
                                     size,
                                     session.max_height,
@@ -2242,8 +2308,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 None,
                                 size,
                                 session.max_height,
@@ -2275,8 +2348,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 None,
                                 size,
                                 session.max_height,
@@ -2312,8 +2392,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 None,
                                 size,
                                 session.max_height,
@@ -2369,14 +2456,15 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(
+                                    &status_tail(
                                         &registry,
                                         &runtime,
                                         &geom,
                                         &panes,
                                         gate.as_ref(),
-                                    )
-                                    .as_deref(),
+                                        &running,
+                                        &session.bindings,
+                                    ),
                                     None,
                                     size,
                                     session.max_height,
@@ -2414,8 +2502,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 None,
                                 size,
                                 session.max_height,
@@ -2481,8 +2576,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 None,
                                 size,
                                 session.max_height,
@@ -2553,8 +2655,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 None,
                                 size,
                                 session.max_height,
@@ -2635,14 +2744,15 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(
+                                    &status_tail(
                                         &registry,
                                         &runtime,
                                         &geom,
                                         &panes,
                                         gate.as_ref(),
-                                    )
-                                    .as_deref(),
+                                        &running,
+                                        &session.bindings,
+                                    ),
                                     None,
                                     size,
                                     session.max_height,
@@ -2728,14 +2838,15 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(
+                                    &status_tail(
                                         &registry,
                                         &runtime,
                                         &geom,
                                         &panes,
                                         gate.as_ref(),
-                                    )
-                                    .as_deref(),
+                                        &running,
+                                        &session.bindings,
+                                    ),
                                     None,
                                     size,
                                     session.max_height,
@@ -2816,8 +2927,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 None,
                                 size,
                                 session.max_height,
@@ -2928,8 +3046,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 None,
                                 size,
                                 session.max_height,
@@ -2966,8 +3091,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 Some(text.to_string()),
                                 size,
                                 session.max_height,
@@ -2997,8 +3129,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 Some(text),
                                 size,
                                 session.max_height,
@@ -3016,6 +3155,7 @@ pub(crate) fn run_registry(
                         // build, launch, forget.
                         WatchAction::RunBinding(index) => {
                             let binding = &session.bindings[index];
+                            let running_before = running.len();
                             let width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
                             // At most one activation in the gate. While
                             // an off-thread rung is in flight the gate
@@ -3061,6 +3201,7 @@ pub(crate) fn run_registry(
                                             palette.appearance,
                                             &tx,
                                             width,
+                                            &mut running,
                                         );
                                         gate = next;
                                         line
@@ -3070,10 +3211,14 @@ pub(crate) fn run_registry(
                             };
                             // Repaint at the edge when there is
                             // something to show: a question that just
-                            // armed, or a decline/busy line — neither
-                            // rides a pane tick.
+                            // armed, a decline/busy line, or a launch
+                            // that grew the running set — none of them
+                            // rides a pane tick, and on a quiet board
+                            // the compose step (gated on movement)
+                            // would never show them.
                             let question_armed = matches!(gate, Some(Gate::Confirming { .. }));
-                            if (notice.is_some() || question_armed)
+                            let launched = running.len() != running_before;
+                            if (notice.is_some() || question_armed || launched)
                                 && let Some(l) = live.as_ref()
                             {
                                 let size = crossterm::terminal::size().unwrap_or((80, 24));
@@ -3086,14 +3231,15 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
-                                    focus_segment(
+                                    &status_tail(
                                         &registry,
                                         &runtime,
                                         &geom,
                                         &panes,
                                         gate.as_ref(),
-                                    )
-                                    .as_deref(),
+                                        &running,
+                                        &session.bindings,
+                                    ),
                                     notice,
                                     size,
                                     session.max_height,
@@ -3141,8 +3287,15 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
-                                focus_segment(&registry, &runtime, &geom, &panes, gate.as_ref())
-                                    .as_deref(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
                                 debug_notice,
                                 size,
                                 session.max_height,
@@ -4001,6 +4154,12 @@ struct PaintKey {
     /// Whole seconds since the viewed frame was current; 0 while live.
     /// Advancing once per second is what lets the paused age repaint.
     age_secs: u64,
+    /// The status tail's activity digest — see `activity_digest`. In
+    /// the key because the tail's segments may change only when a key
+    /// field changes (the run-constant tail rule), and the gate's and
+    /// the in-flight activations' transitions are exactly such
+    /// changes.
+    activity: u64,
 }
 
 /// The one construction of the repaint gate's key: while paused it holds
@@ -4016,6 +4175,7 @@ fn paint_key(
     view: ViewState,
     view_key: PaneViewKey,
     age_secs: u64,
+    activity: u64,
 ) -> PaintKey {
     // A live-scrolled key carries the LIVE hash: the tail keeps
     // repainting under the offset — that is the point of the mode. The
@@ -4044,6 +4204,7 @@ fn paint_key(
         alt_time: view.alt_time,
         view: view_key,
         age_secs,
+        activity,
     }
 }
 
@@ -4272,7 +4433,7 @@ fn repaint(
     palette: &Palette,
     view: ViewState,
     view_key: PaneViewKey,
-    focus_seg: Option<&str>,
+    tail: &StatusTail,
     notice: Option<String>,
     size: (u16, u16),
     max_height: Option<u16>,
@@ -4281,6 +4442,7 @@ fn repaint(
     profile: ColorProfile,
     history: &History,
 ) -> anyhow::Result<PaintKey> {
+    let focus_seg = tail.text.as_deref();
     let age_secs = displayed_age_key(
         pause,
         live_scroll,
@@ -4297,6 +4459,7 @@ fn repaint(
         view,
         view_key,
         age_secs,
+        tail.activity,
     );
     let (source, offset, mode) = match (pause, live_scroll) {
         (Some(p), _) => (p.frozen.as_slice(), p.scroll.offset(), FrameMode::Paused),
@@ -5207,6 +5370,7 @@ fn advance(
     appearance: Appearance,
     tx: &std::sync::mpsc::Sender<TickEvent>,
     width: usize,
+    running: &mut Vec<(ActivationId, usize)>,
 ) -> (Option<Gate>, Option<String>) {
     match step {
         GateStep::Prepare => unreachable!("preparation is entered through begin_activation"),
@@ -5234,6 +5398,11 @@ fn advance(
             None,
         ),
         GateStep::Command => {
+            // The in-flight set is maintained WHERE the command is
+            // spawned, because that is the only place that knows one
+            // was — the same rule that keeps the spawn itself behind
+            // `next_step`.
+            running.push((ctx.id, index));
             launch_command(binding, index, ctx, scripts, appearance, tx);
             (None, None)
         }
@@ -6663,12 +6832,128 @@ fn zoom_badge(order: &[SourceId], id: SourceId) -> String {
     format!("zoomed {at}/{}", order.len())
 }
 
-fn focus_segment(
+/// The activation's identity AND where it is. Both, because the row
+/// says different things about the same id at different phases, and a
+/// key that cannot tell them apart lets a visible transition go
+/// unpainted — the same id moving `Confirming` → `Running` keeps its
+/// id, so an id-only digest would skip exactly that paint.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Phase {
+    Preparing,
+    Guarding,
+    Confirming,
+    Running,
+}
+
+/// A digest of every activation the status row can see — the gate's,
+/// with the phase it is in, and every one in flight. Hashed in SORTED
+/// order (id ascending) so the digest is independent of any
+/// collection's iteration order; a `DefaultHasher` digest compared for
+/// equality, the same posture the pane-view digest already accepts —
+/// two different states are overwhelmingly likely to DIFFER, and a
+/// collision costs one skipped repaint, never corruption.
+fn activity_digest(members: impl Iterator<Item = (ActivationId, Phase)>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut members: Vec<(u64, u8)> = members.map(|(id, phase)| (id.0, phase as u8)).collect();
+    members.sort_unstable();
+    let mut hasher = std::hash::DefaultHasher::new();
+    for member in members {
+        member.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// The status row's trailing segments, together with the part of the
+/// repaint key they depend on.
+///
+/// The two travel in one value ON PURPOSE. A footer segment may change
+/// only when a `PaintKey` field changes (the run-constant tail rule) —
+/// and a segment with no key contribution goes silently stale the
+/// first time it changes on an iteration the gate skipped, which on an
+/// `interval "never"` board is most of them. Bundling makes that
+/// impossible to forget: there is no way to add text here without
+/// naming what makes it repaint.
+struct StatusTail {
+    /// The ` · `-joined segments, or None when there are none.
+    text: Option<String>,
+    /// The activity digest — see `activity_digest`.
+    activity: u64,
+}
+
+/// The ACTION half of the tail: the pending question, then the running
+/// segment — last, because it is the most transient thing in the row.
+///
+/// Deterministic and bounded when several run: one activation names
+/// its binding, more than one becomes `N actions running` — naming one
+/// of several would invite the reader to expect the row to clear when
+/// that one finishes, and it would not. Attribution lives on the
+/// completion lines, which each name their own binding. Not gated by
+/// `output`: a `hide` binding still shows it while it runs, or the
+/// most silent disposition would also be the one where a slow command
+/// looks like a dead key.
+fn status_tail_text(
+    bindings: &[KeyBinding],
+    gate: Option<&Gate>,
+    running: &[(ActivationId, usize)],
+    width: usize,
+) -> Option<String> {
+    let mut segments: Vec<String> = Vec::new();
+    if let Some(Gate::Confirming { question, .. }) = gate {
+        segments.push(question.clone());
+    }
+    match running {
+        [] => {}
+        [(_, index)] => {
+            if let Some(line) = action_line(&bindings[*index], ActionReport::Running, width) {
+                segments.push(line);
+            }
+        }
+        many => segments.push(format!("{} actions running", many.len())),
+    }
+    (!segments.is_empty()).then(|| segments.join(" · "))
+}
+
+/// The whole trailing tail: the focus segment, then the action half —
+/// and the digest computed from exactly what the text is computed
+/// from, which is what keeps the two in step.
+fn status_tail(
     registry: &Registry,
     runtime: &[SourceRuntime],
     geom: &[PaneGeometry],
     view: &PaneView,
     gate: Option<&Gate>,
+    running: &[(ActivationId, usize)],
+    bindings: &[KeyBinding],
+) -> StatusTail {
+    let mut segments: Vec<String> = Vec::new();
+    if let Some(focus) = focus_segment(registry, runtime, geom, view) {
+        segments.push(focus);
+    }
+    if let Some(action) = status_tail_text(bindings, gate, running, usize::MAX) {
+        segments.push(action);
+    }
+    let gate_member = match gate {
+        Some(Gate::Preparing { id, .. }) => Some((*id, Phase::Preparing)),
+        Some(Gate::Guarding(ctx)) => Some((ctx.id, Phase::Guarding)),
+        Some(Gate::Confirming { ctx, .. }) => Some((ctx.id, Phase::Confirming)),
+        None => None,
+    };
+    let activity = activity_digest(
+        gate_member
+            .into_iter()
+            .chain(running.iter().map(|(id, _)| (*id, Phase::Running))),
+    );
+    StatusTail {
+        text: (!segments.is_empty()).then(|| segments.join(" · ")),
+        activity,
+    }
+}
+
+fn focus_segment(
+    registry: &Registry,
+    runtime: &[SourceRuntime],
+    geom: &[PaneGeometry],
+    view: &PaneView,
 ) -> Option<String> {
     let mut segments: Vec<String> = Vec::new();
     if let Some(id) = view.focus {
@@ -6701,13 +6986,6 @@ fn focus_segment(
             seg.push_str(&zoom_badge(&focus_order(registry, layout), id));
         }
         segments.push(seg);
-    }
-    // The pending question rides the same lane — a STATE on the state
-    // surface, so it survives every repaint until answered — and it
-    // does NOT depend on a focused pane: a reader can arm a confirm
-    // with nothing focused at all.
-    if let Some(Gate::Confirming { question, .. }) = gate {
-        segments.push(question.clone());
     }
     (!segments.is_empty()).then(|| segments.join(" · "))
 }
@@ -8196,13 +8474,10 @@ mod tests {
         let runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
         let geom = registry.geometry((80, 24));
         let mut panes = PaneView::new(registry.len());
-        assert_eq!(
-            focus_segment(&registry, &runtime, &geom, &panes, None),
-            None
-        );
+        assert_eq!(focus_segment(&registry, &runtime, &geom, &panes), None);
         panes.focus = Some(SourceId(1));
         assert_eq!(
-            focus_segment(&registry, &runtime, &geom, &panes, None),
+            focus_segment(&registry, &runtime, &geom, &panes),
             Some("focus right".to_string())
         );
     }
@@ -8486,6 +8761,7 @@ mod tests {
             view,
             panes.key(),
             14,
+            0,
         );
         assert_eq!(
             live,
@@ -8503,6 +8779,7 @@ mod tests {
                 alt_time: false,
                 view: panes.key(),
                 age_secs: 14,
+                activity: 0,
             }
         );
         let scroll = ScrollState::default().step(ScrollStep::LineDown, 50, 10);
@@ -8526,6 +8803,7 @@ mod tests {
             view,
             panes.key(),
             14,
+            0,
         );
         assert_eq!(
             scrolled,
@@ -8543,6 +8821,7 @@ mod tests {
                 alt_time: false,
                 view: panes.key(),
                 age_secs: 14,
+                activity: 0,
             }
         );
         let paused = paint_key(
@@ -8554,6 +8833,7 @@ mod tests {
             view,
             panes.key(),
             14,
+            0,
         );
         assert_eq!(
             paused,
@@ -8571,6 +8851,7 @@ mod tests {
                 alt_time: false,
                 view: panes.key(),
                 age_secs: 14,
+                activity: 0,
             }
         );
     }
@@ -10760,6 +11041,7 @@ mod tests {
             view,
             panes.key(),
             0,
+            0,
         );
         panes.focus = Some(SourceId(1));
         let after = paint_key(
@@ -10770,6 +11052,7 @@ mod tests {
             (80, 24),
             view,
             panes.key(),
+            0,
             0,
         );
         assert_ne!(before, after, "same content, moved focus, new key");
@@ -13438,6 +13721,7 @@ mod tests {
         let geom = registry.geometry((80, 24));
         let mut panes = PaneView::new(registry.len());
         panes.focus = Some(SourceId(0));
+        let bindings = [declared_binding(Key::Char('e'))];
         let gate = Gate::Confirming {
             ctx: Activation {
                 id: ActivationId(1),
@@ -13446,20 +13730,32 @@ mod tests {
             },
             question: "confirm `e`: Really? [y/N]".to_string(),
         };
-        let row = focus_segment(&registry, &runtime, &geom, &panes, Some(&gate))
-            .expect("both segments compose");
+        let row = status_tail(
+            &registry,
+            &runtime,
+            &geom,
+            &panes,
+            Some(&gate),
+            &[],
+            &bindings,
+        )
+        .text
+        .expect("both segments compose");
         assert!(row.contains("focus "), "{row}");
         assert!(row.contains(" · confirm `e`"), "{row}");
         assert!(row.contains("[y/N]"), "{row}");
         // And with no focus at all the question still shows: a pending
         // state must not depend on the reader having focused something.
-        let bare = focus_segment(
+        let bare = status_tail(
             &registry,
             &runtime,
             &geom,
             &PaneView::new(registry.len()),
             Some(&gate),
+            &[],
+            &bindings,
         )
+        .text
         .expect("the question alone composes");
         assert!(bare.contains("confirm `e`"), "{bare}");
     }
@@ -13738,6 +14034,192 @@ mod tests {
         assert_ne!(
             a, b,
             "minted INSIDE the seam, by the allocator production uses"
+        );
+    }
+    // ─── The status tail ────────────────────────────────────────────
+
+    /// The cross-line pin: EVERY line an action can produce names its
+    /// binding — matched exhaustively over the closed report kind with
+    /// no `_` arm, so a sixth kind of report is a compile error here
+    /// rather than a line that quietly forgets its subject. The
+    /// expectation is composed from `action_label`, never a literal,
+    /// so the test cannot drift from the label.
+    #[cfg(unix)]
+    #[test]
+    fn every_line_about_an_action_names_its_binding() {
+        let binding = declared_binding(Key::Char('r'));
+        let label = action_label(&binding);
+        let ran = completed_action("", "boom", 1 << 8);
+        let never = never_started_action();
+        let reports: Vec<ActionReport<'_>> = vec![
+            ActionReport::Completed(&ran),
+            ActionReport::Completed(&never),
+            ActionReport::Declined {
+                rung: Rung::Prepare,
+                detail: Some("variable \"head\" failed"),
+            },
+            ActionReport::Declined {
+                rung: Rung::When,
+                detail: None,
+            },
+            ActionReport::Declined {
+                rung: Rung::Confirm,
+                detail: None,
+            },
+            ActionReport::Declined {
+                rung: Rung::Command,
+                detail: None,
+            },
+            ActionReport::Cancelled,
+            ActionReport::Busy,
+            ActionReport::Running,
+        ];
+        for report in reports {
+            // The exhaustiveness half: name every variant once, so a
+            // new kind must be added HERE too.
+            match &report {
+                ActionReport::Completed(_)
+                | ActionReport::Declined { .. }
+                | ActionReport::Cancelled
+                | ActionReport::Busy
+                | ActionReport::Running => {}
+            }
+            let line = action_line(&binding, report, 120).expect("every kind here speaks");
+            assert!(line.contains(&label), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_running_segment_names_its_binding_the_way_every_other_line_does() {
+        let binding = declared_binding(Key::Char('r'));
+        let running = [(ActivationId(1), 0usize)];
+        let tail = status_tail_text(std::slice::from_ref(&binding), None, &running, 120);
+        let expected = format!("{} running", action_label(&binding));
+        assert_eq!(tail.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn several_running_actions_report_a_count_and_name_none() {
+        // Naming one of several would be worse than naming none: the
+        // named one finishing would not clear the row, which then
+        // appears stuck. Attribution lives on the completion lines.
+        let bindings = [
+            declared_binding(Key::Char('r')),
+            declared_binding(Key::Char('e')),
+        ];
+        let two = [(ActivationId(1), 0usize), (ActivationId(2), 1usize)];
+        let tail = status_tail_text(&bindings, None, &two, 120).expect("a segment exists");
+        assert_eq!(tail, "2 actions running");
+        // Two activations of ONE binding are still two members.
+        let same = [(ActivationId(1), 0usize), (ActivationId(2), 0usize)];
+        let tail = status_tail_text(&bindings, None, &same, 120).expect("a segment exists");
+        assert_eq!(tail, "2 actions running");
+        // One completing while another runs leaves the survivor named.
+        let one = [(ActivationId(2), 0usize)];
+        let tail = status_tail_text(&bindings, None, &one, 120).expect("a segment exists");
+        assert!(tail.contains("`r` running"), "{tail}");
+        // And the last one leaving empties the segment.
+        assert_eq!(status_tail_text(&bindings, None, &[], 120), None);
+    }
+
+    #[test]
+    fn every_status_tail_state_rides_the_repaint_key() {
+        // The run-constant tail rule, satisfied structurally: the
+        // digest is computed from exactly what the text is computed
+        // from — sorted (id, phase) pairs — so these specific states
+        // DIFFER (never "cannot collide": a u64 digest accepts the
+        // same one-in-2^64 posture the pane-view digest does).
+        let d = |gate: &[(u64, Phase)], running: &[u64]| {
+            activity_digest(
+                gate.iter()
+                    .map(|(id, phase)| (ActivationId(*id), *phase))
+                    .chain(running.iter().map(|id| (ActivationId(*id), Phase::Running))),
+            )
+        };
+        // The segment appears.
+        assert_ne!(d(&[], &[]), d(&[], &[1]));
+        // 1 -> N changes the whole text.
+        assert_ne!(d(&[], &[1]), d(&[], &[1, 2]));
+        // A count would compare equal here: one action swapped for
+        // another.
+        assert_ne!(d(&[], &[1, 2]), d(&[], &[1, 3]));
+        // A completion while another runs.
+        assert_ne!(d(&[], &[1, 2]), d(&[], &[1]));
+        // The same id changing PHASE — an id-only digest compares
+        // equal here while the text goes from the confirm question to
+        // the running segment.
+        assert_ne!(d(&[(7, Phase::Confirming)], &[]), d(&[], &[7]));
+        assert_ne!(
+            d(&[(7, Phase::Preparing)], &[]),
+            d(&[(7, Phase::Guarding)], &[])
+        );
+        // Order-independent of insertion order: sorted before hashing,
+        // so a HashMap seed change can never cause a repaint storm.
+        assert_eq!(d(&[], &[1, 2]), d(&[], &[2, 1]));
+        // And the key carries it: two keys differing only in activity
+        // compare not equal.
+        let view = ViewState {
+            wrap: false,
+            hshift: 0,
+            gutter: false,
+            highlight: false,
+            alt_time: false,
+        };
+        let key = |activity: u64| {
+            paint_key(
+                None,
+                None,
+                42,
+                Appearance::Dark,
+                (80, 24),
+                view,
+                PaneView::new(0).key(),
+                0,
+                activity,
+            )
+        };
+        assert_ne!(key(d(&[], &[])), key(d(&[], &[1])));
+        assert_eq!(key(7), key(7));
+    }
+
+    #[test]
+    fn the_status_row_carries_the_focus_and_the_action_in_that_order() {
+        assert_eq!(
+            live_notice(0, "since 18:47:53", None, Some("focus diff · `r` running")),
+            "since 18:47:53 · focus diff · `r` running"
+        );
+        // Pinned where the order is decided, not only where consumed:
+        // the running segment is the most transient thing in the row,
+        // so it goes last.
+        let registry = two_weighted_panes();
+        let runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let geom = registry.geometry((80, 24));
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(0));
+        let bindings = [declared_binding(Key::Char('r'))];
+        let running = [(ActivationId(1), 0usize)];
+        let tail = status_tail(
+            &registry, &runtime, &geom, &panes, None, &running, &bindings,
+        );
+        let text = tail.text.expect("both segments compose");
+        let focus_at = text.find("focus ").expect("the focus segment");
+        let running_at = text.find("running").expect("the running segment");
+        assert!(focus_at < running_at, "{text}");
+    }
+
+    #[test]
+    fn a_board_with_no_action_in_flight_paints_the_row_it_always_did() {
+        // Byte identity for every board that never presses a key.
+        let registry = two_weighted_panes();
+        let runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let geom = registry.geometry((80, 24));
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(1));
+        let tail = status_tail(&registry, &runtime, &geom, &panes, None, &[], &[]);
+        assert_eq!(tail.text.as_deref(), Some("focus right"));
+        assert_eq!(
+            live_notice(0, "since 18:47:53", None, tail.text.as_deref()),
+            "since 18:47:53 · focus right"
         );
     }
 }

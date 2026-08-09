@@ -420,6 +420,17 @@ fn wait_for_without(
 }
 
 /// The last screen row containing `needle`, carriage returns stripped.
+/// The stream AFTER the last occurrence of `needle` — the way to ask
+/// "what did the final status-row paint say" on a stream of in-place
+/// rewrites, which put several paints on one newline-row and defeat a
+/// row-splitting search.
+fn after_last<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    bytes
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+        .map(|at| &bytes[at..])
+}
+
 fn row_containing<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
     bytes
         .split(|&b| b == b'\n')
@@ -5102,14 +5113,30 @@ fn a_hide_binding_paints_nothing_when_it_succeeds() {
     );
     session.write_bytes(b"r");
     wait_for_counter(&counter, 1);
-    // The stream AFTER the run confirms nothing was said: the needle is
-    // the backticked spelling, which no fixture text contains.
+    // What `hide` hides is the COMPLETION notice — the running segment
+    // is state, not output, and still shows while the action runs (or
+    // the most silent disposition would be the one where a slow
+    // command looks like a dead key). So the absence is asserted on
+    // the completion vocabulary, and the segment's own departure on
+    // the last status row.
     let settled = drain_for(&session, Duration::from_millis(600));
     assert!(
-        !contains(&settled, b"`r`"),
+        !contains(&settled, b"`r` done"),
         "hide painted a success notice: {:?}",
         String::from_utf8_lossy(&settled)
     );
+    assert!(
+        !contains(&settled, b"`r` exit"),
+        "a clean exit painted an exit line: {:?}",
+        String::from_utf8_lossy(&settled)
+    );
+    if let Some(after) = after_last(&settled, b"? help") {
+        assert!(
+            !contains(after, b"running"),
+            "the segment outlived the action: {:?}",
+            String::from_utf8_lossy(after)
+        );
+    }
     session.write_bytes(b"q");
     assert!(
         !session.kill_if_alive(Duration::from_secs(2)),
@@ -6155,6 +6182,169 @@ fn a_description_reaches_the_help_expanded() {
         "an unexpanded reference reached the reader: {:?}",
         String::from_utf8_lossy(&seen)
     );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The running segment end to end: it appears while a slow action
+/// runs, and it is GONE from the last status row once the completion
+/// lands — proven against that row, not the whole capture, since the
+/// segment legitimately appeared earlier.
+#[test]
+fn a_slow_action_shows_it_is_running_until_it_reports() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fast = dir.path().join("fast");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"slow fail\"\n    command \"sleep 1; echo boom >&2; exit 1\"\n}}\n\n\
+             pane \"fast\" {{\n    interval \"100ms\"\n    command \"{fast_cmd}\"\n}}\n",
+            fast_cmd = labeled_counter_cmd(&fast, "fast"),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"fast-1", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`r` running", b"`r` exit 1"],
+        Duration::from_secs(5),
+    );
+    let settled = drain_for(&session, Duration::from_millis(600));
+    if let Some(row) = row_containing(&settled, b"? help") {
+        assert!(
+            !contains(row, b"running"),
+            "the segment outlived its action: {:?}",
+            String::from_utf8_lossy(row)
+        );
+    }
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The insertion-site pin: a bare, a GUARDED, and a CONFIRMED binding
+/// all reach the in-flight set — an insert in the dispatch arm passes
+/// the bare case and gives every guarded binding no segment at all.
+/// The confirmed arm also drives the phase transition: the row shows
+/// the question while awaiting the answer, and `running` only after
+/// `y`.
+#[test]
+fn a_guarded_and_a_confirmed_activation_both_reach_the_in_flight_set() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        "row-gap 0\n\ndefaults {\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}\n\n\
+         key \"r\" {\n    description \"bare\"\n    command \"sleep 0.6\"\n}\n\n\
+         key \"e\" {\n    description \"guarded\"\n    when \"true\"\n    command \"sleep 0.6\"\n}\n\n\
+         key \"a\" {\n    description \"confirmed\"\n    confirm \"GATEQUESTION\"\n    command \"sleep 0.6\"\n}\n\n\
+         pane \"steady\" {\n    interval \"1h\"\n    command \"echo steady-content\"\n}\n",
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`r` running", b"`r` done"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"e");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`e` running", b"`e` done"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"a");
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"GATEQUESTION"],
+        Duration::from_secs(5),
+    );
+    assert!(
+        !contains(&seen, b"`a` running"),
+        "the row said running while the question was pending: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    session.write_bytes(b"y");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`a` running", b"`a` done"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Two overlapping actions keep the row truthful end to end: the count
+/// while both run, the survivor named when one retires, and no
+/// `running` on the last status row when the second finishes.
+#[test]
+fn two_overlapping_actions_keep_the_row_truthful() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        "row-gap 0\n\ndefaults {\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}\n\n\
+         key \"r\" {\n    description \"slow\"\n    command \"sleep 2\"\n}\n\n\
+         key \"e\" {\n    description \"quick\"\n    command \"sleep 0.5\"\n}\n\n\
+         pane \"steady\" {\n    interval \"1h\"\n    command \"echo steady-content\"\n}\n",
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    session.write_bytes(b"e");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"2 actions running", b"`r` running", b"`r` done"],
+        Duration::from_secs(8),
+    );
+    let settled = drain_for(&session, Duration::from_millis(600));
+    if let Some(after) = after_last(&settled, b"? help") {
+        assert!(
+            !contains(after, b"running"),
+            "the segment outlived both actions: {:?}",
+            String::from_utf8_lossy(after)
+        );
+    }
     session.write_bytes(b"q");
     assert!(
         !session.kill_if_alive(Duration::from_secs(2)),
