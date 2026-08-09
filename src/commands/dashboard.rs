@@ -8,7 +8,8 @@ use crate::cli::{CheckArgs, DashboardAction, DashboardArgs, InitArgs};
 use crate::color::ColorProfile;
 use crate::commands::watch::{SessionArgs, run_registry};
 use crate::core::dashboard_file::{
-    Board, DashboardFile, KeyBindingDecl, SiteAudit, UncheckedSite, finish_load, read_and_parse,
+    Board, DashboardFile, KeyBinding, KeyBindingDecl, SiteAudit, UncheckedSite, finish_load,
+    read_and_parse,
 };
 use crate::core::registry::Registry;
 use crate::core::template::{Bindings, is_reference_name};
@@ -70,7 +71,7 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
         snapshot_ansi: args.snapshot_ansi,
         live_tail: dashboard_suffix(args.once, registry.len()),
         help_heading: "rat dashboard — keys",
-        help_extra: pane_help(&registry),
+        help_extra: pane_help(&registry, &bindings),
         // Boxes are allocated from the terminal width, so a resize
         // reflows and every child is respawned under the new geometry.
         resize_respawn: true,
@@ -155,7 +156,7 @@ fn dashboard_suffix(once: bool, sources: usize) -> String {
 /// The dashboard's slice of the `?` reference: one line per pane with
 /// its cadence, any trigger specs indented beneath — the same shape as
 /// watch's trigger section.
-fn pane_help(registry: &Registry) -> Vec<String> {
+fn pane_help(registry: &Registry, bindings: &[KeyBinding]) -> Vec<String> {
     let mut lines = vec![String::new(), "  panes:".to_string()];
     for id in registry.ids() {
         let spec = registry.spec(id);
@@ -171,6 +172,7 @@ fn pane_help(registry: &Registry) -> Vec<String> {
     // Unconditional, unlike the sections below: every dashboard registry
     // is Composition::Panes, so the gestures always apply.
     lines.extend(PANE_GESTURE_HELP.iter().map(|l| (*l).to_string()));
+    lines.extend(binding_help(bindings));
     if registry.ids().any(|id| registry.spec(id).live) {
         lines.extend(LIVE_HELP.iter().map(|l| (*l).to_string()));
     }
@@ -207,6 +209,81 @@ fn pane_help(registry: &Registry) -> Vec<String> {
 ///
 /// Wrapped by hand, like every section here: `?` pages plain grouped
 /// text through the pager, and nothing may exceed the key table's width.
+/// The board's own keys, from the board's own declaration — the only
+/// place a binding is advertised, which is why `description` is
+/// required rather than optional: a key `?` cannot name is a trap.
+///
+/// EMPTY IN, EMPTY OUT: a board that declares no binding must produce
+/// byte-identical help to the one it produced before bindings existed,
+/// and `the_help_is_unchanged_when_no_pane_has_a_trigger` is the
+/// witness.
+fn binding_help(bindings: &[KeyBinding]) -> Vec<String> {
+    /// The key column's width, chosen so descriptions start at cell 21
+    /// — the column every shipped table already uses: `help_lines`
+    /// writes `"  q                  quit"` (2 + 1 + 18) and the pane
+    /// gestures write 4 + 11 + 6. Change it only with them.
+    const KEY_COLUMN: usize = 17;
+    if bindings.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        String::new(),
+        "  key actions (this board's own keys):".to_string(),
+    ];
+    for binding in bindings {
+        // Annotate what changes what the keypress COSTS the reader: a
+        // confirm interrupts, so the reader must be ready to answer. A
+        // `when` gets no note — its decline names the key at the
+        // moment it happens, and on a real console nearly every
+        // binding carries one, so a note would discriminate nothing.
+        // Built as a joined list so a later note is an append, not a
+        // reshape.
+        let mut notes: Vec<&str> = Vec::new();
+        if binding.confirm.is_some() {
+            notes.push("asks before running");
+        }
+        let body = if notes.is_empty() {
+            binding.description.clone()
+        } else {
+            format!("{} ({})", binding.description, notes.join(", "))
+        };
+        // `{:<17}` pads by chars, and that is correct for exactly one
+        // reason: a key spelling is ASCII (the spelling grammar is the
+        // intersection of the two input wires, and the unix tap drops
+        // non-ASCII), so byte == char == cell. If the spellable set
+        // ever widens past ASCII this misaligns every description —
+        // the dependency is stated here so nobody "fixes" it early.
+        // The description side gets no such guarantee, which is why
+        // the COMPOSED line is bounded in display cells: the pager has
+        // no wrapping engine, and the cut lands in the description,
+        // never in the key.
+        lines.push(crate::core::measure::truncate_display(
+            &format!("    {:<KEY_COLUMN$}{body}", binding.spelling),
+            74,
+            crate::core::measure::ELLIPSIS,
+        ));
+    }
+    lines.extend(BINDING_HELP_TAIL.iter().map(|l| (*l).to_string()));
+    lines
+}
+
+/// The two facts a reader cannot guess from a list of keys: an action
+/// is launch-and-forget, so the panes turn over on their own cadence
+/// rather than on the keypress; and an action can decline before it
+/// runs.
+///
+/// Wrapped by hand, like every section here: `?` pages plain grouped
+/// text through the pager, and nothing may exceed the key table's
+/// width.
+const BINDING_HELP_TAIL: &[&str] = &[
+    "",
+    "    A key action runs one command and forgets it: the board learns",
+    "    what changed the way it always does, when its panes next run —",
+    "    on their intervals and their triggers, not the instant the key",
+    "    is pressed. An action can also decline before it runs; the",
+    "    status row names the key that declined.",
+];
+
 const PANE_GESTURE_HELP: &[&str] = &[
     "",
     "  pane gestures (while the frame is live — not the `live` label):",
@@ -783,7 +860,7 @@ mod tests {
         // `interval` on a live pane is the respawn delay. Not a
         // guessable fact — nothing on the pane says it. De-wrapped
         // before matching, for the same reason as the looping test.
-        let lines = pane_help(&live_registry());
+        let lines = pane_help(&live_registry(), &[]);
         assert!(
             lines.contains(&"    follow  live".to_string()),
             "the pane list must carry the live label: {lines:?}"
@@ -805,7 +882,7 @@ mod tests {
         // The trigger-only dashboard must not gain the live section —
         // and the no-trigger, no-live case is already pinned
         // byte-identical below.
-        let text = pane_help(&registry(true)).join(" ");
+        let text = pane_help(&registry(true), &[]).join(" ");
         assert!(!text.contains("live panes:"), "got {text}");
     }
 
@@ -818,7 +895,7 @@ mod tests {
         // future rewrap that changed nothing a user can perceive. The
         // width is pinned separately, below, because that is a
         // different property.
-        let lines = pane_help(&registry(true));
+        let lines = pane_help(&registry(true), &[]);
         let text = lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
         assert!(text.contains("looping"), "got {text}");
         // The two facts a user cannot guess: that the pane was left
@@ -840,9 +917,11 @@ mod tests {
         // key table is one the pager has to chop. 74 is the widest row
         // that ships (`p  freeze the frame in place …`); this section
         // may reach it and must not pass it.
-        for line in pane_help(&registry(true))
+        for line in pane_help(&registry(true), &[])
             .into_iter()
-            .chain(pane_help(&live_registry()))
+            .chain(pane_help(&live_registry(), &[]))
+            .chain(pane_help(&registry(false), &help_bindings()))
+            .chain(pane_help(&registry(false), &[long_binding()]))
         {
             assert!(
                 line.chars().count() <= 74,
@@ -861,7 +940,7 @@ mod tests {
         let noisy = registry(false).with_diagnostics(vec![
             "duplicate id \"a\" — refs bind to the first declaration".to_string(),
         ]);
-        let lines = pane_help(&noisy);
+        let lines = pane_help(&noisy, &[]);
         assert!(
             lines.contains(&"  diagnostics:".to_string()),
             "the section header appears: {lines:?}"
@@ -872,7 +951,7 @@ mod tests {
                 .any(|l| l.contains("duplicate id \"a\"") && l.starts_with("    ")),
             "the diagnostic is listed, indented: {lines:?}"
         );
-        let quiet = pane_help(&registry(false));
+        let quiet = pane_help(&registry(false), &[]);
         assert!(
             !quiet.iter().any(|l| l.contains("diagnostics")),
             "no section when there is nothing to say: {quiet:?}"
@@ -886,7 +965,7 @@ mod tests {
         // it: a dashboard with no triggers gains no help text at all,
         // and cannot gain any by a later edit without failing here.
         assert_eq!(
-            pane_help(&registry(false)),
+            pane_help(&registry(false), &[]),
             vec![
                 String::new(),
                 "  panes:".to_string(),
@@ -910,6 +989,13 @@ mod tests {
                 "    and Tab reaches the rest of a larger board.".to_string(),
             ]
         );
+        // Stated rather than implied: a board with no bindings gains
+        // no section at all.
+        let quiet = pane_help(&registry(false), &[]);
+        assert!(
+            !quiet.iter().any(|l| l.contains("key actions")),
+            "{quiet:?}"
+        );
     }
 
     #[test]
@@ -917,7 +1003,7 @@ mod tests {
         // Unconditional, unlike LIVE_HELP: every dashboard registry is
         // Composition::Panes, so the gestures always apply — proven by
         // asking a registry with no live pane and no trigger.
-        let text = pane_help(&registry(false)).join("\n");
+        let text = pane_help(&registry(false), &[]).join("\n");
         for needle in [
             "Tab",
             "BackTab",
@@ -1243,5 +1329,116 @@ mod tests {
             .unwrap_err()
         );
         assert!(err.starts_with("key \"q\":"), "{err}");
+    }
+    // ─── The binding help section ───────────────────────────────────
+
+    fn shown(key: char, description: &str) -> KeyBinding {
+        KeyBinding {
+            key: crate::ui::key::Key::Char(key),
+            spelling: key.to_string(),
+            description: description.to_string(),
+            program: crate::core::dashboard_file::BindingProgram::Argv(vec![
+                crate::core::template::Template::extract("true"),
+            ]),
+            shell: ShellMode::Direct,
+            when: None,
+            when_shell: None,
+            output: crate::core::dashboard_file::BindingOutput::Status,
+            confirm: None,
+        }
+    }
+
+    /// Two bindings, one plain and one that confirms — the smallest
+    /// board that exercises both line shapes.
+    fn help_bindings() -> Vec<KeyBinding> {
+        let mut confirming = shown('a', "assess this change");
+        confirming.confirm = Some("Really?".to_string());
+        vec![shown('r', "rerun the suite"), confirming]
+    }
+
+    fn long_binding() -> KeyBinding {
+        shown('e', &"x".repeat(200))
+    }
+
+    #[test]
+    fn a_declared_binding_appears_in_the_help_with_its_key_and_its_description() {
+        let lines = pane_help(&registry(false), &help_bindings());
+        assert!(
+            lines.iter().any(|l| l.contains("  key actions")),
+            "{lines:?}"
+        );
+        // The EXACT line: the column position is what drifts, and it is
+        // the one thing a reader compares against the tables above it.
+        assert!(
+            lines.contains(&"    r                rerun the suite".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn bindings_are_listed_in_declaration_order() {
+        // Never sorted: the author's order carries meaning — a review
+        // board groups its verdict keys together.
+        let bindings = vec![
+            shown('x', "third in the alphabet, first declared"),
+            shown('a', "first in the alphabet, second declared"),
+            shown('r', "middle, last declared"),
+        ];
+        let lines = pane_help(&registry(false), &bindings);
+        let position = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?} in {lines:?}"))
+        };
+        assert!(position("third in the alphabet") < position("first in the alphabet"));
+        assert!(position("first in the alphabet") < position("middle, last declared"));
+    }
+
+    #[test]
+    fn a_confirming_binding_says_so_and_a_guarded_one_does_not() {
+        // Annotate what changes what the keypress COSTS the reader: a
+        // confirm interrupts. A `when` changes only whether the command
+        // runs, and its decline names the key at the moment it happens
+        // — a better surface than a static note that would sit on
+        // nearly every line of a real console.
+        let mut guarded = shown('n', "advance the queue");
+        guarded.when = Some(crate::core::template::Template::extract("test -s ./x"));
+        guarded.when_shell = Some(ShellMode::Platform);
+        let mut confirming = shown('a', "assess this change");
+        confirming.confirm = Some("Really?".to_string());
+        let lines = pane_help(&registry(false), &[guarded, confirming]);
+        let line_for = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?} in {lines:?}"))
+        };
+        assert!(
+            line_for("assess this change").ends_with("(asks before running)"),
+            "{lines:?}"
+        );
+        assert!(
+            !line_for("advance the queue").contains('('),
+            "a `when` earns no annotation: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_description_is_truncated_rather_than_overflowing_the_help_width() {
+        let lines = pane_help(&registry(false), &[long_binding()]);
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("    e"))
+            .expect("the binding's line exists — the key survives the cut");
+        assert!(
+            crate::core::measure::display_width(line) <= 74,
+            "{} cells: {line:?}",
+            crate::core::measure::display_width(line)
+        );
+        assert!(
+            line.ends_with(crate::core::measure::ELLIPSIS),
+            "cut through truncate_display: {line:?}"
+        );
     }
 }

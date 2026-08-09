@@ -6051,3 +6051,113 @@ fn a_when_guards_on_a_deferred_variable_and_the_command_sees_the_same_value() {
         "dashboard should have exited on q"
     );
 }
+
+/// The plumbing no unit test sees: the board's own bindings reach the
+/// `?` pager on a real board — at rest, and again from a FOCUSED pane
+/// (the non-rest arm), since `?` is mode-blind and this fixture is
+/// what would notice if a later change made it otherwise.
+#[test]
+fn the_help_pager_shows_the_boards_own_bindings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        "row-gap 0\n\ndefaults {\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}\n\n\
+         key \"r\" {\n    description \"rerun the suite\"\n    command \"true\"\n}\n\n\
+         pane \"steady\" {\n    interval \"1h\"\n    command \"echo steady-content\"\n}\n",
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"?");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"key actions", b"rerun the suite"],
+        Duration::from_secs(5),
+    );
+    // The non-rest arm: focus a pane and ask again. The pager's bytes
+    // go straight through the pty rather than the differ, so a second
+    // identical reference still prints.
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"focus steady",
+            Duration::from_secs(3)
+        ),
+        "the focus segment never appeared"
+    );
+    session.write_bytes(b"?");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"key actions", b"rerun the suite"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The one assertion that binds the help to the variable machinery's
+/// timing: a description referencing a constant reaches `?` EXPANDED —
+/// never `{{name}}` at the reader.
+#[test]
+fn a_description_reaches_the_help_expanded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        "row-gap 0\n\nvariables {\n    what \"the whole suite\"\n}\n\ndefaults {\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}\n\n\
+         key \"r\" {\n    description \"rerun {{what}}\"\n    command \"true\"\n}\n\n\
+         pane \"steady\" {\n    interval \"1h\"\n    command \"echo steady-content\"\n}\n",
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"?");
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"rerun the whole suite"],
+        Duration::from_secs(5),
+    );
+    assert!(
+        !contains(&seen, b"{{"),
+        "an unexpanded reference reached the reader: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}

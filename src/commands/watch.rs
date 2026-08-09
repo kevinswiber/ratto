@@ -7512,6 +7512,10 @@ mod tests {
         // the permanent tripwire against a merged help path (INV-3).
         assert!(!lines.contains("pane gestures"));
         assert!(!lines.contains("BackTab"));
+        // Append help is watch-only and bindings are dashboard-only,
+        // so the two surfaces can never legitimately meet; this needle
+        // keeps that true if the two paths are ever merged.
+        assert!(!lines.contains("key actions"));
     }
 
     #[test]
