@@ -1209,3 +1209,43 @@ fn an_unknown_variable_names_itself_and_the_file() {
         .stderr(predicates::str::contains("declared variables are plan"))
         .stderr(predicates::str::contains("board.kdl"));
 }
+
+#[test]
+fn a_variable_override_reaches_the_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            r#"
+variables {{
+    word "hello"
+}}
+
+defaults {{ height 3
+chrome #false }}
+
+pane "a" {{
+    command "{bin}" "style" "{{{{word}}}}"
+}}
+"#,
+            bin = rat_bin().replace('\\', "\\\\")
+        ),
+    );
+    // Nothing expands yet (INV-2 — expansion comes with the spawn-time
+    // phase), so this route asserts the FLAG's reach: the board loads,
+    // and an override naming an undeclared variable refuses by name.
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once", "-v", "word=goodbye"])
+        .assert()
+        .success();
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once", "-v", "wrod=goodbye"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "the board declares no variable `wrod`",
+        ));
+}

@@ -2915,8 +2915,8 @@ pane "log" {
     use crate::core::registry::ShellDecl;
     use crate::core::template::{Bindings, Template};
     use crate::core::variables::{
-        Derivation, Expanded, Resolved, Tier, VarSource, VariableBlock, opaque_roots,
-        resolve_partial, resolve_variables,
+        Derivation, Expanded, Resolved, Tier, VarSource, VariableBlock, check_overrides,
+        opaque_roots, resolve_partial, resolve_variables,
     };
 
     fn vars(text: &str) -> VariableBlock {
@@ -3874,5 +3874,115 @@ variables {{
         let mut built = kdl::KdlEntry::new("x");
         built.clear_format();
         assert!(!is_raw(&built), "no format means NORMAL — never raw");
+    }
+    // ─── `-v` overrides ─────────────────────────────────────────────
+
+    #[test]
+    fn an_override_must_name_a_variable_the_board_declares() {
+        // A board's meaning must be readable from the board plus its `-v`
+        // flags (INV-3). An override that names nothing is a typo that
+        // would otherwise do nothing at all — the exact failure mode
+        // INV-6 refuses for a `{{name}}`.
+        let block = vars(&format!("variables {{\n    limit \"50\"\n}}\n{ONE_PANE}"));
+        check_overrides(
+            &block,
+            &Bindings::from([("limit".to_string(), "200".to_string())]),
+        )
+        .expect("declared");
+        let err = format!(
+            "{:#}",
+            check_overrides(
+                &block,
+                &Bindings::from([("limti".to_string(), "200".to_string())])
+            )
+            .expect_err("undeclared")
+        );
+        assert!(
+            err.contains("the board declares no variable `limti`"),
+            "got {err}"
+        );
+        assert!(err.contains("declared variables are limit"), "got {err}");
+
+        let none = vars(ONE_PANE);
+        let err = format!(
+            "{:#}",
+            check_overrides(&none, &Bindings::from([("x".to_string(), "1".to_string())]))
+                .expect_err("no block at all")
+        );
+        assert!(
+            err.contains("this board declares no variables"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn an_override_wins_for_the_exact_name_and_nothing_else() {
+        // The pin: derivation still runs for names NOT overridden, so
+        // overriding `store` does not silently re-derive an explicitly
+        // overridden `sel`.
+        let block = vars(&format!(
+            r#"
+variables {{
+    sel   "{{{{store}}}}/pointbreak-review.sel"
+    store "git rev-parse --git-common-dir" shell=#true
+    other "echo hi" shell=#true
+}}
+{ONE_PANE}"#
+        ));
+        let overrides = Bindings::from([
+            ("store".to_string(), "/common".to_string()),
+            ("sel".to_string(), "/explicit.sel".to_string()),
+        ]);
+        let mut ran: Vec<String> = Vec::new();
+        let out = resolve_variables(&block, &overrides, &mut |d: Derivation<'_>| {
+            ran.push(d.name.to_string());
+            Ok("derived".to_string())
+        })
+        .expect("resolves");
+        assert_eq!(ran, vec!["other"], "only the un-overridden command ran");
+        assert_eq!(out.get("sel").map(String::as_str), Some("/explicit.sel"));
+        assert_eq!(out.get("store").map(String::as_str), Some("/common"));
+    }
+
+    #[test]
+    fn an_override_value_is_literal_text_and_never_a_template() {
+        // Substitution is single-pass by construction: an override's
+        // bytes land in the output verbatim. A `-v` value that could
+        // introduce a reference would let a caller's environment inject
+        // one into a board — the class of bug INV-3's "no implicit
+        // environment interpolation" rule exists to remove.
+        let block = vars(&format!(
+            "variables {{\n    a \"x\"\n    b \"{{{{a}}}}!\"\n}}\n{ONE_PANE}"
+        ));
+        let overrides = Bindings::from([("a".to_string(), "{{b}}".to_string())]);
+        let out = resolve_variables(&block, &overrides, &mut |_| unreachable!()).expect("resolves");
+        assert_eq!(out.get("b").map(String::as_str), Some("{{b}}!"));
+    }
+
+    #[test]
+    fn an_override_changes_a_value_never_a_boards_legality() {
+        // Cycles, tiers and unknown names are decided on the DECLARED
+        // block, before any flag is seen. A board is well-formed or it is
+        // not, and `rat dashboard check` must reach the same verdict as
+        // `rat dashboard` with flags.
+        let err = vars_err(&format!(
+            "variables {{\n    a \"{{{{b}}}}\"\n    b \"{{{{a}}}}\"\n}}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.contains("variable cycle"),
+            "a cycle refuses with or without -v: {err}"
+        );
+
+        let block = vars(&format!(
+            "variables {{\n    head \"git rev-parse HEAD\" shell=#true defer=#true\n}}\n{ONE_PANE}"
+        ));
+        let overrides = Bindings::from([("head".to_string(), "abc123".to_string())]);
+        // The tier is the DECLARED one, so a `-v` cannot smuggle a
+        // deferred name into a load-time site (INV-7's check).
+        assert_eq!(block.tier("head"), Some(Tier::Spawn));
+        // And a deferred variable still has no LOAD-time value; the
+        // spawn resolver applies the same override map at its own moment.
+        let out = resolve_variables(&block, &overrides, &mut |_| unreachable!()).expect("resolves");
+        assert!(out.is_empty());
     }
 }

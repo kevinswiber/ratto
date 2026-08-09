@@ -541,6 +541,11 @@ pub struct DashboardArgs {
     /// Keep escape sequences in snapshots instead of stripping them
     #[arg(long)]
     pub snapshot_ansi: bool,
+    /// Set a variable the board declares: `-v name=value`, repeatable.
+    /// Wins for that exact name, and a command variable so overridden
+    /// never runs.
+    #[arg(short = 'v', long = "variable", value_name = "NAME=VALUE")]
+    pub variable: Vec<String>,
 }
 
 #[derive(clap::Args)]

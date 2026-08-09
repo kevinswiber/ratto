@@ -690,10 +690,19 @@ fn resolve_node(
 
 /// Read + parse + validate. `colored` styles the syntax-error
 /// snippets for the caller's stream; it changes no parse outcome.
-pub fn load(path: &std::path::Path, colored: bool) -> anyhow::Result<Registry> {
+pub fn load(
+    path: &std::path::Path,
+    colored: bool,
+    // `Bindings` lives in `core::template`, NOT in the walk —
+    // `dashboard_file.rs` may not name `dashboard_kdl.rs`, which
+    // imports it.
+    overrides: &crate::core::template::Bindings,
+) -> anyhow::Result<Registry> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file = crate::core::dashboard_kdl::parse_styled(&text, colored)
+        .with_context(|| format!("in {}", path.display()))?;
+    crate::core::variables::check_overrides(&file.variables, overrides)
         .with_context(|| format!("in {}", path.display()))?;
     file.into_registry()
         .with_context(|| format!("in {}", path.display()))

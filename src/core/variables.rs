@@ -356,6 +356,29 @@ impl Template {
     }
 }
 
+/// Every `-v` must name a variable the board declares. A board's
+/// meaning is readable from the board plus its `-v` flags (INV-3), so
+/// an override that names nothing is a typo doing nothing — the same
+/// failure INV-6 refuses for a `{{name}}`, one surface out. It also
+/// keeps INV-6's declared set well defined: `-v` sets a variable, it
+/// does not introduce one.
+pub fn check_overrides(block: &VariableBlock, overrides: &Bindings) -> anyhow::Result<()> {
+    for name in overrides.keys() {
+        if !block.contains(name) {
+            anyhow::bail!(
+                "the board declares no variable `{name}` — {}",
+                if block.is_empty() {
+                    "this board declares no variables; a `-v` sets one the board declares"
+                        .to_string()
+                } else {
+                    format!("declared variables are {}", block.declared_list())
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The COMMAND variables a name ultimately derives from — the roots of
 /// its opacity, found by following the edges the graph already has.
 ///

@@ -2,11 +2,14 @@
 //! construction — the declaration file becomes a [`Registry`], the
 //! flags become a `SessionArgs`, and the watch engine does the rest.
 
+use anyhow::bail;
+
 use crate::cli::DashboardArgs;
 use crate::color::ColorProfile;
 use crate::commands::watch::{SessionArgs, run_registry};
 use crate::core::dashboard_file::load;
 use crate::core::registry::Registry;
+use crate::core::template::{Bindings, is_reference_name};
 use crate::exit::AppResult;
 use crate::theme::Palette;
 
@@ -14,7 +17,8 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
     // A load error prints before any UI exists, so the profile is the
     // one color authority it gets: anything above Ascii earns the
     // colored snippet theme.
-    let registry = load(&args.file, profile != ColorProfile::Ascii)?;
+    let overrides = parse_overrides(&args.variable)?;
+    let registry = load(&args.file, profile != ColorProfile::Ascii, &overrides)?;
     let once_timeout = args
         .once_timeout
         .as_deref()
@@ -229,6 +233,33 @@ const LOOPING_HELP: &[&str] = &[
     "    was lost, or when the dashboard was too busy to judge. No badge",
     "    means no loop was proved, not that there is none.",
 ];
+
+/// `-v name=value` into the map a resolution runs against. Split at
+/// the FIRST `=` so a value may contain as many as it likes
+/// (`-v flags=--since=yesterday` is a real board's real value), and
+/// the name obeys the same grammar a `{{name}}` does — a name that
+/// could never be referenced cannot be set.
+///
+/// `rat dashboard check` reuses this: the same flags must reach the
+/// same verdict there.
+pub(crate) fn parse_overrides(args: &[String]) -> anyhow::Result<Bindings> {
+    let mut out = Bindings::new();
+    for arg in args {
+        let Some((name, value)) = arg.split_once('=') else {
+            bail!("-v takes `name=value` — write `-v plan=/path/to/plan`, not `-v {arg}`");
+        };
+        if !is_reference_name(name) {
+            bail!(
+                "-v {arg:?}: a variable's name starts with a letter or `_` and continues \
+                 with letters, digits, `_` or `-` — the same spelling `{{{{name}}}}` uses"
+            );
+        }
+        if out.insert(name.to_string(), value.to_string()).is_some() {
+            bail!("-v {name} is given twice — give each variable one value");
+        }
+    }
+    Ok(out)
+}
 
 #[cfg(test)]
 mod tests {
@@ -480,5 +511,50 @@ mod tests {
         // The retargeting sentence is a behavior change to keys the
         // shared reference already documents, so it must be stated here.
         assert!(text.contains("scroll keys"), "the retarget is unstated");
+    }
+
+    #[test]
+    fn an_override_splits_at_the_first_equals() {
+        let map = parse_overrides(&[
+            "plan=/tmp/plans/0028".to_string(),
+            "flags=--since=yesterday".to_string(),
+            "empty=".to_string(),
+        ])
+        .expect("parses");
+        assert_eq!(map.get("plan").map(String::as_str), Some("/tmp/plans/0028"));
+        // The FIRST `=` splits: a value may contain as many as it likes.
+        assert_eq!(
+            map.get("flags").map(String::as_str),
+            Some("--since=yesterday")
+        );
+        // An empty value is the author saying so, exactly as `limit ""`
+        // is — unlike a command's empty OUTPUT, which is a derivation
+        // failure (INV-4.2).
+        assert_eq!(map.get("empty").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn a_malformed_override_teaches_the_spelling() {
+        for (arg, needle) in [
+            ("plan", "-v takes `name=value`"),
+            ("=/tmp/x", "a variable's name starts with a letter or `_`"),
+            ("9lives=x", "a variable's name starts with a letter or `_`"),
+            ("a b=x", "a variable's name starts with a letter or `_`"),
+        ] {
+            let err = format!("{:#}", parse_overrides(&[arg.to_string()]).expect_err(arg));
+            assert!(err.contains(needle), "{arg} → {err}");
+        }
+    }
+
+    #[test]
+    fn the_same_name_is_given_a_value_once() {
+        // The document's own rule, one level out: last-wins is invisible
+        // in a long command line the same way it is invisible in a long
+        // pane block (`record` in the walk).
+        let err = format!(
+            "{:#}",
+            parse_overrides(&["plan=a".to_string(), "plan=b".to_string()]).expect_err("twice")
+        );
+        assert!(err.contains("-v plan is given twice"), "got {err}");
     }
 }
