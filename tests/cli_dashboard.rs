@@ -2736,3 +2736,35 @@ fn every_template_checks_clean_from_an_unrelated_directory() {
             .success();
     }
 }
+
+#[test]
+fn the_variables_example_checks_clean() {
+    rat()
+        .args(["dashboard", "check", "examples/variables.kdl"])
+        .assert()
+        .success();
+}
+
+#[cfg(unix)]
+#[test]
+fn the_variables_example_renders_once() {
+    // Parsing is not running: this is the route that proves the
+    // expansions actually reach children. Unix, like the example's own
+    // shell lines; the repo the test runs in is the git repository the
+    // header asks for.
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "examples/variables.kdl", "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("commits"), "{stdout}");
+    assert!(
+        stdout.contains("now at "),
+        "the deferred value expanded: {stdout}"
+    );
+    assert!(
+        stdout.contains("{{head}} means"),
+        "the raw title kept its braces: {stdout}"
+    );
+}

@@ -580,11 +580,15 @@ fn render_report(
                     lines.push(line);
                 }
             }
+            let (plural, verb) = if lines.len() == 1 {
+                ("", "was")
+            } else {
+                ("s", "were")
+            };
             let _ = writeln!(
                 out,
-                "  {} load-time site{} were not checked, because their values derive at run time:",
+                "  {} load-time site{plural} {verb} not checked, because their values derive at run time:",
                 lines.len(),
-                if lines.len() == 1 { "" } else { "s" },
             );
             for line in lines {
                 let _ = writeln!(out, "{line}");

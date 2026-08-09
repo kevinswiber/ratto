@@ -1991,12 +1991,48 @@ pane "nested" {
             include_str!("../../examples/panes-nested.kdl"),
             include_str!("../../examples/follow.kdl"),
             include_str!("../../examples/script.kdl"),
+            include_str!("../../examples/variables.kdl"),
+            include_str!("../../examples/review.kdl"),
         ] {
-            parse(text)
-                .expect("the example parses")
-                .into_registry(&Bindings::new())
+            let file = parse(text).expect("the example parses");
+            // A stub runner, not the real one: this is a unit test, and
+            // what is under test is that every LOAD-TIME site validates
+            // over resolved values — template-free examples take the
+            // stub-free path unchanged.
+            let bindings = resolve_variables(&file.variables, &Bindings::new(), &mut |_| {
+                Ok("stub".to_string())
+            })
+            .expect("the example's variables resolve");
+            file.into_registry(&bindings)
                 .expect("the example validates");
         }
+    }
+
+    #[test]
+    fn the_variables_example_shows_every_evaluation_form() {
+        // PARSED, not grepped: one declaration carrying both
+        // `shell=#true` and `defer=#true` satisfies a substring check
+        // while teaching only two forms. Three DISTINCT variables in
+        // three distinct declared forms is the claim.
+        let vars = parse(include_str!("../../examples/variables.kdl"))
+            .expect("the example parses")
+            .variables;
+        let constants = vars
+            .in_order()
+            .filter(|v| matches!(v.source, VarSource::Constant))
+            .count();
+        let load_commands = vars
+            .in_order()
+            .filter(|v| matches!(v.source, VarSource::LoadCommand(_)))
+            .count();
+        let deferred = vars
+            .in_order()
+            .filter(|v| matches!(v.source, VarSource::SpawnCommand(_)))
+            .count();
+        assert!(
+            constants >= 1 && load_commands >= 1 && deferred >= 1,
+            "three distinct forms: {constants} constants, {load_commands} once-at-load, {deferred} deferred"
+        );
     }
 
     fn names_of(file: &DashboardFile) -> Vec<&str> {

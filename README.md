@@ -237,6 +237,8 @@ triggers:
 ```sh
 rat dashboard panes.kdl
 rat dashboard panes.kdl --once   # render one frame and exit
+rat dashboard check panes.kdl    # validate it without running anything
+rat dashboard init > board.kdl   # start from a shipped example
 ```
 
 The declaration file names each pane's command and cadence, shared
@@ -293,9 +295,10 @@ pane "deps" {
 ```
 
 A body whose first two bytes are `#!` runs through its own
-interpreter: rat writes it once per run to a private file and
-re-executes that file every tick, so python, node, ruby — anything —
-works without `-c`/`-e` gymnastics. On unix the kernel does the
+interpreter: rat writes it to a private file and re-executes that
+file every tick — once per run for an ordinary body, rewritten only
+when a `{{variable}}` inside it changes the bytes — so python, node,
+ruby — anything — works without `-c`/`-e` gymnastics. On unix the kernel does the
 shebang honors; on Windows rat reads the first line itself, resolves
 `/usr/bin/env X` by name on `PATH`, and gives the file the extension
 the interpreter insists on (`.ps1` for PowerShell; `.cmd` for cmd,
@@ -393,6 +396,73 @@ seconds — naming the pane and the `live=#true` declaration to write —
 and `--once-timeout 30s` bounds the wait: on expiry the run exits 124
 with an empty stdout rather than printing a partial frame.
 
+#### Variables
+
+A board can declare a `variables` block and reference each name
+anywhere a string is written, with `{{name}}`:
+
+```kdl
+variables {
+    limit "3"
+    store "git rev-parse --git-common-dir" shell=#true
+    head  "git rev-parse --short HEAD" shell=#true defer=#true
+}
+```
+
+The grammar is exactly `{{`, an identifier, `}}` — no expressions, no
+nesting, no inner whitespace. Anything else is literal text, so a jq
+or awk body writing `{{print $1}}` is never touched. The sigil is
+`{{name}}` rather than `$name` because `command` and `script` values
+*are* shell text: `$` stays the shell's.
+
+A variable takes one of three forms. A plain value is a **constant** —
+and a parameter, because `-v limit=8` overrides it for one run; a
+constant is its own default. With `shell=#true` (or `shell="fish"`)
+the value is derived by running the command **once at load**, memoized
+for the session; a failure, empty output, or a hang refuses the board
+by name, because a plausible-looking wrong value that a board then
+watches forever is worse than not starting. With `defer=#true` the
+command is re-derived at **every consuming spawn** instead. Variables
+may reference each other in any order — a cycle is refused naming the
+path — and never consult the `defaults` block: a shipped board's
+`store` must not change shell dialect because the importing board
+declares `defaults { shell "fish" }`.
+
+**Normal strings interpolate; raw strings never do** — the same deal
+double and single quotes make in a shell. `title "at {{head}}"`
+expands; `title #"at {{head}}"#` keeps its braces, which is how you
+write the reference shape literally. The cost is that one literal
+cannot be both raw (backslash freedom) and interpolating: a sed body
+that wants both escapes its backslashes in a normal string.
+
+**Where a reference may appear is derived, not memorized**: a value
+consumed when a process starts — a `command` argv element, a `script`
+body — expands at spawn and may hold a deferred reference. A value
+parsed into a typed thing at load — `trigger`, `interval`, the
+geometry keys, the titles, a `shell` dialect name — must be complete
+at load, so a *deferred* reference there is refused by name. One
+consequence is worth its own sentence: `command` is word-split when
+the file is read, so `command "{{cmd}}"` with `cmd = "git log"` runs a
+program **named** `git log` — one argument, never re-split. A board
+that wants a whole command line says `shell #true`.
+
+Nothing ambient leaks in: `{{HOME}}` does not read the environment — a
+board that wants an env value declares it (`home "echo $HOME"
+shell=#true`) — and pane ids, key names, integers, and booleans are
+not substitutable at all. An id is identity: the `RAT_PANE` value and
+the anchor a `ref="#id"` binds to. Display text belongs in `title`,
+which is.
+
+`rat dashboard check board.kdl` validates all of this **without
+running anything the board declares** — teaching errors on stderr, a
+report on stdout, exit 0 or 1, `NO_COLOR` honored — which is what
+makes it safe for CI. Values derived by a command are honestly
+reported as not checked, because nothing was run; `-v` makes them
+checkable, exactly as it does on a run. `rat dashboard init` writes a
+starter board to stdout (`--list` names the shipped templates,
+`--output` refuses to overwrite), so an installed binary carries its
+own examples.
+
 #### Pane navigation
 
 `Tab` and `BackTab` cycle the focus through focusable panes in layout
@@ -475,7 +545,14 @@ stall the frame until the bounded wait gives up. And its side effects
 recur at the pane's cadence — the guidance above applies unchanged, on
 a schedule the variable's author may not have been thinking about:
 write deferred commands that can run at any moment, any number of
-times. A deferred command that writes a watched path is the loop the
+times. Within one spawn a deferred variable evaluates once, so a
+command naming it twice runs it once and both occurrences agree. A
+failure at spawn is not a load error — there is no load left to
+refuse: it fails that pane's spawn and renders in that pane's own box,
+exactly as a spawn error already does, leaving the board around it
+untouched. Empty output fails that spawn too: a deferred variable
+reading a file catches an interrupted zero-length write, and a silent
+empty expansion would hand `--revision ""` to a real command. A deferred command that writes a watched path is the loop the
 next paragraph describes, and the pane that references the variable is
 correctly the one implicated, because the derivation runs as part of
 that pane's own spawn.
@@ -598,6 +675,13 @@ pane tails, so it needs no second terminal — and
 [`examples/tail-windows.kdl`](examples/tail-windows.kdl) is the same
 dashboard for `cmd.exe`, where a `shell #true` script may contain
 neither a double quote nor a pipe.
+[`examples/variables.kdl`](examples/variables.kdl) teaches the
+variables layer — the three evaluation forms, the `-v` parameter, and
+a raw string that stays literal — and
+[`examples/review.kdl`](examples/review.kdl) is a review console whose
+paths derive at load, so the same file works in a primary checkout, a
+linked worktree, or a clone. Every one of these ships inside the
+binary too: `rat dashboard init --list`.
 
 ### `rat frame` — flicker-free repaint for script-owned loops
 
