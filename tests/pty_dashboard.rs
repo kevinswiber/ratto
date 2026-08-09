@@ -2808,6 +2808,80 @@ row {
     );
 }
 
+/// Presentational panes still compose and may supply the dashboard title, but
+/// they have no navigation number and never become the focus target.
+#[test]
+fn a_non_focusable_title_pane_is_skipped_by_tab_and_alt_digits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r##"
+title "Dashboard" ref="#header"
+
+defaults {
+    height 4
+    border "rounded"
+}
+
+column {
+    pane "header" {
+        focusable #false
+        command "printf header"
+    }
+    row {
+        pane "log" {
+            interval "1h"
+            command "printf log"
+        }
+        pane "clock" {
+            interval "1h"
+            command "printf clock"
+        }
+    }
+}
+"##,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let _ = wait_for_bytes(&session, &mut terminal, b"clock", Duration::from_secs(5))
+        .expect("the first composition never painted");
+
+    // Tab starts at `log`, not the title pane. The visible numbering and
+    // footer share the same filtered order.
+    session.write_bytes(b"\t");
+    let first_focus = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &["1 · log".as_bytes(), "2 · clock".as_bytes(), b"focus log"],
+        Duration::from_secs(3),
+    );
+    assert!(
+        contains(&first_focus, b"header"),
+        "the title pane remains visible"
+    );
+    assert!(
+        !contains(&first_focus, "0 · header".as_bytes()),
+        "the visible title pane must not receive a navigation number"
+    );
+
+    // Alt-2 uses that same order, so it skips the title and reaches clock.
+    session.write_bytes(b"\x1b2");
+    let _ = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"focus clock",
+        Duration::from_secs(3),
+    )
+    .expect("Alt-2 should focus clock");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// While zoomed, Alt-digit carries the zoom straight to its number —
 /// the same both-panes-owe-a-run contract Tab's carry keeps.
 #[test]

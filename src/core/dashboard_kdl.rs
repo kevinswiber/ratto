@@ -136,6 +136,11 @@ const PANE_KEYS: &[Key] = &[
         set: Set::Flag(|d, v| d.chrome = Some(v)),
     },
     Key {
+        name: "focusable",
+        example: "focusable #false",
+        set: Set::Flag(|d, v| d.focusable = Some(v)),
+    },
+    Key {
         name: "live",
         example: "live #true",
         set: Set::Flag(|d, v| d.live = Some(v)),
@@ -1639,7 +1644,7 @@ pane "nested" {
         );
     }
 
-    /// One table, twelve keys: every key a pane accepts must land on
+    /// One table, thirteen keys: every key a pane accepts must land on
     /// the declaration through it. A key the table forgets shows up
     /// here as a `None` field, not as a silently ignored node.
     #[test]
@@ -1659,6 +1664,7 @@ pane "all" {
     padding "0 1"
     title "Recent commits"
     chrome #false
+    focusable #false
 }
 "#,
         )
@@ -1683,6 +1689,7 @@ pane "all" {
         assert_eq!(pane.padding.as_deref(), Some("0 1"));
         assert_eq!(pane.title.as_deref(), Some("Recent commits"));
         assert_eq!(pane.chrome, Some(false));
+        assert_eq!(pane.focusable, Some(false));
     }
 
     #[test]
@@ -2098,7 +2105,7 @@ pane "all" {
     fn a_scalar_key_may_be_written_as_a_property_or_a_child_node() {
         let as_properties = parse(
             r#"
-pane "log" interval="15s" height=7 width="2fr" chrome=#false {
+pane "log" interval="15s" height=7 width="2fr" chrome=#false focusable=#false {
     command "git" "log"
 }
 "#,
@@ -2111,6 +2118,7 @@ pane "log" {
     height 7
     width "2fr"
     chrome #false
+    focusable #false
     command "git" "log"
 }
 "#,

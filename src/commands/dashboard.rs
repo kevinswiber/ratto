@@ -130,9 +130,9 @@ fn pane_help(registry: &Registry) -> Vec<String> {
 const PANE_GESTURE_HELP: &[&str] = &[
     "",
     "  pane gestures (while the frame is live — not the `live` label):",
-    "    Tab, BackTab     cycle focus between panes — a zoom rides along",
+    "    Tab, BackTab     cycle focus between focusable panes — a zoom rides along",
     "    Alt-h/j/k/l      move focus directionally",
-    "    Alt-1..9         jump straight to a numbered pane",
+    "    Alt-1..9         jump straight to a numbered focusable pane",
     "    Esc              unzoom, then drop focus, then the frame scroll",
     "    Enter            zoom the focused pane; zoomed, page its body",
     "    z                zoom the focused pane to the full frame",
@@ -141,7 +141,7 @@ const PANE_GESTURE_HELP: &[&str] = &[
     "    pane's own window instead of the whole frame, and focusing a",
     "    pane below the fold scrolls the frame to it. h/l shift",
     "    nothing here: pane content is clipped to its box. While a",
-    "    focus is held, every title counts itself in declaration",
+    "    focus is held, every focusable title counts itself in layout",
     "    order; Alt-1..9 jumps to the first nine (from rest, too),",
     "    and Tab reaches the rest of a larger board.",
 ];
@@ -263,6 +263,7 @@ mod tests {
             padding: Sides::default(),
             title: None,
             chrome: true,
+            focusable: true,
         };
         Registry::panes(
             vec![spec("a", "./sa"), spec("b", "./sb")],
@@ -307,6 +308,7 @@ mod tests {
             padding: Sides::default(),
             title: None,
             chrome: true,
+            focusable: true,
         };
         Registry::panes(
             vec![batch, follow],
@@ -438,9 +440,10 @@ mod tests {
                 "    b  every 5s".to_string(),
                 String::new(),
                 "  pane gestures (while the frame is live — not the `live` label):".to_string(),
-                "    Tab, BackTab     cycle focus between panes — a zoom rides along".to_string(),
+                "    Tab, BackTab     cycle focus between focusable panes — a zoom rides along"
+                    .to_string(),
                 "    Alt-h/j/k/l      move focus directionally".to_string(),
-                "    Alt-1..9         jump straight to a numbered pane".to_string(),
+                "    Alt-1..9         jump straight to a numbered focusable pane".to_string(),
                 "    Esc              unzoom, then drop focus, then the frame scroll".to_string(),
                 "    Enter            zoom the focused pane; zoomed, page its body".to_string(),
                 "    z                zoom the focused pane to the full frame".to_string(),
@@ -449,7 +452,7 @@ mod tests {
                 "    pane's own window instead of the whole frame, and focusing a".to_string(),
                 "    pane below the fold scrolls the frame to it. h/l shift".to_string(),
                 "    nothing here: pane content is clipped to its box. While a".to_string(),
-                "    focus is held, every title counts itself in declaration".to_string(),
+                "    focus is held, every focusable title counts itself in layout".to_string(),
                 "    order; Alt-1..9 jumps to the first nine (from rest, too),".to_string(),
                 "    and Tab reaches the rest of a larger board.".to_string(),
             ]

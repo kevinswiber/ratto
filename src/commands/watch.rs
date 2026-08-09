@@ -2267,7 +2267,7 @@ pub(crate) fn run_registry(
                                 continue;
                             }
                             // While zoomed, Tab/BackTab CARRY the zoom
-                            // along the reading order, and Alt-digit
+                            // along the focusable reading order, and Alt-digit
                             // carries it straight to a numbered pane:
                             // the surface stays a single pane, so there
                             // is no hidden focus to guard. A directional
@@ -2275,7 +2275,7 @@ pub(crate) fn run_registry(
                             // on-screen geometry the zoom is hiding
                             // (INV-12).
                             if let Some(from) = panes.zoomed {
-                                let order = pane_order(layout);
+                                let order = focus_order(&registry, layout);
                                 let next = match action {
                                     WatchAction::FocusNext => {
                                         focus_cycle(panes.focus, &order, true)
@@ -2352,7 +2352,7 @@ pub(crate) fn run_registry(
                                 )?);
                                 continue;
                             }
-                            let order = pane_order(layout);
+                            let order = focus_order(&registry, layout);
                             let next = match action {
                                 WatchAction::FocusNext => focus_cycle(panes.focus, &order, true),
                                 WatchAction::FocusPrev => focus_cycle(panes.focus, &order, false),
@@ -2868,9 +2868,10 @@ enum WatchAction {
     /// Per-pane gestures. Live only: a frozen or scrubbed frame is a
     /// composed string with no pane identity left in it.
     FocusNext,
-    /// Jump the focus straight to the pane at this reading-order
-    /// index (Alt-1..9 → 0..8). The order is `pane_order`'s — the
-    /// same order Tab cycles and the numbered titles display.
+    /// Jump the focus straight to the focusable pane at this
+    /// reading-order index (Alt-1..9 → 0..8). The order is
+    /// `focus_order`'s — the same order Tab cycles and the numbered
+    /// titles display.
     FocusJump(usize),
     FocusPrev,
     FocusMove(FocusDir),
@@ -3060,9 +3061,20 @@ fn resolve_page_or_zoom(action: WatchAction, mode: FrameMode, panes: &PaneView) 
     }
 }
 
-/// The next or previous pane in reading order, wrapping. With no focus
-/// any focus gesture lands on the first pane, so reaching for a pane
-/// always gets one.
+/// The panes eligible for dashboard focus, in layout reading order.
+///
+/// A non-focusable pane remains part of the composition: it has a source,
+/// geometry, and rendered block. It is simply absent from every navigation
+/// target list, so numbering and focus gestures cannot disagree.
+fn focus_order(registry: &Registry, layout: &LayoutNode) -> Vec<SourceId> {
+    pane_order(layout)
+        .into_iter()
+        .filter(|id| registry.pane(*id).is_some_and(|pane| pane.focusable))
+        .collect()
+}
+
+/// The next or previous focusable pane in reading order, wrapping. With no
+/// focus any focus gesture lands on the first eligible pane.
 fn focus_cycle(from: Option<SourceId>, order: &[SourceId], forward: bool) -> Option<SourceId> {
     let first = order.first().copied();
     let Some(at) = from.and_then(|id| order.iter().position(|o| *o == id)) else {
@@ -3071,6 +3083,56 @@ fn focus_cycle(from: Option<SourceId>, order: &[SourceId], forward: bool) -> Opt
     let n = order.len();
     let next = if forward { at + 1 } else { at + n - 1 };
     order.get(next % n).copied()
+}
+
+#[cfg(test)]
+#[test]
+fn focus_order_excludes_non_focusable_panes_from_every_navigation_target() {
+    use crate::core::box_model::{BorderPreset, Sides};
+    use crate::core::registry::{PaneBox, PaneWidth};
+
+    let spec = |id: &str| SourceSpec {
+        id: id.to_string(),
+        program: SourceProgram::Argv(vec!["true".to_string()]),
+        shell: ShellMode::Direct,
+        interval: Some(Duration::from_secs(3600)),
+        triggers: Vec::new(),
+        debounce: Duration::from_millis(250),
+        live: false,
+    };
+    let pane = |focusable| PaneBox {
+        height: 4,
+        width: PaneWidth::Weight(1),
+        overflow: Overflow::KeepTop,
+        border: BorderPreset::Rounded,
+        padding: Sides::default(),
+        title: None,
+        chrome: false,
+        focusable,
+    };
+    let registry = Registry::panes(
+        vec![spec("header"), spec("log"), spec("clock")],
+        vec![pane(false), pane(true), pane(true)],
+        LayoutNode::Column(vec![
+            LayoutNode::Pane(SourceId(0)),
+            LayoutNode::Pane(SourceId(1)),
+            LayoutNode::Pane(SourceId(2)),
+        ]),
+        0,
+        0,
+    )
+    .expect("a valid registry");
+    let layout = match registry.composition() {
+        Composition::Panes { layout, .. } => layout,
+        Composition::Plain { .. } => panic!("expected panes"),
+    };
+    let order = focus_order(&registry, layout);
+    assert_eq!(order, vec![SourceId(1), SourceId(2)]);
+    assert_eq!(focus_cycle(None, &order, true), Some(SourceId(1)));
+    assert_eq!(
+        focus_cycle(Some(SourceId(2)), &order, true),
+        Some(SourceId(1))
+    );
 }
 
 /// The pane a directional move lands on, or None at the edge of the
@@ -5023,8 +5085,8 @@ fn pane_display_name(registry: &Registry, id: SourceId) -> &str {
 /// the run-constant tail rule — and this one is admissible exactly
 /// because `PaneViewKey.focus` is IN the key. A counter here would not
 /// be, and would go silently stale.
-/// The zoom cursor: this pane's place in the reading order while it
-/// fills the frame. Tab carries the zoom from pane to pane and the
+/// The zoom cursor: this pane's place in the focusable reading order while it
+/// fills the frame. Tab carries the zoom from focusable pane to focusable pane and the
 /// others are invisible, so "2/4" is the only orientation there is.
 fn zoom_badge(order: &[SourceId], id: SourceId) -> String {
     let at = order.iter().position(|o| *o == id).map_or(0, |p| p + 1);
@@ -5063,7 +5125,7 @@ fn focus_segment(
         && let Composition::Panes { layout, .. } = registry.composition()
     {
         seg.push_str(" · ");
-        seg.push_str(&zoom_badge(&pane_order(layout), id));
+        seg.push_str(&zoom_badge(&focus_order(registry, layout), id));
     }
     Some(seg)
 }
@@ -5116,27 +5178,27 @@ fn compose_sources(
     else {
         return PaneBlock::default();
     };
-    let order = pane_order(layout);
+    let order = focus_order(registry, layout);
     let blocks: Vec<PaneBlock> = registry
         .ids()
         .map(|id| {
             let source = &runtime[id.0];
             let spec = registry.spec(id);
-            let zoom_cursor = (view.zoomed == Some(id)).then(|| zoom_badge(&order, id));
-            // Navigation numbers: while ANY pane holds the focus,
-            // every title counts itself in reading order. The count
-            // deliberately continues past the ninth pane — the number
-            // names the declaration order, which is worth knowing on
-            // its own, and a future go-to-pane command can address it
-            // even though Alt-digit only reaches the first nine. At
-            // rest the board stays unnumbered.
-            let numbered = view.focus.is_some().then(|| {
-                let at = order.iter().position(|o| *o == id).map_or(0, |p| p + 1);
-                format!("{at} · {}", pane_display_name(registry, id))
-            });
             let pane = registry
                 .pane(id)
                 .expect("a Panes registry boxes every source");
+            let zoom_cursor = (view.zoomed == Some(id)).then(|| zoom_badge(&order, id));
+            // Navigation numbers: while ANY pane holds the focus,
+            // every focusable title counts itself in focus order. The count
+            // deliberately continues past the ninth pane — the number
+            // names the focusable-pane order, which is worth knowing on
+            // its own, and a future go-to-pane command can address it
+            // even though Alt-digit only reaches the first nine. At
+            // rest the board stays unnumbered.
+            let numbered = (view.focus.is_some() && pane.focusable).then(|| {
+                let at = order.iter().position(|o| *o == id).map_or(0, |p| p + 1);
+                format!("{at} · {}", pane_display_name(registry, id))
+            });
             let cadence = cadence_label(spec);
             // The last-CHANGE stamp, never last-produced: a produced-at
             // stamp would repaint every tick and cost byte-silence. A
@@ -6151,7 +6213,7 @@ mod tests {
 
     #[test]
     fn alt_digits_jump_to_a_numbered_pane() {
-        // Alt-1..9 address the reading order directly — the same
+        // Alt-1..9 address the focusable reading order directly — the same
         // order Tab cycles and the numbered titles display. Live
         // frame only, like every pane gesture (INV-3); a frozen frame
         // has no pane identity, and Alt-0 stays unbound.
@@ -7049,6 +7111,7 @@ mod tests {
             padding: Sides::default(),
             title: None,
             chrome: true,
+            focusable: true,
         };
         Registry::panes(
             vec![spec("tail"), spec("head")],
@@ -7088,6 +7151,7 @@ mod tests {
                 padding: Sides::default(),
                 title: None,
                 chrome: true,
+                focusable: true,
             })
             .collect::<Vec<_>>();
         let cells = (0..panes.len())
@@ -7349,6 +7413,7 @@ mod tests {
             padding: Sides::default(),
             title: None,
             chrome: false,
+            focusable: true,
         };
         use crate::core::registry::TitleSource;
         let build = |title: Option<&str>| {
@@ -7500,6 +7565,7 @@ mod tests {
                 padding: Sides::default(),
                 title: None,
                 chrome: false,
+                focusable: true,
             }],
             LayoutNode::Pane(SourceId(0)),
             0,
@@ -7557,6 +7623,7 @@ mod tests {
                 padding: Sides::default(),
                 title: None,
                 chrome: true,
+                focusable: true,
             }],
             LayoutNode::Pane(SourceId(0)),
             0,
@@ -8028,6 +8095,7 @@ mod tests {
             padding: Sides::default(),
             title: None,
             chrome: true,
+            focusable: true,
         };
         Registry::panes(
             vec![spec("left"), spec("right")],
@@ -8066,8 +8134,8 @@ mod tests {
         );
         assert!(!quiet.lines.iter().any(|l| l.contains("1 · ")));
 
-        // While ANY pane holds the focus, EVERY title counts itself in
-        // reading order — the label Alt-digit jumps by.
+        // While ANY pane holds the focus, EVERY focusable title counts
+        // itself in focus order — the label Alt-digit jumps by.
         let mut panes = PaneView::new(registry.len());
         panes.focus = Some(SourceId(1));
         let focused = compose_sources(
@@ -8111,6 +8179,7 @@ mod tests {
             padding: Sides::default(),
             title: None,
             chrome: false,
+            focusable: true,
         };
         let n = 11;
         let registry = Registry::panes(
@@ -8654,6 +8723,7 @@ mod tests {
             padding: Sides::default(),
             title: None,
             chrome: true,
+            focusable: true,
         };
         Registry::panes(
             vec![spec("left"), spec("right")],
@@ -9312,6 +9382,7 @@ mod tests {
             padding: Sides::default(),
             title: None,
             chrome: true,
+            focusable: true,
         };
         Registry::panes(
             vec![spec("a", a), spec("b", b)],

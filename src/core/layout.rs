@@ -529,6 +529,7 @@ mod tests {
             padding,
             title: None,
             chrome,
+            focusable: true,
         }
     }
 

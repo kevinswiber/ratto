@@ -132,6 +132,9 @@ pub struct PaneBox {
     pub title: Option<String>,
     /// The faint cadence/freshness row, the last interior row.
     pub chrome: bool,
+    /// Whether Tab, directional focus, and Alt-number jumps may target
+    /// this pane. It remains visible, live, and laid out either way.
+    pub focusable: bool,
 }
 
 impl PaneBox {
@@ -592,6 +595,7 @@ mod tests {
             },
             title: None,
             chrome: true,
+            focusable: true,
         }
     }
 

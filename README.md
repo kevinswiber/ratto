@@ -367,6 +367,8 @@ box, borders and chrome included — the pin is what keeps the frame's
 row count constant and repaints cheap. Longer output is cut by
 `overflow`: `keep-top` (the default) or `keep-bottom` for a log tail.
 `width` takes cells (`"40"`), a weight (`"2fr"`), or `"auto"`.
+`focusable #false` leaves a pane visible and running but removes it from
+pane navigation; use it for headings and other presentational panes.
 
 Every pane's last inner row is a faint `{cadence} · {stamp}` line the
 loop owns. The stamp is when that pane's output last *changed*, not
@@ -393,14 +395,14 @@ with an empty stdout rather than printing a partial frame.
 
 #### Pane navigation
 
-`Tab` and `BackTab` cycle the focus through the panes in layout
+`Tab` and `BackTab` cycle the focus through focusable panes in layout
 reading order, wrapping; `Alt-h/j/k/l` moves it directionally, and a
 direction with no candidate pane is a no-op rather than a wrap;
-`Alt-1`–`Alt-9` jump straight to a pane by its reading-order number.
-While any pane is focused, every title counts itself in declaration
-order (`1 · alpha`), so the jump targets are visible exactly while
+`Alt-1`–`Alt-9` jump straight to a focusable pane by its reading-order
+number. While any pane is focused, every focusable title counts itself
+in that order (`1 · alpha`), so the jump targets are visible exactly while
 you are navigating — at rest the board stays unnumbered. On a board
-with more than nine panes the count keeps going even though the jump
+with more than nine focusable panes the count keeps going even though the jump
 keys stop at `Alt-9`: the number still names the pane's place, and
 `Tab` reaches everything. The
 focused pane wears the accent border and the footer names it. On a
@@ -428,7 +430,7 @@ long-lived child, the same rule the gutter toggle and a resize already
 follow. A batch pane's content was rendered at its old declared width,
 so it re-runs once, debounced, to arrive at the zoomed width honestly —
 on zoom-in and zoom-out alike. While zoomed, `Tab`/`BackTab` — and an
-`Alt-digit` jump — carry the zoom from pane to pane along the reading
+`Alt-digit` jump — carry the zoom from focusable pane to focusable pane along the reading
 order, and the chrome row's `zoomed 2/4` badge names the pane's place
 in that cycle. The hidden panes
 keep running underneath, and per-pane scroll stays active over the

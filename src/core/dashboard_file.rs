@@ -119,6 +119,8 @@ pub struct PaneDecl {
     pub padding: Option<String>,
     pub title: Option<String>,
     pub chrome: Option<bool>,
+    /// Whether pane-navigation gestures may target this pane.
+    pub focusable: Option<bool>,
     /// The child is long-lived: spawn it once and show its output as it
     /// arrives, rather than waiting for an exit that is not coming.
     pub live: Option<bool>,
@@ -485,6 +487,7 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result
         padding,
         title: decl.title.clone().or_else(|| defaults.title.clone()),
         chrome: decl.chrome.or(defaults.chrome).unwrap_or(true),
+        focusable: decl.focusable.or(defaults.focusable).unwrap_or(true),
     })
 }
 
@@ -834,6 +837,35 @@ mod tests {
         assert!(
             !registry.spec(SourceId(1)).live,
             "a pane must be able to opt back out"
+        );
+    }
+
+    #[test]
+    fn focusability_defaults_true_and_inherits_with_an_override() {
+        let mut decl = file(vec![
+            pane("header", &["date"]),
+            PaneDecl {
+                focusable: Some(true),
+                ..pane("log", &["date"])
+            },
+        ]);
+        decl.defaults.focusable = Some(false);
+        let registry = decl.into_registry().expect("registry");
+        assert!(
+            !registry.pane(SourceId(0)).expect("header box").focusable,
+            "the header inherits the default"
+        );
+        assert!(
+            registry.pane(SourceId(1)).expect("log box").focusable,
+            "a pane can opt back in"
+        );
+
+        let ordinary = file(vec![pane("ordinary", &["date"])])
+            .into_registry()
+            .expect("registry");
+        assert!(
+            ordinary.pane(SourceId(0)).expect("ordinary box").focusable,
+            "omission preserves the existing focus behavior"
         );
     }
 
