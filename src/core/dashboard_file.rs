@@ -1462,8 +1462,6 @@ pub struct Board {
     /// fields already expanded, `output` and the shell already read,
     /// the argv already checked. Every consumer past this point reads
     /// text and calls no substitution function of its own.
-    #[allow(dead_code)]
-    // The loop consumes this next (via SessionArgs); only tests read it today.
     pub bindings: Vec<KeyBinding>,
 }
 

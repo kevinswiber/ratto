@@ -39,6 +39,7 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
     let board = validated(&file, profile != ColorProfile::Ascii, &overrides)?;
     let registry = board.registry;
     let variables = board.variables;
+    let bindings = board.bindings;
     let once_timeout = args
         .once_timeout
         .as_deref()
@@ -78,6 +79,7 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
         // need its own treatment first.
         append: false,
         variables,
+        bindings,
     };
     run_registry(registry, session, profile, palette)
 }

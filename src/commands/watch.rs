@@ -23,6 +23,7 @@ use crate::color::{ColorProfile, SystemEnv};
 use crate::core::child::{
     ChildSlot, ShutdownGuard, TickEvent, not_started, run_tick, spawn_live_tick, spawn_tick,
 };
+use crate::core::dashboard_file::KeyBinding;
 use crate::core::duration::{brief_duration, parse_interval};
 use crate::core::layout::{
     PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
@@ -162,6 +163,10 @@ pub(crate) struct SessionArgs {
     /// `rat watch` and for every board with no `variables` block,
     /// which is the spawn site's fast-path gate.
     pub variables: SpawnVariables,
+    /// The board's declared key bindings, in declaration order. Empty
+    /// for `rat watch`, which has no declaration file to hold any:
+    /// the index a dispatch answer carries is an index into THIS list.
+    pub bindings: Vec<KeyBinding>,
 }
 
 /// Parse the watch flags, build the one-source registry, run it. The
@@ -239,6 +244,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         // `rat watch` has no board and therefore no variables: the
         // empty context is the whole of its behavior.
         variables: SpawnVariables::default(),
+        bindings: Vec::new(),
     };
     run_registry(registry, session, profile, palette)
 }
@@ -1684,7 +1690,12 @@ pub(crate) fn run_registry(
                         TapEvent::Key(key) => {
                             let mode = mode_of(pause.as_ref(), live_scroll);
                             let action = resolve_page_or_zoom(action_for(key, mode), mode, &panes);
-                            resolve_esc(action, &panes)
+                            let action = resolve_esc(action, &panes);
+                            // Last in the chain, and it reads that way
+                            // for a reason: it fires only on a declined
+                            // key, so a built-in has already had every
+                            // chance to answer.
+                            resolve_binding(action, mode, key, &session.bindings)
                         }
                         // Gated on LIVE capture, not just the flag: a
                         // terminal that keeps reporting after a release
@@ -2653,12 +2664,11 @@ pub(crate) fn run_registry(
                                 &history,
                             )?);
                         }
-                        // The resolver answers this once the key table
-                        // has declined; running it is the runner's, and
-                        // the disposition is applied where the renderer
-                        // is in hand. Inert until then, and deliberately
-                        // adjacent to Ignore so the two read as the same
-                        // "nothing happens yet".
+                        // Answered by `resolve_binding` once the key
+                        // table has declined. Still inert: the runner —
+                        // the activation, its gates, and the spawn — is
+                        // the next phase's, and the disposition is
+                        // applied where the renderer is in hand.
                         WatchAction::RunBinding(_) => {}
                         WatchAction::Ignore => {}
                     }
@@ -2938,7 +2948,6 @@ enum WatchAction {
     ///
     /// `usize` keeps the enum `Copy` — the dispatch matches by value
     /// and re-binds with `action @ (…)` patterns.
-    #[allow(dead_code)] // The resolver constructs this next; only tests name it today.
     RunBinding(usize),
     Ignore,
 }
@@ -3219,6 +3228,54 @@ fn resolve_page_or_zoom(action: WatchAction, mode: FrameMode, panes: &PaneView) 
     match scroll_target(mode, panes) {
         Some(id) if panes.zoomed != Some(id) => WatchAction::ToggleZoom,
         _ => WatchAction::Page,
+    }
+}
+
+/// A declared binding's meaning, resolved where the board's own
+/// declarations are visible. Two gates stand before it, and both are
+/// required:
+///
+/// - the key table must have DECLINED — a built-in always wins; and
+/// - the key must be unclaimed in EVERY mode, not merely in this one.
+///
+/// The second gate is not redundant. Several built-ins are
+/// mode-conditional and fall to `Ignore` outside their mode (`F` on a
+/// live frame; `>` and `.` off a frozen one), so an "answered Ignore"
+/// test alone would hand a reader's `F` to a board's binding the moment
+/// the frame was live. `builtin_key` is the one derivation from the
+/// table itself, so this gate and the parse-time refusal cannot drift.
+/// It stays inline rather than hoisted: at most three table lookups,
+/// on a key the table already declined — the rarest keypress there is
+/// — and local is what keeps the guarantee readable next to the gate
+/// it guards.
+///
+/// Unlike its siblings this takes the KEY, not just the action: the
+/// table answers in meanings and discards the spelling, and a binding
+/// is looked up by spelling. The lookup is `Key`-to-`Key` equality —
+/// the spelling was parsed once at load, and re-parsing here would put
+/// the grammar in the keypress path.
+///
+/// Frozen frames are inert, exactly as every pane gesture is: a paused
+/// frame is a composed string with no pane identity in it, and the
+/// selection a later action reads comes from a pane.
+///
+/// A pure function over `(action, mode, key, &[KeyBinding])`, and
+/// deliberately not over `&SessionArgs` or `&PaneView`: that is what
+/// makes the precedence matrices cheap enough to be TOTAL rather than
+/// sampled, and the matrix is the whole evidentiary basis for the
+/// built-ins-always-win rule.
+fn resolve_binding(
+    action: WatchAction,
+    mode: FrameMode,
+    key: Key,
+    bindings: &[KeyBinding],
+) -> WatchAction {
+    if action != WatchAction::Ignore || mode == FrameMode::Paused || builtin_key(key).is_some() {
+        return action;
+    }
+    match bindings.iter().position(|declared| declared.key == key) {
+        Some(index) => WatchAction::RunBinding(index),
+        None => action,
     }
 }
 
@@ -11197,5 +11254,223 @@ mod tests {
         for key in crate::core::key_spelling::ascii_spellable() {
             assert_ne!(builtin_key(key), Some(binding_phrase), "{key:?}");
         }
+    }
+    // ─── resolve_binding ────────────────────────────────────────────
+
+    /// A binding whose only interesting field is the key it answers to.
+    /// The resolver reads nothing else, and a test that supplies more is
+    /// a test that would keep passing if the resolver started reading it.
+    fn declared_binding(key: Key) -> crate::core::dashboard_file::KeyBinding {
+        crate::core::dashboard_file::KeyBinding {
+            key,
+            spelling: crate::core::key_spelling::spelling_of(key),
+            description: "x".to_string(),
+            program: crate::core::dashboard_file::BindingProgram::Argv(vec![Template::extract(
+                "true",
+            )]),
+            shell: crate::core::registry::ShellMode::Direct,
+            when: None,
+            when_shell: None,
+            output: crate::core::dashboard_file::BindingOutput::Status,
+            confirm: None,
+        }
+    }
+
+    #[test]
+    fn an_unclaimed_declared_key_resolves_to_its_binding() {
+        // Index 1, never 0: a resolver that hardcodes the first entry
+        // passes an index-0 test forever.
+        let bindings = [
+            declared_binding(Key::Char('a')),
+            declared_binding(Key::Char('r')),
+        ];
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(
+                resolve_binding(WatchAction::Ignore, mode, Key::Char('r'), &bindings),
+                WatchAction::RunBinding(1),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_undeclared_key_stays_ignored() {
+        // The board declared bindings; this key is not one of them, and
+        // an unbound key must stay as dead as it was before the feature
+        // existed.
+        let bindings = [
+            declared_binding(Key::Char('a')),
+            declared_binding(Key::Char('r')),
+        ];
+        for mode in FRAME_MODES {
+            assert_eq!(
+                resolve_binding(WatchAction::Ignore, mode, Key::Char('y'), &bindings),
+                WatchAction::Ignore,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_other_action_passes_through_untouched() {
+        // The pressed key IS declared, deliberately: a resolver that
+        // checked the key before checking the action would override a
+        // built-in the instant the two coincide.
+        let bindings = [declared_binding(Key::Char('r'))];
+        let actions = [
+            WatchAction::Quit,
+            WatchAction::Abort,
+            WatchAction::Page,
+            WatchAction::PageOrZoom,
+            WatchAction::Help,
+            WatchAction::Snapshot,
+            WatchAction::Resume,
+            WatchAction::Freeze,
+            WatchAction::ScrubBack,
+            WatchAction::ScrubForward,
+            WatchAction::ToggleWrap,
+            WatchAction::ShiftLeft,
+            WatchAction::ShiftRight,
+            WatchAction::ToggleGutter,
+            WatchAction::ToggleHighlight,
+            WatchAction::ToggleTime,
+            WatchAction::ToggleMouse,
+            WatchAction::FocusNext,
+            WatchAction::FocusPrev,
+            WatchAction::ClearFocus,
+            WatchAction::ToggleZoom,
+            WatchAction::ToggleCollapse,
+            WatchAction::Scroll(ScrollStep::LineDown),
+            WatchAction::ScrollN(ScrollStep::LineUp, 3),
+            WatchAction::FocusJump(2),
+            WatchAction::FocusMove(FocusDir::Left),
+        ];
+        for action in actions {
+            for mode in FRAME_MODES {
+                assert_eq!(
+                    resolve_binding(action, mode, Key::Char('r'), &bindings),
+                    action,
+                    "{action:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    /// The list is built by hand ON PURPOSE: the parser refuses a
+    /// binding on a claimed key at load (the conflict refusal). The
+    /// runtime gate is the SECOND line of defense, and a guarantee that
+    /// can only be tested through the thing that makes it unnecessary
+    /// is not tested at all.
+    #[test]
+    fn a_claimed_key_never_reaches_a_binding() {
+        for key in crate::core::key_spelling::ascii_spellable() {
+            if builtin_key(key).is_none() {
+                continue;
+            }
+            for mode in FRAME_MODES {
+                assert_eq!(
+                    resolve_binding(action_for(key, mode), mode, key, &[declared_binding(key)]),
+                    action_for(key, mode),
+                    "{key:?} mode={mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_binding_list_is_the_identity() {
+        // The structural half of INV-3, total: a board that declares no
+        // bindings takes exactly the dispatch it took before this plan
+        // existed, for every key it is possible to press.
+        for key in crate::core::key_spelling::ascii_spellable() {
+            for mode in FRAME_MODES {
+                assert_eq!(
+                    resolve_binding(action_for(key, mode), mode, key, &[]),
+                    action_for(key, mode),
+                    "{key:?} mode={mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_call_site_chain_answers_the_same_thing() {
+        // 0026's fixture blind spot, discharged where it is cheap and
+        // total: the composed chain is driven over a PaneView matrix
+        // that is NOT only rest, so neither resolver upstream can eat
+        // or alter a binding answer in any pane state.
+        let bindings = [declared_binding(Key::Char('r'))];
+        let chain = |key: Key, mode: FrameMode, panes: &PaneView| {
+            let action = resolve_page_or_zoom(action_for(key, mode), mode, panes);
+            let action = resolve_esc(action, panes);
+            resolve_binding(action, mode, key, &bindings)
+        };
+        let mut focused = PaneView::new(2);
+        focused.focus = Some(SourceId(1));
+        let mut zoomed = PaneView::new(2);
+        zoomed.focus = Some(SourceId(1));
+        zoomed.zoomed = Some(SourceId(1));
+        let mut scrolled = PaneView::new(2);
+        scrolled.scroll[0] = LiveScroll::at(3, 30, 10);
+        for panes in [PaneView::new(2), focused, zoomed, scrolled] {
+            for mode in FRAME_MODES {
+                assert_eq!(
+                    chain(Key::Char('r'), mode, &panes),
+                    resolve_binding(WatchAction::Ignore, mode, Key::Char('r'), &bindings),
+                    "{mode:?} panes={:?}",
+                    panes.key()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_scrolled_live_frame_still_runs_its_bindings() {
+        // The sibling trap as its own named test: 0026's live pass
+        // caught `mode == Live` gating in the field — every fixture had
+        // pressed its key at live rest. `LiveScrolled` is on the firing
+        // side; `Paused` is not.
+        let bindings = [declared_binding(Key::Char('r'))];
+        assert_eq!(
+            resolve_binding(
+                WatchAction::Ignore,
+                FrameMode::LiveScrolled,
+                Key::Char('r'),
+                &bindings
+            ),
+            WatchAction::RunBinding(0)
+        );
+        assert_eq!(
+            resolve_binding(
+                WatchAction::Ignore,
+                FrameMode::Paused,
+                Key::Char('r'),
+                &bindings
+            ),
+            WatchAction::Ignore
+        );
+    }
+
+    #[test]
+    fn a_duplicate_spelling_takes_the_first_declaration() {
+        // The grammar refuses a duplicate `key` node at load, so this is
+        // unreachable from a real board; the assertion is about the
+        // LOOKUP being deterministic, not about what a board may
+        // declare — an order-dependent answer is the kind of thing that
+        // becomes load-bearing by accident once a second way to declare
+        // a binding exists.
+        let bindings = [
+            declared_binding(Key::Char('r')),
+            declared_binding(Key::Char('r')),
+        ];
+        assert_eq!(
+            resolve_binding(
+                WatchAction::Ignore,
+                FrameMode::Live,
+                Key::Char('r'),
+                &bindings
+            ),
+            WatchAction::RunBinding(0)
+        );
     }
 }
