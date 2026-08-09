@@ -29,6 +29,7 @@ use crate::core::registry::{
 use crate::core::template::{Bindings, Template, reference_at};
 use crate::core::trigger::parse_trigger;
 use crate::core::variables::{Expanded, Tier, VariableBlock};
+use crate::ui::key::Key;
 
 /// `rat watch --trigger-debounce`'s default, reused verbatim so a pane
 /// and a watch behave the same when neither says otherwise.
@@ -74,6 +75,10 @@ pub struct DashboardFile {
     /// absent stacks every pane in declaration order. The top-level
     /// items compose as a column, exactly as the engine's tree does.
     pub layout: Option<Vec<LayoutDecl>>,
+    /// The board's declared bindings, in declaration order — which is
+    /// the order the `?` section lists them and the order a conflict
+    /// is reported in.
+    pub bindings: Vec<KeyBindingDecl>,
 }
 
 /// A declared layout node: a pane by name, or a row/column of nested
@@ -145,6 +150,110 @@ pub struct PaneDecl {
     pub live: Option<bool>,
 }
 
+/// One binding **as declared** — the `key` node's twin of [`PaneDecl`].
+/// Strings are `Template`s; nothing here is expanded, resolved, or
+/// inherited. The node-local rules are already applied: a
+/// `description` exists, and exactly one program form does.
+#[derive(Clone, PartialEq, Debug)]
+pub struct KeyBindingDecl {
+    /// The key as spelled, already held to the vocabulary the loop
+    /// speaks. This is what dispatch matches on.
+    pub key: Key,
+    /// The positional **verbatim**, as the author wrote it. Beside the
+    /// parsed key, not instead of it: every surface that talks about
+    /// this binding — the `?` section, the status row, the conflict
+    /// refusal — echoes these bytes, so the displayed key and the KDL
+    /// line are the same text and a reader who greps one finds the
+    /// other. There is exactly one canonical spelling per key, so this
+    /// always equals what the renderer would produce; echoing is
+    /// preferred because it costs nothing and cannot drift.
+    pub spelling: String,
+    /// Required — the `?` reference is a board's only discovery
+    /// surface.
+    pub description: Template,
+    pub program: BindingProgram,
+    /// `None` inherits from `defaults`, exactly as a pane's does.
+    pub shell: Option<ShellDecl>,
+    /// The precondition, run before everything else. A command
+    /// string handed to a shell at the keypress — never parsed into a
+    /// typed value here.
+    pub when: Option<Template>,
+    /// The token as written. Parsed into a [`BindingOutput`] at load,
+    /// after expansion — the same placement `interval` has, and for
+    /// the same reason: it is a string site like any other.
+    pub output: Option<Template>,
+    pub confirm: Option<Template>,
+}
+
+/// One binding **as loaded** — what the board runs and every surface
+/// reads. Two things happened between this and the declaration, and
+/// the field types say which is which:
+///
+/// - **Load sites are expanded.** `description` and `confirm` are
+///   painted, not spawned: the `?` section and the confirm gate have
+///   no spawn to expand at, so their text is final here and no reader
+///   downstream calls a substitution function. `output` and the
+///   `shell` dialect name parse into typed values, which can only
+///   happen after expansion.
+/// - **Spawn sites stay templates.** `command`, `script` and `when`
+///   are handed to a shell when the key is pressed, so they are
+///   expanded there, against the map that exists then.
+#[derive(Clone, PartialEq, Debug)]
+pub struct KeyBinding {
+    pub key: Key,
+    pub spelling: String,
+    pub description: String,
+    pub program: BindingProgram,
+    /// Resolved: the binding's own, else the `defaults` block's, then
+    /// through the promote/refuse ladder. A shebang-less `script`
+    /// body never leaves this as `Direct`, which is the guarantee the
+    /// action builder indexes on.
+    pub shell: ShellMode,
+    pub when: Option<Template>,
+    /// The shell the **precondition** runs under, resolved separately
+    /// and for a reason the single `shell` field cannot express.
+    ///
+    /// A `when` value is a command LINE — `test -s ./x`,
+    /// `[ "$RAT_SELECTION_PANE" = requests ]` — not an argv. It has no
+    /// meaning without a shell, so an absent shell promotes to
+    /// `Platform` here while an argv `command` stays `Direct`. One
+    /// field cannot hold both answers, and deriving the second at
+    /// spawn time would make the gate guess at provenance the load
+    /// already knew.
+    ///
+    /// `None` exactly when `when` is `None`. An explicit `shell #false`
+    /// **with** a `when` is refused at load rather than promoted: the
+    /// author asked for no shell, and quietly giving them one is how a
+    /// board comes to depend on a promotion nobody wrote down.
+    pub when_shell: Option<ShellMode>,
+    pub output: BindingOutput,
+    pub confirm: Option<String>,
+}
+
+/// The two program forms a binding may take — the pane's own two
+/// (`SourceProgram`), declared rather than resolved. They become a
+/// `SourceProgram` at the action spawn; nothing here materializes a
+/// body or picks an interpreter.
+#[derive(Clone, PartialEq, Debug)]
+pub enum BindingProgram {
+    Argv(Vec<Template>),
+    Script(Template),
+}
+
+/// What the board does with an action's output.
+///
+/// [`Default`] is where the ruled default lives, once: `"hide"` is too
+/// quiet for a destructive action and `"pager"` steals the screen for
+/// a command that may print nothing, so a status line is the
+/// least-astonishing middle.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum BindingOutput {
+    Hide,
+    #[default]
+    Status,
+    Pager,
+}
+
 impl DashboardFile {
     /// The ONE validation path: resolve defaults, parse every token,
     /// check the layout, build the registry. Every error names the
@@ -193,6 +302,26 @@ impl DashboardFile {
         )?
         .with_title(self.resolve_title(&names, bindings)?)
         .with_diagnostics(Self::collect_diagnostics(&names)))
+    }
+
+    /// Every binding, loaded: display fields expanded against the
+    /// resolved load-tier map, `output` and the shell dialect name
+    /// read after expansion, the shell inherited and then run through
+    /// the ladder, the argv checked non-empty, `when`'s own shell
+    /// resolved. Every error names the binding first, exactly as
+    /// `at(id)` makes every pane error name its pane.
+    ///
+    /// `load` is the SAME map the pane side expands against — the
+    /// once-at-load derivations with `-v` overrides already folded in.
+    /// Taking it as a parameter rather than deriving it here is what
+    /// keeps one evaluation per load: a second derivation would re-run
+    /// every command variable and could disagree with the panes about
+    /// the same name.
+    pub fn resolve_bindings(&self, load: &Bindings) -> anyhow::Result<Vec<KeyBinding>> {
+        self.bindings
+            .iter()
+            .map(|decl| resolve_binding(decl, &self.defaults, &self.variables, load))
+            .collect()
     }
 
     /// The declared title against the declared panes: a `ref` binds
@@ -648,7 +777,7 @@ fn refuse_deferred_at_load_site(
 /// must be template-free — nothing more. A body starting with `[ "` or
 /// `echo` is already classified correctly at load, so a `{{rev}}`
 /// guard on line 1 is fine.
-fn script_first_bytes(body: &Template, subject: &str) -> anyhow::Result<()> {
+fn script_first_bytes(body: &Template, subject: &str, noun: &str) -> anyhow::Result<()> {
     // A raw body is literal end to end (INV-1), so nothing here can
     // apply. THIS GUARD IS `reference_at`'s DOCUMENTED PRECONDITION,
     // not a local optimization: it reads bytes, and a raw body's bytes
@@ -669,7 +798,7 @@ fn script_first_bytes(body: &Template, subject: &str) -> anyhow::Result<()> {
                  the `#!` line names the body's interpreter and is read at load, before \
                  any variable expands, so it must be written out in full. Write the \
                  interpreter literally, or drop the `#!` line to run the body through \
-                 the pane's shell"
+                 the {noun}'s shell"
             );
         }
         return Ok(());
@@ -859,17 +988,60 @@ fn resolve_script(
     inherited: bool,
     id: &str,
 ) -> anyhow::Result<(SourceProgram, ShellMode)> {
-    if body.as_str().trim().is_empty() {
+    let mode = script_ladder(
+        body,
+        decl.shell.as_ref(),
+        decl.shell.as_ref().or(defaults.shell.as_ref()),
+        shell,
+        &at(id),
+        "pane",
+    )?;
+    // The inherit-guard is the pane's own fifth rule — a binding never
+    // inherits its program, so it lives beside the ladder rather than
+    // in it. It applies only to a shebang-less body: a `#!` names its
+    // own interpreter, so the shell mode it inherited under is inert.
+    if shebang(body.as_str()).is_none() && inherited && shell != defaults_shell {
         bail!(
-            "{}: `script` has no body — write the script inside a `\"\"\"` \
-             block, or drop the key",
-            at(id)
+            "{}: inherits `script` from `defaults` but overrides \
+             `shell` — the inherited body was written under the \
+             defaults' shell mode ({}), not this pane's ({}); declare \
+             the pane's own `script`",
+            at(id),
+            mode_label(defaults_shell),
+            mode_label(shell),
         );
     }
-    script_first_bytes(body, &at(id))?;
+    Ok((SourceProgram::Script(body.clone()), mode))
+}
+
+/// The script-body ladder — the rulings every `script` body gets,
+/// whoever declares it (a pane or a binding): an empty body is
+/// refused, a `#!` body refuses a declared running shell, an indented
+/// `#!` is refused, a shebang-less body under an explicit
+/// `shell #false` is refused, and a shebang-less body promotes
+/// `Direct` to the platform shell. ONE implementation, two callers —
+/// `resolve_script` (panes) and `resolve_binding` — so the rulings
+/// cannot drift into two spellings. The promotion is the guarantee
+/// the spawn side's `expect` rests on: a shebang-less body never
+/// resolves to `Direct`.
+fn script_ladder(
+    body: &Template,
+    own_shell: Option<&ShellDecl>,
+    declared_shell: Option<&ShellDecl>,
+    shell: &ShellMode,
+    subject: &str,
+    noun: &str,
+) -> anyhow::Result<ShellMode> {
+    if body.as_str().trim().is_empty() {
+        bail!(
+            "{subject}: `script` has no body — write the script inside a `\"\"\"` \
+             block, or drop the key"
+        );
+    }
+    script_first_bytes(body, subject, noun)?;
     match shebang(body.as_str()) {
         Some(line) => {
-            if let Some(own) = &decl.shell
+            if let Some(own) = own_shell
                 && own.runs_a_shell()
             {
                 let spelled = match &line.arg {
@@ -877,57 +1049,147 @@ fn resolve_script(
                     None => line.interpreter.clone(),
                 };
                 bail!(
-                    "{}: declares `shell` and a `script` whose `#!` line \
-                     already names its interpreter (`{}`) — the `#!` wins \
+                    "{subject}: declares `shell` and a `script` whose `#!` line \
+                     already names its interpreter (`{spelled}`) — the `#!` wins \
                      and {} would never run. Drop `shell`, or drop the \
                      `#!` line to run the body through {}",
-                    at(id),
-                    spelled,
                     shell_label(own),
                     shell_label(own),
                 );
             }
-            Ok((SourceProgram::Script(body.clone()), shell.clone()))
+            Ok(shell.clone())
         }
         None => {
             let first = body.as_str().lines().next().unwrap_or("");
             if first.trim_start().starts_with("#!") {
                 bail!(
-                    "{}: the `#!` line must be the body's first two bytes, \
+                    "{subject}: the `#!` line must be the body's first two bytes, \
                      but this one is indented. KDL removes the closing \
                      `\"\"\"`'s indentation from every line — align the \
-                     closing `\"\"\"` with the script",
-                    at(id)
+                     closing `\"\"\"` with the script"
                 );
             }
-            let explicit = decl.shell.as_ref().or(defaults.shell.as_ref());
-            if matches!(explicit, Some(ShellDecl::Direct)) {
+            if matches!(declared_shell, Some(ShellDecl::Direct)) {
                 bail!(
-                    "{}: `script` runs through a shell, but this pane \
+                    "{subject}: `script` runs through a shell, but this {noun} \
                      declares `shell #false` — a body has no argv to execute \
                      directly. Drop the `shell #false`, or write the program \
-                     as `command`",
-                    at(id)
+                     as `command`"
                 );
             }
-            if inherited && shell != defaults_shell {
-                bail!(
-                    "{}: inherits `script` from `defaults` but overrides \
-                     `shell` — the inherited body was written under the \
-                     defaults' shell mode ({}), not this pane's ({}); declare \
-                     the pane's own `script`",
-                    at(id),
-                    mode_label(defaults_shell),
-                    mode_label(shell),
-                );
-            }
-            let shell = match shell {
+            Ok(match shell {
                 ShellMode::Direct => ShellMode::Platform,
                 other => other.clone(),
-            };
-            Ok((SourceProgram::Script(body.clone()), shell))
+            })
         }
     }
+}
+
+/// The binding half of what `resolve_source` does for a pane: the
+/// load-site expansions, the shell inheritance and ladder, the argv
+/// guarantee, and the precondition's own shell. Spawn sites
+/// (`command`, `script`, `when`) ride through as templates — they
+/// expand at the keypress, against the map that exists then.
+fn resolve_binding(
+    decl: &KeyBindingDecl,
+    defaults: &PaneDecl,
+    block: &VariableBlock,
+    bindings: &Bindings,
+) -> anyhow::Result<KeyBinding> {
+    let at = format!("key {:?}", decl.spelling);
+    // The display fields are painted, never spawned, so a per-spawn
+    // value has no moment to be derived in — refused, naming the field
+    // and the variable, exactly as a pane's load sites are.
+    refuse_deferred_at_load_site(&decl.description, "description", false, block, &at)?;
+    let description = at_load(&decl.description, bindings)?.into_owned();
+    let confirm = match &decl.confirm {
+        Some(text) => {
+            refuse_deferred_at_load_site(text, "confirm", false, block, &at)?;
+            Some(at_load(text, bindings)?.into_owned())
+        }
+        None => None,
+    };
+    // The dialect name is a load-time site like a pane's (`shell` is
+    // the one key a binding inherits, by the same rule).
+    if let Some((ShellDecl::Named(name), inherited)) =
+        inherit(decl.shell.as_ref(), defaults.shell.as_ref())
+    {
+        refuse_deferred_at_load_site(name, "shell", inherited, block, &at)?;
+    }
+    let declared_shell = decl.shell.as_ref().or(defaults.shell.as_ref());
+    let resolved_shell = declared_shell
+        .cloned()
+        .unwrap_or_default()
+        .resolve(bindings)
+        .with_context(|| at.clone())?;
+    let output = match &decl.output {
+        Some(token) => {
+            refuse_deferred_at_load_site(token, "output", false, block, &at)?;
+            match at_load(token, bindings)?.as_ref() {
+                "hide" => BindingOutput::Hide,
+                "status" => BindingOutput::Status,
+                "pager" => BindingOutput::Pager,
+                _ => bail!(
+                    "{at}: `output` takes \"hide\", \"status\", or \"pager\" — \
+                     write `output \"status\"`"
+                ),
+            }
+        }
+        None => BindingOutput::default(),
+    };
+    let (program, shell) = match &decl.program {
+        BindingProgram::Argv(argv) => {
+            // `command ""` survives the walk — one positional — and
+            // splits to nothing. `SourceProgram::Argv` is never empty,
+            // and the action builder indexes `argv[0]` on that promise.
+            if argv.is_empty() {
+                bail!(
+                    "{at}: `command` is empty — a binding with nothing to run \
+                     is a key that does nothing"
+                );
+            }
+            (BindingProgram::Argv(argv.clone()), resolved_shell.clone())
+        }
+        BindingProgram::Script(body) => {
+            let mode = script_ladder(
+                body,
+                decl.shell.as_ref(),
+                declared_shell,
+                &resolved_shell,
+                &at,
+                "binding",
+            )?;
+            (BindingProgram::Script(body.clone()), mode)
+        }
+    };
+    // The precondition's shell, from the DECLARATION rather than the
+    // ladder's result: a command line needs a shell, so absence
+    // promotes to `Platform` — while an explicit `shell #false` is a
+    // declaration, and quietly overriding it is how a board comes to
+    // depend on a promotion nobody wrote down.
+    let when_shell = match &decl.when {
+        None => None,
+        Some(_) => Some(match declared_shell {
+            None => ShellMode::Platform,
+            Some(ShellDecl::Direct) => bail!(
+                "{at}: `when` is a command line and runs through a shell, but \
+                 this binding declares `shell #false` — drop the \
+                 `shell #false`, or drop the `when`"
+            ),
+            Some(named) => named.resolve(bindings).with_context(|| at.clone())?,
+        }),
+    };
+    Ok(KeyBinding {
+        key: decl.key,
+        spelling: decl.spelling.clone(),
+        description,
+        program,
+        shell,
+        when: decl.when.clone(),
+        when_shell,
+        output,
+        confirm,
+    })
 }
 
 fn resolve_box(
@@ -1200,6 +1462,44 @@ pub fn load(
     overrides: &Bindings,
 ) -> anyhow::Result<(Registry, crate::core::shell::SpawnVariables)> {
     let (text, file) = read_and_parse(path, colored, overrides)?;
+    let board = finish_load(path, &text, file, overrides)?;
+    Ok((board.registry, board.variables))
+}
+
+/// What loading a board produces — this module's product, beside the
+/// two binding records above.
+pub struct Board {
+    pub registry: Registry,
+    pub variables: crate::core::shell::SpawnVariables,
+    /// The **loaded** bindings, never the declared ones: display
+    /// fields already expanded, `output` and the shell already read,
+    /// the argv already checked. Every consumer past this point reads
+    /// text and calls no substitution function of its own.
+    #[allow(dead_code)]
+    // The command layer's load pipeline consumes this next; only tests read it today.
+    pub bindings: Vec<KeyBinding>,
+}
+
+/// Finish loading an already-parsed board: resolve the variables
+/// once, build the registry, and load the bindings against that same
+/// map.
+///
+/// Split from [`load`] so a caller can interpose a check **core
+/// cannot make** between parsing and loading. With only `load`,
+/// ordering such a check would force a re-read, a second variable
+/// derivation, or a core-to-commands call — all worse than one
+/// nameable second half. This function knows nothing beyond this
+/// module's own rules.
+///
+/// `path` and `text` are the two things `read_and_parse` handed back
+/// beside the file: the breadcrumb every error carries, and the
+/// document a derivation failure is placed into.
+pub fn finish_load(
+    path: &std::path::Path,
+    text: &str,
+    file: DashboardFile,
+    overrides: &Bindings,
+) -> anyhow::Result<Board> {
     // The runner is passed as a PARAMETER, not called from inside
     // `resolve_variables`: that inversion is what lets the graph walk
     // be tested with no subprocess, lets a checker hold a
@@ -1218,7 +1518,7 @@ pub fn load(
                 match file.variables.get(request.name) {
                     Some(variable) => {
                         let (line, column) =
-                            crate::core::dashboard_kdl::line_column(&text, variable.span.start);
+                            crate::core::dashboard_kdl::line_column(text, variable.span.start);
                         anyhow::anyhow!(
                             "{}",
                             crate::core::dashboard_kdl::syntax_error_text(
@@ -1239,10 +1539,19 @@ pub fn load(
         bindings.clone(),
         overrides.clone(),
     );
+    // The pane errors keep reporting first — the panes are the board's
+    // substance — so the binding resolution's verdict is held until the
+    // registry has had its say.
+    let key_bindings = file.resolve_bindings(&bindings);
     let registry = file
         .into_registry(&bindings)
         .with_context(|| format!("in {}", path.display()))?;
-    Ok((registry, variables))
+    let key_bindings = key_bindings.with_context(|| format!("in {}", path.display()))?;
+    Ok(Board {
+        registry,
+        variables,
+        bindings: key_bindings,
+    })
 }
 
 #[cfg(test)]

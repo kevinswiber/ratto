@@ -8,9 +8,6 @@ pub mod decode;
 pub mod duration;
 pub mod fuzzy;
 pub mod join;
-// Consumed by the dashboard walk's `key` node; until that node lands,
-// only tests read this module.
-#[allow(dead_code)]
 pub mod key_spelling;
 pub mod layout;
 pub mod live;

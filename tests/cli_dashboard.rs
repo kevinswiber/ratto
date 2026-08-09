@@ -2786,3 +2786,22 @@ fn the_variables_example_renders_once() {
         "the raw title kept its braces: {stdout}"
     );
 }
+
+#[test]
+fn a_binding_without_a_description_names_itself_and_the_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "key \"r\" {\n    command \"true\"\n}\n\npane \"a\" {\n    command \"true\"\n    height 3\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "key \"r\": this binding needs a `description`",
+        ))
+        .stderr(predicates::str::contains("board.kdl"));
+}

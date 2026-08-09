@@ -10,7 +10,9 @@
 //! and have no property spelling, because a KDL property holds exactly
 //! one value. `row`, `column`, `gap` and `row-gap` are not keys —
 //! containers hold only cells, and `gap`/`row-gap` are the dashboard's,
-//! written once at the top level.
+//! written once at the top level. The same rule governs a `key` block:
+//! one value per key, either spelling, and `command` alone holds a
+//! list.
 //!
 //! It is written here, and in `examples/panes.kdl`'s header, because a
 //! rule that is real, uniform and mechanically enforced still reads as
@@ -35,48 +37,59 @@
 //! | document `gap`, `row-gap` | — | `usize_field` | no — integers |
 //! | pane id positional | — | `one_id` | **refused** by the existing charset check |
 //! | `variables` values | — | `variables_block` | yes — validated by `classify` |
+//! | binding `command` | `List` | `many_text` | yes |
+//! | binding `script`, `when`, `description`, `confirm`, `output` | `Text` | `prop_text` / `one_text` | yes |
+//! | binding `shell` | `FlagOrText` | `shell_decl` → `ShellDecl::Named(Template)` | yes, in its string arm |
+//! | binding key positional | — | `one_spelling` | **refused** — a key is identity (the pane-id argument) |
 
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 
-use crate::core::dashboard_file::{DashboardFile, LayoutDecl, PaneDecl};
+use crate::core::dashboard_file::{
+    BindingProgram, DashboardFile, KeyBindingDecl, LayoutDecl, PaneDecl,
+};
+use crate::core::key_spelling::parse_key;
 use crate::core::registry::ShellDecl;
 use crate::core::template::{Template, is_reference_name};
 use crate::core::variables::{Tier, VarSource, Variable, VariableBlock};
+use crate::ui::key::Key;
 
 /// The one function that puts a key's value on the declaration. The
 /// variant IS the key's shape: it says what the value looks like, and
 /// therefore where it may be written — a KDL property holds exactly one
-/// value, so only `List` lacks a property spelling.
-enum Set {
-    Text(fn(&mut PaneDecl, Template)),
-    Count(fn(&mut PaneDecl, i128, &Ctx<'_>) -> anyhow::Result<()>),
-    Flag(fn(&mut PaneDecl, bool)),
-    List(fn(&mut PaneDecl, Vec<Template>, &Ctx<'_>) -> anyhow::Result<()>),
+/// value, so only `List` lacks a property spelling. Generic over the
+/// declaration it targets: a `pane`/`defaults` block builds a
+/// [`PaneDecl`], a `key` block a [`BindingDraft`], through the same
+/// machinery.
+enum Set<T> {
+    Text(fn(&mut T, Template)),
+    Count(fn(&mut T, i128, &Ctx<'_>) -> anyhow::Result<()>),
+    Flag(fn(&mut T, bool)),
+    List(fn(&mut T, Vec<Template>, &Ctx<'_>) -> anyhow::Result<()>),
     /// `#true`, `#false`, or one string naming the choice — a switch
     /// and a choice in one key. `shell` is the only key with this
     /// shape, so the payload is its own type; a second such key would
     /// earn a shape-neutral one.
-    FlagOrText(fn(&mut PaneDecl, ShellDecl)),
+    FlagOrText(fn(&mut T, ShellDecl)),
 }
 
-impl Set {
+impl<T> Set<T> {
     /// A list key has no property spelling; every other shape has both.
     fn takes_a_property(&self) -> bool {
         !matches!(self, Set::List(_))
     }
 }
 
-/// One key a `pane` or `defaults` block accepts: its name, the example
-/// every teaching error shows, and the one function that applies it.
-/// Dispatch, property legality and every accepted-set list read THIS —
-/// a new key is one row here and nothing else.
-struct Setting {
+/// One key a block accepts: its name, the example every teaching error
+/// shows, and the one function that applies it. Dispatch, property
+/// legality and every accepted-set list read THIS — a new key is one
+/// row in its block's table and nothing else.
+struct Setting<T> {
     name: &'static str,
     example: &'static str,
-    set: Set,
+    set: Set<T>,
 }
 
-impl Setting {
+impl<T> Setting<T> {
     /// KDL writes a property as `key=value`, so the one example serves
     /// both positions. (List keys have no property spelling and never
     /// reach here.)
@@ -85,7 +98,7 @@ impl Setting {
     }
 }
 
-const PANE_KEYS: &[Setting] = &[
+const PANE_KEYS: &[Setting<PaneDecl>] = &[
     Setting {
         name: "command",
         example: r#"command "git" "log""#,
@@ -177,12 +190,18 @@ struct Ctx<'a> {
 }
 
 fn set_command(decl: &mut PaneDecl, argv: Vec<Template>, ctx: &Ctx<'_>) -> anyhow::Result<()> {
-    decl.command = Some(match argv.as_slice() {
+    decl.command = Some(split_command(argv, ctx)?);
+    Ok(())
+}
+
+/// One word under a shell stays one word; anything else is split, and
+/// an unbalanced string is a parse error naming the block — never a
+/// one-word fallback that survives to a spawn. ONE rule, two callers:
+/// `set_command` (a pane's) and `BINDING_KEYS`' `command` row.
+fn split_command(argv: Vec<Template>, ctx: &Ctx<'_>) -> anyhow::Result<Vec<Template>> {
+    Ok(match argv.as_slice() {
         // One word under `shell` stays one word.
         [script] if ctx.shell => vec![script.clone()],
-        // An unbalanced string is a parse error naming the pane — never
-        // a one-word fallback that survives to a spawn.
-        //
         // The split happens at PARSE, on TEMPLATE text, and each word
         // is re-recorded under the whole value's flavor — so an
         // expansion lands INSIDE the word that held it and never
@@ -192,8 +211,7 @@ fn set_command(decl: &mut PaneDecl, argv: Vec<Template>, ctx: &Ctx<'_>) -> anyho
                 .map_err(|err| anyhow!("{}: command has unbalanced quoting ({err})", ctx.at))?,
         ),
         argv => argv.to_vec(),
-    });
-    Ok(())
+    })
 }
 
 fn set_height(decl: &mut PaneDecl, cells: i128, ctx: &Ctx<'_>) -> anyhow::Result<()> {
@@ -206,14 +224,21 @@ fn set_height(decl: &mut PaneDecl, cells: i128, ctx: &Ctx<'_>) -> anyhow::Result
     Ok(())
 }
 
-fn pane_setting(name: &str) -> Option<&'static Setting> {
-    PANE_KEYS.iter().find(|k| k.name == name)
+/// The one table lookup, for whichever block is asking.
+fn lookup<T>(keys: &'static [Setting<T>], name: &str) -> Option<&'static Setting<T>> {
+    keys.iter().find(|k| k.name == name)
 }
 
-/// The keys legal in the position the error is complaining about.
-fn setting_list(property_position: bool) -> String {
-    PANE_KEYS
-        .iter()
+/// The pane-side spelling of [`lookup`] — `peek_shell` and the stray
+/// scans are pane-only and should not grow a table argument.
+fn pane_setting(name: &str) -> Option<&'static Setting<PaneDecl>> {
+    lookup(PANE_KEYS, name)
+}
+
+/// The keys legal in the position the error is complaining about, for
+/// whichever block is complaining.
+fn setting_list<T>(keys: &[Setting<T>], property_position: bool) -> String {
+    keys.iter()
         .filter(|k| !property_position || k.set.takes_a_property())
         .map(|k| k.name)
         .collect::<Vec<_>>()
@@ -222,7 +247,7 @@ fn setting_list(property_position: bool) -> String {
 
 /// Every shape error is generated from the key's own example, so there
 /// is no per-key error text to keep in step with the table.
-fn shape_err(k: &Setting, at: &str) -> anyhow::Error {
+fn shape_err<T>(k: &Setting<T>, at: &str) -> anyhow::Error {
     anyhow!(
         "{at}: `{}` takes {} — write `{}`",
         k.name,
@@ -233,7 +258,7 @@ fn shape_err(k: &Setting, at: &str) -> anyhow::Error {
 
 /// The same complaint against the property spelling, so the fix it
 /// shows is the one the user was reaching for.
-fn prop_shape_err(k: &Setting, at: &str) -> anyhow::Error {
+fn prop_shape_err<T>(k: &Setting<T>, at: &str) -> anyhow::Error {
     anyhow!(
         "{at}: `{}` takes {} — write `{}`",
         k.name,
@@ -242,7 +267,7 @@ fn prop_shape_err(k: &Setting, at: &str) -> anyhow::Error {
     )
 }
 
-fn takes(k: &Setting) -> &'static str {
+fn takes<T>(k: &Setting<T>) -> &'static str {
     match k.set {
         Set::Text(_) => "one string",
         Set::Count(_) => "one integer",
@@ -279,7 +304,7 @@ fn refuse_annotation(ty: Option<&kdl::KdlIdentifier>, key: &str, at: &str) -> an
 /// it, a block under it, or an annotation anywhere on it is a token
 /// with nowhere to go — the same silent discard I-52 closes one level
 /// up, one level down.
-fn only_a_value(node: &kdl::KdlNode, k: &Setting, at: &str) -> anyhow::Result<()> {
+fn only_a_value<T>(node: &kdl::KdlNode, k: &Setting<T>, at: &str) -> anyhow::Result<()> {
     refuse_annotation(node.ty(), k.name, at)?;
     for entry in node.entries() {
         match entry.name() {
@@ -312,7 +337,7 @@ fn only_a_value(node: &kdl::KdlNode, k: &Setting, at: &str) -> anyhow::Result<()
 /// One key, one place, once: a key written twice on the same block —
 /// two properties, two child nodes, or one of each — is an error.
 /// Last-wins is invisible to a reader scanning a long pane block.
-fn record(seen: &mut Vec<&'static str>, k: &'static Setting, at: &str) -> anyhow::Result<()> {
+fn record<T>(seen: &mut Vec<&'static str>, k: &'static Setting<T>, at: &str) -> anyhow::Result<()> {
     if seen.contains(&k.name) {
         bail!(
             "{at}: `{}` is declared twice — declare it once, as a property or a child node",
@@ -440,6 +465,7 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
     // node anywhere in the document still supplies the `shell` the
     // command split depends on.
     let mut tree: Vec<&kdl::KdlNode> = Vec::new();
+    let mut keys: Vec<&kdl::KdlNode> = Vec::new();
     let mut settings: Vec<&'static str> = Vec::new();
     let mut variables_node: Option<&kdl::KdlNode> = None;
     let mut defaults_node: Option<&kdl::KdlNode> = None;
@@ -469,6 +495,11 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
                 defaults_node = Some(node);
             }
             "pane" | "row" | "column" => tree.push(node),
+            // Deferred beside the tree, and for the same reason: a
+            // binding's command splits under the `defaults` shell, and
+            // a `defaults` block anywhere in the document must reach a
+            // `key` node written above it.
+            "key" => keys.push(node),
             // Placement used to live in its own block, so a reader who
             // writes one is not guessing — they know a grammar that was
             // real. The error owes them the spelling that replaced it.
@@ -479,7 +510,7 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
             other => {
                 bail!(
                     "unknown node {other:?} — a dashboard's top level takes \
-                     title, gap, row-gap, variables, defaults, pane, row, or column"
+                     title, gap, row-gap, variables, defaults, key, pane, row, or column"
                 )
             }
         }
@@ -530,6 +561,12 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
         let label = cell_label(None, node, index);
         items.push(inline_node(node, &label, default_shell, &mut panes, &load)?.normalized());
     }
+    // After the panes: a board with a broken pane and a broken binding
+    // reports the pane, which is the board's substance.
+    file.bindings = keys
+        .iter()
+        .map(|node| key_block(node, default_shell, &load))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     file.variables = variables;
     file.panes = panes;
     // Placement is STRUCTURAL, so the layout is never absent — the top
@@ -664,7 +701,7 @@ fn pane_block(
         let Some(k) = pane_setting(prop) else {
             bail!(
                 "{at}: unknown property {prop:?} — a pane's keys with a property spelling are {}",
-                setting_list(true)
+                setting_list(PANE_KEYS, true)
             );
         };
         record(&mut seen, k, &at)?;
@@ -690,7 +727,7 @@ fn pane_block(
         let Some(k) = pane_setting(name) else {
             bail!(
                 "{at}: unknown node {name:?} — a pane's keys are {}",
-                setting_list(false)
+                setting_list(PANE_KEYS, false)
             );
         };
         record(&mut seen, k, &at)?;
@@ -726,6 +763,237 @@ fn peek_shell(node: &kdl::KdlNode, at: &str) -> anyhow::Result<Option<ShellDecl>
     }
 }
 
+/// The keys a `key` block accepts — the binding's own table, driven
+/// through the same generic machinery as [`PANE_KEYS`], so a binding's
+/// shape errors, accepted-set lists and declared-once rule are the
+/// pane's, not a second culture.
+const BINDING_KEYS: &[Setting<BindingDraft>] = &[
+    Setting {
+        name: "description",
+        example: r#"description "rerun the suite""#,
+        set: Set::Text(|d, v| d.description = Some(v)),
+    },
+    Setting {
+        name: "when",
+        example: r#"when "test -s ./review.sel""#,
+        set: Set::Text(|d, v| d.when = Some(v)),
+    },
+    Setting {
+        name: "command",
+        example: r#"command "cargo" "test""#,
+        set: Set::List(|d, v, ctx| {
+            d.command = Some(split_command(v, ctx)?);
+            Ok(())
+        }),
+    },
+    Setting {
+        name: "script",
+        // `r##`: with one hash the `"#` inside `"#!` would terminate
+        // the raw string early.
+        example: r##"script "#!/bin/sh\ncargo test""##,
+        set: Set::Text(|d, v| d.script = Some(v)),
+    },
+    Setting {
+        name: "shell",
+        example: "shell #true",
+        set: Set::FlagOrText(|d, v| d.shell = Some(v)),
+    },
+    Setting {
+        name: "output",
+        example: r#"output "status""#,
+        set: Set::Text(|d, v| d.output = Some(v)),
+    },
+    Setting {
+        name: "confirm",
+        example: r#"confirm "Rerun the full suite?""#,
+        set: Set::Text(|d, v| d.confirm = Some(v)),
+    },
+];
+
+/// A binding under construction. Private to the walk: it exists only
+/// between the two passes, and every field it holds as an `Option` is
+/// one [`KeyBindingDecl`] holds as a decision.
+#[derive(Default)]
+struct BindingDraft {
+    description: Option<Template>,
+    when: Option<Template>,
+    command: Option<Vec<Template>>,
+    script: Option<Template>,
+    shell: Option<ShellDecl>,
+    /// The token as written; `output` is parsed at load so a reference
+    /// in it can resolve first.
+    output: Option<Template>,
+    confirm: Option<Template>,
+}
+
+/// A binding's key: exactly one unannotated string, and NOT a
+/// template. The spelling is identity — it is the key a reader
+/// presses, and the conflict check decides at LOAD whether it
+/// collides with one of rat's own, which a computed spelling would
+/// make unanswerable by reading the file. Same argument the pane id
+/// and `title ref="#id"` already make.
+fn one_spelling(node: &kdl::KdlNode) -> anyhow::Result<String> {
+    // Either position: `(u8)key "r"` and `key (u8)"r"` are both a
+    // token that reaches nothing (D-7).
+    let annotation = std::iter::once(node.ty())
+        .chain(
+            node.entries()
+                .iter()
+                .filter(|entry| entry.name().is_none())
+                .map(kdl::KdlEntry::ty),
+        )
+        .flatten()
+        .next();
+    if let Some(ty) = annotation {
+        bail!(
+            "key: the ({}) type annotation on a binding has no meaning here — remove it",
+            ty.value()
+        );
+    }
+    let values = positional(node);
+    match values.as_slice() {
+        [value] => {
+            let text = value.as_string().ok_or_else(|| {
+                anyhow!("key: a binding's key is a string — write `key \"7\" {{ … }}`")
+            })?;
+            // The refusal reads the bytes before any flavor question,
+            // deliberately — identity is identity however it is quoted
+            // (the `title ref` precedent).
+            if !Template::extract(text).refs().is_empty() {
+                bail!(
+                    "key {text:?}: a binding's key is not substitutable — it is the key a \
+                     reader presses, and it decides at load whether the binding collides \
+                     with one of rat's own. Display text belongs in `description`"
+                );
+            }
+            Ok(text.to_string())
+        }
+        [first, ..] => bail!(
+            "key {:?}: a binding names one key — write `key \"r\" {{ … }}`",
+            first.as_string().unwrap_or_default()
+        ),
+        [] => bail!("key: this binding needs a key — write `key \"r\" {{ … }}`"),
+    }
+}
+
+/// One `key "r" { … }` block. Structurally `pane_block`: the spelling,
+/// the shell peek the command split depends on, then the two passes
+/// against the binding's own table.
+fn key_block(
+    node: &kdl::KdlNode,
+    default_shell: bool,
+    load: &Load<'_>,
+) -> anyhow::Result<KeyBindingDecl> {
+    let spelling = one_spelling(node)?;
+    let at = format!("key {spelling:?}");
+    let key = parse_key(&spelling).with_context(|| at.clone())?;
+    let shell = peek_shell(node, &at)?;
+    let ctx = Ctx {
+        at: &at,
+        shell: shell
+            .as_ref()
+            .map_or(default_shell, ShellDecl::runs_a_shell),
+    };
+    let mut draft = BindingDraft::default();
+    let mut seen: Vec<&'static str> = Vec::new();
+
+    for entry in node.entries() {
+        let Some(prop) = entry.name() else {
+            continue; // positional: the binding's own key
+        };
+        let prop = prop.value();
+        if let Some(ty) = entry.ty() {
+            bail!(
+                "{at}: the ({}) type annotation on `{prop}` has no meaning here — remove it",
+                ty.value()
+            );
+        }
+        let Some(k) = lookup(BINDING_KEYS, prop) else {
+            bail!(
+                "{at}: unknown property {prop:?} — a binding's keys with a property spelling are {}",
+                setting_list(BINDING_KEYS, true)
+            );
+        };
+        record(&mut seen, k, &at)?;
+        match k.set {
+            Set::List(_) => bail!(
+                "{at}: `{}` holds a list, so it must be a child node — write `{}` inside the block",
+                k.name,
+                k.example
+            ),
+            Set::Text(set) => set(&mut draft, prop_text(entry, k, &at, load)?),
+            Set::Count(set) => set(&mut draft, prop_count(entry.value(), k, &at)?, &ctx)?,
+            Set::Flag(set) => set(&mut draft, prop_flag(entry.value(), k, &at)?),
+            Set::FlagOrText(set) => set(&mut draft, prop_mode(entry, k, &at, load)?),
+        }
+    }
+
+    for child in node
+        .children()
+        .map(kdl::KdlDocument::nodes)
+        .unwrap_or_default()
+    {
+        let name = child.name().value();
+        let Some(k) = lookup(BINDING_KEYS, name) else {
+            bail!(
+                "{at}: unknown node {name:?} — a binding's keys are {}",
+                setting_list(BINDING_KEYS, false)
+            );
+        };
+        record(&mut seen, k, &at)?;
+        only_a_value(child, k, &at)?;
+        match k.set {
+            Set::Text(set) => set(&mut draft, one_text(child, k, &at, load)?),
+            Set::Count(set) => set(&mut draft, one_count(child, k, &at)?, &ctx)?,
+            Set::Flag(set) => set(&mut draft, one_flag(child, k, &at)?),
+            Set::List(set) => set(&mut draft, many_text(child, k, &at, load)?, &ctx)?,
+            Set::FlagOrText(set) => set(&mut draft, one_mode(child, k, &at, load)?),
+        }
+    }
+    checked(key, spelling, draft, &at)
+}
+
+/// The draft's decisions, made where the author wrote the lines. None
+/// of these consult `defaults`, which is exactly why they belong here
+/// and not at resolution (the `title_field` precedent).
+fn checked(
+    key: Key,
+    spelling: String,
+    draft: BindingDraft,
+    at: &str,
+) -> anyhow::Result<KeyBindingDecl> {
+    let Some(description) = draft.description else {
+        bail!(
+            "{at}: this binding needs a `description` — the `?` reference is the only place \
+             a board can advertise a key. Write `description \"rerun the suite\"`"
+        );
+    };
+    let program = match (draft.command, draft.script) {
+        (Some(_), Some(_)) => bail!(
+            "{at}: declares both `command` and `script` — a binding runs one program; \
+             keep the `script` body or the `command` argv, not both"
+        ),
+        (Some(argv), None) => BindingProgram::Argv(argv),
+        (None, Some(body)) => BindingProgram::Script(body),
+        (None, None) => bail!(
+            "{at}: needs a `command` or a `script` — a binding with nothing to run is a key \
+             that does nothing"
+        ),
+    };
+    // `output` is NOT read here: its token may hold a reference, and
+    // the walk does not expand. `resolve_bindings` reads it.
+    Ok(KeyBindingDecl {
+        key,
+        spelling,
+        description,
+        program,
+        shell: draft.shell,
+        when: draft.when,
+        output: draft.output,
+        confirm: draft.confirm,
+    })
+}
+
 /// What a string site needs beyond its own bytes: the declared
 /// variables to hold its references to, the document text an error is
 /// placed into, and the caller's color verdict (never an env sniff —
@@ -736,9 +1004,9 @@ struct Load<'a> {
     vars: &'a VariableBlock,
 }
 
-fn prop_text(
+fn prop_text<T>(
     entry: &kdl::KdlEntry,
-    k: &Setting,
+    k: &Setting<T>,
     at: &str,
     load: &Load<'_>,
 ) -> anyhow::Result<Template> {
@@ -749,11 +1017,11 @@ fn prop_text(
     template_of(text, entry, load)
 }
 
-fn prop_count(value: &kdl::KdlValue, k: &Setting, at: &str) -> anyhow::Result<i128> {
+fn prop_count<T>(value: &kdl::KdlValue, k: &Setting<T>, at: &str) -> anyhow::Result<i128> {
     value.as_integer().ok_or_else(|| prop_shape_err(k, at))
 }
 
-fn prop_flag(value: &kdl::KdlValue, k: &Setting, at: &str) -> anyhow::Result<bool> {
+fn prop_flag<T>(value: &kdl::KdlValue, k: &Setting<T>, at: &str) -> anyhow::Result<bool> {
     value.as_bool().ok_or_else(|| prop_shape_err(k, at))
 }
 
@@ -777,9 +1045,9 @@ fn positional(node: &kdl::KdlNode) -> Vec<&kdl::KdlValue> {
         .collect()
 }
 
-fn one_text(
+fn one_text<T>(
     node: &kdl::KdlNode,
-    k: &Setting,
+    k: &Setting<T>,
     at: &str,
     load: &Load<'_>,
 ) -> anyhow::Result<Template> {
@@ -855,14 +1123,14 @@ fn reference_offset(text: &str, entry: &kdl::KdlEntry, name: &str) -> usize {
     start + value_at + repr.find(&format!("{{{{{name}}}}}")).unwrap_or(0)
 }
 
-fn one_count(node: &kdl::KdlNode, k: &Setting, at: &str) -> anyhow::Result<i128> {
+fn one_count<T>(node: &kdl::KdlNode, k: &Setting<T>, at: &str) -> anyhow::Result<i128> {
     match positional(node).as_slice() {
         [value] => value.as_integer().ok_or_else(|| shape_err(k, at)),
         _ => Err(shape_err(k, at)),
     }
 }
 
-fn one_flag(node: &kdl::KdlNode, k: &Setting, at: &str) -> anyhow::Result<bool> {
+fn one_flag<T>(node: &kdl::KdlNode, k: &Setting<T>, at: &str) -> anyhow::Result<bool> {
     match positional(node).as_slice() {
         [value] => value.as_bool().ok_or_else(|| shape_err(k, at)),
         _ => Err(shape_err(k, at)),
@@ -872,9 +1140,9 @@ fn one_flag(node: &kdl::KdlNode, k: &Setting, at: &str) -> anyhow::Result<bool> 
 /// A pane's `shell`, property spelling: the crate's one shell reader
 /// (`shell_decl`) plus what a PANE's shell needs on top of it —
 /// validation of a templated dialect name against the declared set.
-fn prop_mode(
+fn prop_mode<T>(
     entry: &kdl::KdlEntry,
-    k: &Setting,
+    k: &Setting<T>,
     at: &str,
     load: &Load<'_>,
 ) -> anyhow::Result<ShellDecl> {
@@ -883,9 +1151,9 @@ fn prop_mode(
     Ok(decl)
 }
 
-fn one_mode(
+fn one_mode<T>(
     node: &kdl::KdlNode,
-    k: &Setting,
+    k: &Setting<T>,
     at: &str,
     load: &Load<'_>,
 ) -> anyhow::Result<ShellDecl> {
@@ -899,9 +1167,9 @@ fn one_mode(
     }
 }
 
-fn many_text(
+fn many_text<T>(
     node: &kdl::KdlNode,
-    k: &Setting,
+    k: &Setting<T>,
     at: &str,
     load: &Load<'_>,
 ) -> anyhow::Result<Vec<Template>> {
@@ -923,7 +1191,7 @@ fn many_text(
 /// positional error it has today; a recognised name at ANY position
 /// counts, because `defaults #true shell` still holds the key the
 /// author was reaching for.
-fn stray_key(values: &[&kdl::KdlValue]) -> Option<&'static Setting> {
+fn stray_key(values: &[&kdl::KdlValue]) -> Option<&'static Setting<PaneDecl>> {
     values
         .iter()
         .find_map(|value| value.as_string().and_then(pane_setting))
@@ -945,7 +1213,7 @@ fn stray_setting(values: &[&kdl::KdlValue]) -> Option<&'static str> {
 /// the table's example otherwise. A List key has no property spelling,
 /// so it gets the child-node sentence with the table's example — the
 /// same one the property path teaches.
-fn stray_key_err(at: &str, k: &Setting, values: &[&kdl::KdlValue]) -> anyhow::Error {
+fn stray_key_err(at: &str, k: &Setting<PaneDecl>, values: &[&kdl::KdlValue]) -> anyhow::Error {
     if let Set::List(_) = k.set {
         return anyhow!(
             "{at}: `{}` holds a list, so it must be a child node — write `{}` inside the block",
@@ -2254,10 +2522,10 @@ pane "nested" {
     }
 
     #[test]
-    fn an_unknown_top_level_node_names_the_eight() {
+    fn an_unknown_top_level_node_names_the_nine() {
         assert_eq!(
             container_err("panes {\n    pane \"log\" {\n        command \"date\"\n    }\n}\n"),
-            "unknown node \"panes\" — a dashboard's top level takes title, gap, row-gap, variables, defaults, pane, row, or column"
+            "unknown node \"panes\" — a dashboard's top level takes title, gap, row-gap, variables, defaults, key, pane, row, or column"
         );
     }
 
@@ -4032,5 +4300,541 @@ variables {{
         // spawn resolver applies the same override map at its own moment.
         let out = resolve_variables(&block, &overrides, &mut |_| unreachable!()).expect("resolves");
         assert!(out.is_empty());
+    }
+
+    // ─── The `key` node ─────────────────────────────────────────────
+
+    use crate::core::dashboard_file::{BindingOutput, BindingProgram, KeyBinding, KeyBindingDecl};
+    use crate::core::key_spelling::parse_key;
+    use crate::core::registry::ShellMode;
+    use crate::ui::key::Key;
+
+    /// The DECLARED form, straight off the walk.
+    fn declared(text: &str) -> Vec<KeyBindingDecl> {
+        parse(text).expect("the board parses").bindings
+    }
+
+    fn binding_err(text: &str) -> String {
+        format!("{:#}", parse(text).expect_err("the board is refused"))
+    }
+
+    /// The RESOLVED form: load fields expanded, the shell run through the
+    /// ladder, the argv guaranteed non-empty. Everything a surface reads.
+    fn resolved(text: &str) -> Vec<KeyBinding> {
+        load_bindings(text).expect("the board loads")
+    }
+
+    fn resolve_err(text: &str) -> String {
+        format!(
+            "{:#}",
+            load_bindings(text).expect_err("the board is refused at load")
+        )
+    }
+
+    /// Parse, resolve the board's variables the way the real load does,
+    /// then load the bindings against that map — so a test never invents
+    /// a second evaluation of the same board. No board here declares a
+    /// load-time command variable, so the runner is never consulted.
+    fn load_bindings(text: &str) -> anyhow::Result<Vec<KeyBinding>> {
+        let file = parse(text).expect("the board parses");
+        let map = resolve_variables(&file.variables, &Bindings::new(), &mut |_| {
+            unreachable!("no load-tier derivation in these boards")
+        })?;
+        file.resolve_bindings(&map)
+    }
+
+    #[test]
+    fn a_key_node_declares_a_binding() {
+        let decls = declared(&format!(
+            r#"
+key "r" {{
+    description "rerun the suite"
+    when "test -s ./review.sel"
+    command "cargo" "test" "--all"
+    shell "fish"
+    output "pager"
+    confirm "Rerun the full suite?"
+}}
+{ONE_PANE}"#
+        ));
+        assert_eq!(decls.len(), 1);
+        let binding = &decls[0];
+        assert_eq!(binding.key, Key::Char('r'));
+        // The author's bytes, kept beside the parsed key — the help
+        // section and the status row echo these rather than re-deriving.
+        assert_eq!(binding.spelling, "r");
+        assert_eq!(binding.description.as_str(), "rerun the suite");
+        assert_eq!(
+            binding.when.as_ref().map(Template::as_str),
+            Some("test -s ./review.sel")
+        );
+        assert_eq!(
+            binding.program,
+            BindingProgram::Argv(vec!["cargo".into(), "test".into(), "--all".into()])
+        );
+        assert_eq!(
+            binding.shell,
+            Some(ShellDecl::Named(Template::extract("fish")))
+        );
+        assert_eq!(binding.output.as_ref().map(Template::as_str), Some("pager"));
+        assert_eq!(
+            binding.confirm.as_ref().map(Template::as_str),
+            Some("Rerun the full suite?")
+        );
+    }
+
+    #[test]
+    fn a_board_with_no_key_nodes_has_no_bindings() {
+        assert!(declared(ONE_PANE).is_empty());
+    }
+
+    #[test]
+    fn load_expands_the_display_fields_and_leaves_the_spawn_fields_alone() {
+        // The site split, as one assertion. `description` and `confirm`
+        // are consumed by a surface that PAINTS them, so they are
+        // expanded here and every reader downstream receives text and
+        // calls no substitution function. `command`, `script` and `when`
+        // are handed to a shell at the keypress, so they stay as written.
+        let binding = resolved(&format!(
+            r#"
+variables {{
+    suite "cargo test --all"
+    what  "the suite"
+}}
+key "r" {{
+    description "rerun {{{{what}}}}"
+    confirm "Rerun {{{{what}}}}?"
+    when "test -s {{{{what}}}}.sel"
+    command "{{{{suite}}}}"
+}}
+{ONE_PANE}"#
+        ))
+        .remove(0);
+        assert_eq!(binding.description, "rerun the suite");
+        assert_eq!(binding.confirm.as_deref(), Some("Rerun the suite?"));
+        // Untouched: the spawn sites still carry their holes.
+        assert_eq!(
+            binding.when.as_ref().map(Template::as_str),
+            Some("test -s {{what}}.sel")
+        );
+        assert_eq!(
+            binding.program,
+            BindingProgram::Argv(vec![Template::extract("{{suite}}")])
+        );
+    }
+
+    #[test]
+    fn a_deferred_reference_in_a_display_field_is_refused_at_load() {
+        // `description` and `confirm` are painted, never spawned, so a
+        // per-spawn value has no moment to be derived in. Refusing beats
+        // inventing one, and the message says which field and which name.
+        for field in ["description", "confirm"] {
+            // `description` is required, so when it is not the field
+            // under test it still has to exist — and when it IS, a
+            // second copy would trip the declared-twice refusal first.
+            let base = if field == "description" {
+                ""
+            } else {
+                "description \"x\"\n    "
+            };
+            let err = resolve_err(&format!(
+                r#"
+variables {{
+    head "git rev-parse --short HEAD" shell=#true defer=#true
+}}
+key "r" {{
+    {base}command "true"
+    {field} "at {{{{head}}}}"
+}}
+{ONE_PANE}"#
+            ));
+            assert!(err.contains("`head`"), "{field} → {err}");
+            assert!(err.contains(field), "{field} → {err}");
+        }
+    }
+
+    #[test]
+    fn a_recorded_spelling_is_the_one_the_parser_accepts() {
+        // The two representations must not drift: whatever is echoed has
+        // to be a spelling that parses back to the same key. One
+        // canonical spelling per key is what makes this hold for every
+        // legal board rather than for the ones we happened to test.
+        for spelling in ["r", "R", "7", "~", "Alt-x", "Alt-9", "PageDown"] {
+            let decls = declared(&format!(
+                "key \"{spelling}\" {{ description \"x\"\ncommand \"y\" }}\n{ONE_PANE}"
+            ));
+            assert_eq!(decls[0].spelling, spelling);
+            assert_eq!(
+                parse_key(&decls[0].spelling).expect("round trips"),
+                decls[0].key
+            );
+        }
+    }
+
+    #[test]
+    fn a_binding_takes_its_keys_as_properties_too() {
+        // The house rule (the module docstring's): every key holding
+        // exactly one value may be written either way, author's choice.
+        // `command` holds a list and therefore has no property spelling,
+        // exactly as on a pane.
+        let bindings = resolved(&format!(
+            "key \"r\" description=\"rerun\" script=\"cargo test\" output=\"hide\" {{ }}\n{ONE_PANE}"
+        ));
+        assert_eq!(bindings[0].description, "rerun");
+        assert_eq!(bindings[0].output, BindingOutput::Hide);
+        assert_eq!(
+            binding_err(&format!(
+                "key \"r\" command=\"cargo test\" {{ description \"x\" }}\n{ONE_PANE}"
+            )),
+            "key \"r\": `command` holds a list, so it must be a child node — \
+             write `command \"cargo\" \"test\"` inside the block"
+        );
+    }
+
+    #[test]
+    fn a_binding_must_say_what_it_does() {
+        // The `?` table is the only discovery surface a board has, and a
+        // binding it cannot advertise is a key nobody finds.
+        assert_eq!(
+            binding_err(&format!(
+                "key \"r\" {{ command \"cargo test\" }}\n{ONE_PANE}"
+            )),
+            "key \"r\": this binding needs a `description` — the `?` reference is the only \
+             place a board can advertise a key. Write `description \"rerun the suite\"`"
+        );
+    }
+
+    #[test]
+    fn a_binding_runs_exactly_one_program() {
+        assert_eq!(
+            binding_err(&format!("key \"r\" {{ description \"x\" }}\n{ONE_PANE}")),
+            "key \"r\": needs a `command` or a `script` — a binding with nothing to run \
+             is a key that does nothing"
+        );
+        // The sentence is `resolve_source`'s, deliberately: one rule,
+        // one sentence, wherever it is enforced.
+        let err = binding_err(&format!(
+            "key \"r\" {{ description \"x\"\ncommand \"a\"\nscript \"b\" }}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.starts_with("key \"r\": declares both `command` and `script`"),
+            "{err}"
+        );
+        assert!(err.contains("a binding runs one program"), "{err}");
+    }
+
+    #[test]
+    fn a_binding_declares_each_key_once() {
+        // `record` applies unchanged: two child nodes, or a property
+        // and a child node.
+        for text in [
+            "key \"r\" { description \"a\"\ndescription \"b\"\ncommand \"x\" }",
+            "key \"r\" description=\"a\" { description \"b\"\ncommand \"x\" }",
+        ] {
+            let err = binding_err(&format!("{text}\n{ONE_PANE}"));
+            assert!(
+                err.contains(
+                    "`description` is declared twice — declare it once, as a property or a child node"
+                ),
+                "{text} → {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_binding_key_lists_the_ones_that_exist() {
+        assert_eq!(
+            binding_err(&format!(
+                "key \"r\" {{ description \"x\"\ncommand \"y\"\ninterval \"5s\" }}\n{ONE_PANE}"
+            )),
+            "key \"r\": unknown node \"interval\" — a binding's keys are \
+             description, when, command, script, shell, output, confirm"
+        );
+        assert_eq!(
+            binding_err(&format!(
+                "key \"r\" height=3 {{ description \"x\"\ncommand \"y\" }}\n{ONE_PANE}"
+            )),
+            "key \"r\": unknown property \"height\" — a binding's keys with a property \
+             spelling are description, when, script, shell, output, confirm"
+        );
+    }
+
+    #[test]
+    fn output_takes_one_of_three_dispositions_and_is_read_after_expansion() {
+        // The token is parsed at LOAD, not at the walk, because it is a
+        // string site like any other and may hold a reference. Same
+        // placement `interval` already has, for the same reason.
+        for (token, want) in [
+            ("hide", BindingOutput::Hide),
+            ("status", BindingOutput::Status),
+            ("pager", BindingOutput::Pager),
+        ] {
+            let bindings = resolved(&format!(
+                "key \"r\" {{ description \"x\"\ncommand \"y\"\noutput \"{token}\" }}\n{ONE_PANE}"
+            ));
+            assert_eq!(bindings[0].output, want, "{token}");
+        }
+        // A reference resolves before the token is read.
+        let bindings = resolved(&format!(
+            "variables {{ d \"hide\" }}\nkey \"r\" {{ description \"x\"\ncommand \"y\"\noutput \"{{{{d}}}}\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(bindings[0].output, BindingOutput::Hide);
+        // The ruled default, applied once so every surface reads a
+        // disposition rather than re-deriving one.
+        let bindings = resolved(&format!(
+            "key \"r\" {{ description \"x\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(bindings[0].output, BindingOutput::Status);
+        assert_eq!(
+            resolve_err(&format!(
+                "key \"r\" {{ description \"x\"\ncommand \"y\"\noutput \"quiet\" }}\n{ONE_PANE}"
+            )),
+            "key \"r\": `output` takes \"hide\", \"status\", or \"pager\" — write `output \"status\"`"
+        );
+    }
+
+    #[test]
+    fn a_script_body_runs_the_same_promote_or_refuse_ladder_a_pane_gets() {
+        // Both halves of the guarantee the action builder's `expect`
+        // rests on. Without this a board declaring a shebang-less body
+        // with no shell anywhere panics the loop on the first keypress.
+        let promoted = resolved(&format!(
+            "key \"r\" {{ description \"x\"\nscript \"echo hi\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(
+            promoted[0].shell,
+            ShellMode::Platform,
+            "a shebang-less body is never Direct"
+        );
+        // An explicit refusal, not a promotion: a body has no argv to
+        // execute directly.
+        let err = resolve_err(&format!(
+            "key \"r\" {{ description \"x\"\nscript \"echo hi\"\nshell #false }}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.starts_with("key \"r\": `script` runs through a shell"),
+            "{err}"
+        );
+        // A `#!` body keeps its own interpreter and refuses a declared shell.
+        let err = resolve_err(&format!(
+            "key \"r\" {{ description \"x\"\nscript \"#!/bin/sh\\necho hi\"\nshell \"fish\" }}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("already names its interpreter"), "{err}");
+        // Inheritance is real: a `defaults` shell reaches a binding.
+        let inherited = resolved(&format!(
+            "defaults {{ shell \"fish\"\nheight 3 }}\nkey \"r\" {{ description \"x\"\nscript \"echo hi\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(inherited[0].shell, ShellMode::Named("fish".to_string()));
+    }
+
+    #[test]
+    fn a_precondition_gets_a_shell_and_an_explicit_refusal_of_one_is_an_error() {
+        // A `when` value is a command LINE, so it cannot run without a
+        // shell — while an argv `command` under no declared shell stays
+        // Direct. The two answers live in two fields.
+        let promoted = resolved(&format!(
+            "key \"r\" {{ description \"x\"\ncommand \"true\"\nwhen \"test -s ./x\" }}\n{ONE_PANE}"
+        ))
+        .remove(0);
+        assert_eq!(
+            promoted.shell,
+            ShellMode::Direct,
+            "an argv command keeps the pane rule"
+        );
+        assert_eq!(promoted.when_shell, Some(ShellMode::Platform));
+        // A named dialect serves both.
+        let named = resolved(&format!(
+            "key \"r\" {{ description \"x\"\ncommand \"true\"\nwhen \"test -s ./x\"\nshell \"fish\" }}\n{ONE_PANE}"
+        ))
+        .remove(0);
+        assert_eq!(named.shell, ShellMode::Named("fish".to_string()));
+        assert_eq!(named.when_shell, Some(ShellMode::Named("fish".to_string())));
+        // No `when`, no answer to record.
+        let plain = resolved(&format!(
+            "key \"r\" {{ description \"x\"\ncommand \"true\" }}\n{ONE_PANE}"
+        ))
+        .remove(0);
+        assert_eq!(plain.when_shell, None);
+        // An explicit `shell #false` beside a `when` is refused, never
+        // silently promoted.
+        let err = resolve_err(&format!(
+            "key \"r\" {{ description \"x\"\ncommand \"true\"\nwhen \"test -s ./x\"\nshell #false }}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.starts_with("key \"r\": `when` is a command line"),
+            "{err}"
+        );
+        assert!(err.contains("`shell #false`"), "{err}");
+        // Inherited from `defaults` counts as declared, the same way a
+        // pane's does.
+        let err = resolve_err(&format!(
+            "defaults {{ shell #false\nheight 3 }}\nkey \"r\" {{ description \"x\"\ncommand \"true\"\nwhen \"test -s ./x\" }}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("`when` is a command line"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_argv_is_refused_at_load() {
+        // `command ""` survives the walk — it is one positional — and
+        // splits to nothing. `SourceProgram::Argv`'s doc says an argv is
+        // never empty, and the builder indexes `argv[0]` on that promise.
+        let err = resolve_err(&format!(
+            "key \"r\" {{ description \"x\"\ncommand \"\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(
+            err,
+            "key \"r\": `command` is empty — a binding with nothing to run is a key that does nothing"
+        );
+    }
+
+    #[test]
+    fn a_bindings_command_splits_under_the_shell_in_force() {
+        // Mirrors the pane rule exactly (`set_command`): one word under
+        // a shell stays one word.
+        let split = declared(&format!(
+            "key \"r\" {{ description \"x\"\ncommand \"git log -3\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(
+            split[0].program,
+            BindingProgram::Argv(vec!["git".into(), "log".into(), "-3".into()])
+        );
+        let whole = declared(&format!(
+            "defaults {{ shell #true\nheight 3 }}\nkey \"r\" {{ description \"x\"\ncommand \"git log -3\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(
+            whole[0].program,
+            BindingProgram::Argv(vec!["git log -3".into()])
+        );
+        // An unbalanced string is a parse error naming the binding, never
+        // a one-word fallback that survives to a spawn.
+        assert!(
+            binding_err(&format!(
+                "key \"r\" {{ description \"x\"\ncommand \"git log '\" }}\n{ONE_PANE}"
+            ))
+            .starts_with("key \"r\": command has unbalanced quoting"),
+        );
+    }
+
+    #[test]
+    fn a_binding_written_above_the_defaults_still_sees_them() {
+        // The deferral property, and the trap it closes: a `key` node read
+        // during the first pass would split its command against a
+        // `defaults` block the parser had not reached. Position carries no
+        // meaning at the top level, so the binding above must behave
+        // exactly like the binding below.
+        let above = declared(&format!(
+            "key \"r\" {{ description \"x\"\ncommand \"git log -3\" }}\ndefaults {{ shell #true\nheight 3 }}\n{ONE_PANE}"
+        ));
+        assert_eq!(
+            above[0].program,
+            BindingProgram::Argv(vec!["git log -3".into()])
+        );
+    }
+
+    #[test]
+    fn a_binding_records_its_own_shell_and_inherits_nothing_here() {
+        // Inheritance from `defaults` happens at resolution, not at the
+        // walk. The walk records what was written; `None` means inherit.
+        let own = declared(&format!(
+            "key \"r\" {{ description \"x\"\ncommand \"y\"\nshell \"fish\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(
+            own[0].shell,
+            Some(ShellDecl::Named(Template::extract("fish")))
+        );
+        let absent = declared(&format!(
+            "defaults {{ shell #true\nheight 3 }}\nkey \"r\" {{ description \"x\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(
+            absent[0].shell, None,
+            "the walk records absence, it does not resolve it"
+        );
+    }
+
+    #[test]
+    fn a_key_node_names_exactly_one_key() {
+        for (text, want) in [
+            (
+                "key { description \"x\"\ncommand \"y\" }",
+                "key: this binding needs a key — write `key \"r\" { … }`",
+            ),
+            (
+                "key \"r\" \"s\" { description \"x\"\ncommand \"y\" }",
+                "key \"r\": a binding names one key — write `key \"r\" { … }`",
+            ),
+            (
+                "key 7 { description \"x\"\ncommand \"y\" }",
+                "key: a binding's key is a string — write `key \"7\" { … }`",
+            ),
+            (
+                "key (u8)\"r\" { description \"x\"\ncommand \"y\" }",
+                "key: the (u8) type annotation on a binding has no meaning here — remove it",
+            ),
+        ] {
+            assert_eq!(binding_err(&format!("{text}\n{ONE_PANE}")), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn an_unspellable_key_is_refused_where_it_is_written() {
+        // The spelling parser owns the sentence; this pins that it
+        // arrives with the node's breadcrumb in front of it, like every
+        // other error here.
+        let err = binding_err(&format!(
+            "key \"F5\" {{ description \"x\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.starts_with("key \"F5\": `F5` is not a key a binding can name"),
+            "{err}"
+        );
+        assert!(err.contains("rat never sees a function key"), "{err}");
+    }
+
+    #[test]
+    fn a_key_spelling_is_not_substitutable() {
+        // The same argument a pane's id makes, one node over: an id is
+        // identity, and so is a binding's key. It decides AT LOAD whether
+        // the binding collides with one of rat's own, and a computed
+        // spelling makes that question unanswerable by reading the file.
+        let err = binding_err(&format!(
+            "variables {{ k \"r\" }}\nkey \"{{{{k}}}}\" {{ description \"x\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.contains("a binding's key is not substitutable"),
+            "{err}"
+        );
+        assert!(
+            err.contains("isplay text belongs in `description`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_binding_is_a_top_level_node_and_only_that() {
+        // A `key` inside a container or a pane keeps the existing
+        // unknown-node errors — nothing new to write, everything to pin,
+        // because the grammar's shape is what later work builds on.
+        assert_eq!(
+            binding_err("row { key \"r\" { description \"x\"\ncommand \"y\" } }\n"),
+            "row #1 > key #1: unknown node \"key\" — a row holds `pane`, `row`, and `column` blocks"
+        );
+        let err = binding_err(
+            "pane \"a\" { command \"true\"\nheight 3\nkey \"r\" { description \"x\" } }\n",
+        );
+        assert!(
+            err.starts_with("pane \"a\": unknown node \"key\" — a pane's keys are"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_top_levels_accepted_set_now_names_key() {
+        // The existing sentence is pinned above; this is its
+        // replacement, and the reason both must change together.
+        assert_eq!(
+            binding_err("panes { }\n"),
+            "unknown node \"panes\" — a dashboard's top level takes \
+             title, gap, row-gap, variables, defaults, key, pane, row, or column"
+        );
     }
 }

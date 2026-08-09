@@ -142,6 +142,7 @@ pub fn parse_key(spelling: &str) -> anyhow::Result<Key> {
 /// compile here, which is the only place in the crate that can notice
 /// one has appeared. Do not "simplify" it into a wildcard — that would
 /// turn the compile-time notice into a runtime `expect`.
+#[allow(dead_code)] // The conflict refusal and the help table consume this next; only tests read it today.
 pub fn spelling_of(key: Key) -> String {
     match key {
         Key::Char(c) => c.to_string(),
