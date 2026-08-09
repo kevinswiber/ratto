@@ -18,4 +18,7 @@ pub mod schedule;
 pub mod snapshot;
 pub mod spark;
 pub mod table;
+#[allow(dead_code)]
+// Consumed only by its own tests until the variables block lands; remove with the first production caller.
+pub mod template;
 pub mod trigger;
