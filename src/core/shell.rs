@@ -674,6 +674,48 @@ impl SpawnVariables {
     ) -> Result<crate::core::template::Bindings, std::io::Error> {
         resolve_for_spawn(&self.block, &self.load, &self.overrides, needed)
     }
+
+    /// Would expanding `needed` run at least one derivation?
+    ///
+    /// A key-action's gate asks this to decide between resolving
+    /// inline on the loop thread and paying for a worker: a map lookup
+    /// cannot block, a derivation can block for seconds.
+    ///
+    /// OVERRIDE-AWARE, and that is the subtle half. A `-v` override
+    /// supplies a value by exact name and suppresses that name's
+    /// command entirely, so an overridden deferred name needs no
+    /// derivation — and neither does anything reachable only THROUGH
+    /// it, because its command never runs to reference them. The walk
+    /// is the transitive closure under `Variable::refs`, stopping at
+    /// every overridden name.
+    ///
+    /// Read-only: no field, no mutation, no behavior change to any
+    /// existing path. `false` is the answer for every board with no
+    /// `variables` block, which is the overwhelmingly common case and
+    /// the one that must stay free.
+    pub(crate) fn requires_derivation(&self, needed: &[&str]) -> bool {
+        let mut pending: Vec<&str> = needed.to_vec();
+        let mut seen: Vec<&str> = Vec::new();
+        while let Some(name) = pending.pop() {
+            if seen.contains(&name) {
+                continue;
+            }
+            seen.push(name);
+            // Suppressed: the value is supplied, the command never
+            // runs, and the subtree below it is unreachable.
+            if self.overrides.contains_key(name) {
+                continue;
+            }
+            let Some(var) = self.block.get(name) else {
+                continue;
+            };
+            if var.tier == crate::core::variables::Tier::Spawn {
+                return true;
+            }
+            pending.extend(var.refs());
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -1285,5 +1327,88 @@ mod tests {
             derive(&request),
             Err(DerivationFailure::Truncated { .. })
         ));
+    }
+    // ─── requires_derivation ────────────────────────────────────────
+
+    fn constant(name: &str, value: &str) -> Variable {
+        Variable {
+            name: name.to_string(),
+            source: VarSource::Constant,
+            text: Template::extract(value),
+            tier: Tier::Load,
+            span: 0..0,
+        }
+    }
+
+    #[test]
+    fn a_map_with_no_deferred_name_requires_nothing() {
+        // The fast path's common case: static and load-tier names are
+        // memoized already, so expanding them cannot spawn anything.
+        let block = VariableBlock::new(
+            vec![
+                constant("what", "the suite"),
+                load_command("base", "echo v"),
+            ],
+            vec![0, 1],
+        );
+        let vars = SpawnVariables::new(block, Bindings::new(), Bindings::new());
+        assert!(!vars.requires_derivation(&["what", "base"]));
+    }
+
+    #[test]
+    fn a_deferred_name_requires_derivation() {
+        let block = VariableBlock::new(vec![deferred_command("head", "echo v")], vec![0]);
+        let vars = SpawnVariables::new(block, Bindings::new(), Bindings::new());
+        assert!(vars.requires_derivation(&["head"]));
+    }
+
+    #[test]
+    fn an_overridden_deferred_name_requires_nothing() {
+        // The override-aware clause: `-v head=abc` supplies the value
+        // by exact name and suppresses the command entirely.
+        let block = VariableBlock::new(vec![deferred_command("head", "echo v")], vec![0]);
+        let overrides = Bindings::from([("head".to_string(), "abc".to_string())]);
+        let vars = SpawnVariables::new(block, Bindings::new(), overrides);
+        assert!(!vars.requires_derivation(&["head"]));
+    }
+
+    #[test]
+    fn a_deferred_name_reached_only_through_another_requires_derivation() {
+        // The closure under `Variable::refs`, not just the top level:
+        // deferred variables may reference each other.
+        let block = VariableBlock::new(
+            vec![
+                deferred_command("cur", "resolve {{head}}"),
+                deferred_command("head", "echo v"),
+            ],
+            vec![1, 0],
+        );
+        let vars = SpawnVariables::new(block, Bindings::new(), Bindings::new());
+        assert!(vars.requires_derivation(&["cur"]));
+    }
+
+    #[test]
+    fn an_override_cuts_the_subtree_below_it() {
+        // Overriding the outer name means its command never runs, so
+        // nothing reachable only THROUGH it derives either — the walk
+        // must stop at an overridden name, or an override makes the
+        // query MORE pessimistic instead of less.
+        let block = VariableBlock::new(
+            vec![
+                deferred_command("cur", "resolve {{head}}"),
+                deferred_command("head", "echo v"),
+            ],
+            vec![1, 0],
+        );
+        let overrides = Bindings::from([("cur".to_string(), "abc".to_string())]);
+        let vars = SpawnVariables::new(block, Bindings::new(), overrides);
+        assert!(!vars.requires_derivation(&["cur"]));
+    }
+
+    #[test]
+    fn an_empty_context_requires_nothing() {
+        // Every board with no `variables` block — the overwhelmingly
+        // common case, and the one that must stay free.
+        assert!(!SpawnVariables::default().requires_derivation(&["anything"]));
     }
 }

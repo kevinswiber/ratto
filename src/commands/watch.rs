@@ -42,7 +42,7 @@ use crate::core::retain::{Keep, Retention, compact_count};
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::shell::{SpawnVariables, interpreter_name, shell_command, shell_invocation};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
-use crate::core::template::Template;
+use crate::core::template::{Bindings, Template};
 use crate::core::trigger::{
     BracketId, DebounceGate, MtimeWatchSet, PathLedger, TriggerSpec, Verdict, WindowLog,
     parse_trigger, stamps,
@@ -315,10 +315,10 @@ pub(crate) fn run_registry(
     // shutdown guards so it drops after them: children die first, then
     // the files they were running.
     let mut scripts = ScriptFiles::materialize(&registry, &session.bindings)?;
-    // The next activation's id: a plain monotonic counter minted when a
-    // keypress is accepted, so two in-flight activations of one binding
-    // stay distinguishable in every consumer.
-    let mut next_activation: u64 = 0;
+    // The loop's activation allocator: minted on every accepted
+    // keypress and nowhere else, so two in-flight activations of one
+    // binding stay distinguishable in every consumer.
+    let mut ids = ActivationIds::default();
     let _raw_guard = if interactive {
         Some(RawModeGuard::enable().context("enabling raw mode")?)
     } else {
@@ -1373,16 +1373,163 @@ pub(crate) fn run_registry(
                     notices.push(looping_text(&registry, &verdict.panes));
                 }
             }
-            // The actions' dispositions, applied where the iteration's
-            // one-shot rows are already batched — never inside the
-            // drain, whose rule is that only per-source state is
-            // touched there: a `pager` does considerably more than
-            // paint. In completion order; several completions in one
-            // iteration each join the batch, and each pager takes the
-            // ritual in turn.
+            // Whether the gate moved this iteration — a state change
+            // the paint below must show even with no notice, exactly
+            // as a badge move is.
+            let mut gate_moved = false;
+            // The prepared activations, applied here rather than in
+            // the drain for the drain's own reason. Matched to the
+            // gate by IDENTITY; a stale completion is dropped.
+            for prepared in prepared_activations.drain(..) {
+                if !gate_claims(&gate, prepared.activation) {
+                    continue;
+                }
+                let Some(Gate::Preparing { binding: index, .. }) = gate else {
+                    continue;
+                };
+                gate = None;
+                gate_moved = true;
+                let binding = &session.bindings[index];
+                let width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+                match prepared.result {
+                    Err(err) => {
+                        // One canonical outcome: decline, naming the
+                        // binding AND the failed variable (the
+                        // derivation's own wording). The ladder's own
+                        // answer, consulted where it happens — a
+                        // decline has no next step.
+                        debug_assert!(
+                            next_step(binding, GateOutcome::Declined(Rung::Prepare)).is_none()
+                        );
+                        if let Some(line) = action_line(
+                            binding,
+                            ActionReport::Declined {
+                                rung: Rung::Prepare,
+                                detail: Some(&err.to_string()),
+                            },
+                            width,
+                        ) {
+                            notices.push(line);
+                        }
+                    }
+                    Ok(vars) => {
+                        let ctx = Activation {
+                            id: prepared.activation,
+                            binding: index,
+                            vars,
+                        };
+                        // A rung that needs the reader's attention may
+                        // only be armed on a live frame: the paused
+                        // status row carries no confirm lane, and a
+                        // predicate is free to re-run after `F`.
+                        if mode_of(pause.as_ref(), live_scroll) == FrameMode::Paused {
+                            if let Some(line) = action_line(
+                                binding,
+                                ActionReport::Declined {
+                                    rung: Rung::Prepare,
+                                    detail: Some("the frame is frozen — resume and press again"),
+                                },
+                                width,
+                            ) {
+                                notices.push(line);
+                            }
+                        } else if let Some(step) =
+                            next_step(binding, GateOutcome::Passed(Rung::Prepare))
+                        {
+                            let (next, line) = advance(
+                                step,
+                                binding,
+                                index,
+                                ctx,
+                                &scripts,
+                                palette.appearance,
+                                &tx,
+                                width,
+                            );
+                            gate = next;
+                            if let Some(line) = line {
+                                notices.push(line);
+                            }
+                        }
+                    }
+                }
+            }
+            // The actions' completions: a GUARD completion advances or
+            // declines the gate; a COMMAND completion takes its
+            // disposition. Applied here, never inside the drain, whose
+            // rule is that only per-source state is touched there: a
+            // `pager` does considerably more than paint. In completion
+            // order; each pager takes the ritual in turn.
             for outcome in actions.drain(..) {
                 let binding = &session.bindings[outcome.binding];
                 let width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+                if outcome.rung == ActionRung::Guard {
+                    if !gate_claims(&gate, outcome.activation) {
+                        continue;
+                    }
+                    let Some(Gate::Guarding(ctx)) = gate.take() else {
+                        continue;
+                    };
+                    gate_moved = true;
+                    let passed =
+                        matches!(&outcome.result, ActionResult::Exited(status) if status.success());
+                    if !passed {
+                        // A non-zero exit declines; a guard that never
+                        // started has authorized nothing and declines
+                        // too — fail closed. Only the stderr tail
+                        // reaches the line: a `when`'s output never
+                        // takes the binding's `output` disposition,
+                        // which describes the COMMAND's. The ladder's
+                        // own answer, consulted where it happens.
+                        debug_assert!(
+                            next_step(binding, GateOutcome::Declined(Rung::When)).is_none()
+                        );
+                        let detail = match &outcome.result {
+                            ActionResult::NotStarted(err) => Some(err.to_string()),
+                            ActionResult::Exited(_) => action_tail(&outcome),
+                        };
+                        if let Some(line) = action_line(
+                            binding,
+                            ActionReport::Declined {
+                                rung: Rung::When,
+                                detail: detail.as_deref(),
+                            },
+                            width,
+                        ) {
+                            notices.push(line);
+                        }
+                    } else if mode_of(pause.as_ref(), live_scroll) == FrameMode::Paused {
+                        // The async gap: the frame froze while the
+                        // guard ran, and the next rung would arm where
+                        // its lane does not paint.
+                        if let Some(line) = action_line(
+                            binding,
+                            ActionReport::Declined {
+                                rung: Rung::When,
+                                detail: Some("the frame is frozen — resume and press again"),
+                            },
+                            width,
+                        ) {
+                            notices.push(line);
+                        }
+                    } else if let Some(step) = next_step(binding, GateOutcome::Passed(Rung::When)) {
+                        let (next, line) = advance(
+                            step,
+                            binding,
+                            outcome.binding,
+                            ctx,
+                            &scripts,
+                            palette.appearance,
+                            &tx,
+                            width,
+                        );
+                        gate = next;
+                        if let Some(line) = line {
+                            notices.push(line);
+                        }
+                    }
+                    continue;
+                }
                 match binding.output {
                     BindingOutput::Pager => {
                         let lines = action_pager_lines(&outcome);
@@ -1441,7 +1588,10 @@ pub(crate) fn run_registry(
                     append_rows(&mut std::io::stdout().lock(), rows, eol)?;
                 }
             } else if is_tty
-                && let (true, Some(l)) = (!notices.is_empty() || badge_moved, live.as_ref())
+                && let (true, Some(l)) = (
+                    !notices.is_empty() || badge_moved || gate_moved,
+                    live.as_ref(),
+                )
             {
                 previous_key = Some(repaint(
                     &mut renderer,
@@ -1790,33 +1940,47 @@ pub(crate) fn run_registry(
                             // through, deliberately: it is the abort,
                             // and an escape hatch a mode can disable is
                             // one that can wedge a terminal.
-                            let pending = gate
-                                .as_ref()
-                                .map(|Gate::Confirming { binding, .. }| *binding);
+                            let pending = match &gate {
+                                Some(Gate::Confirming { ctx, .. }) => Some(ctx.binding),
+                                _ => None,
+                            };
                             let answered = pending
                                 .filter(|_| confirm_answer(key) != ConfirmAnswer::FallThrough);
                             if let Some(index) = answered {
-                                gate = None;
+                                let Some(Gate::Confirming { ctx, .. }) = gate.take() else {
+                                    unreachable!("matched above");
+                                };
+                                let width =
+                                    crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
                                 let notice = if confirm_answer(key) == ConfirmAnswer::Confirm {
-                                    let activation = ActivationId(next_activation);
-                                    next_activation += 1;
-                                    launch_activation(
+                                    // Passed(Confirm): the ladder says
+                                    // what happens next — today that is
+                                    // always the command.
+                                    match next_step(
                                         &session.bindings[index],
-                                        index,
-                                        activation,
-                                        &session.variables,
-                                        &scripts,
-                                        palette.appearance,
-                                        &tx,
-                                    );
-                                    None
+                                        GateOutcome::Passed(Rung::Confirm),
+                                    ) {
+                                        Some(step) => {
+                                            let (next, line) = advance(
+                                                step,
+                                                &session.bindings[index],
+                                                index,
+                                                ctx,
+                                                &scripts,
+                                                palette.appearance,
+                                                &tx,
+                                                width,
+                                            );
+                                            gate = next;
+                                            line
+                                        }
+                                        None => None,
+                                    }
                                 } else {
                                     // Cancelled: consumed, never
                                     // re-dispatched — one key, one
                                     // effect. Composed through the one
                                     // closed report kind.
-                                    let width =
-                                        crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
                                     action_line(
                                         &session.bindings[index],
                                         ActionReport::Cancelled,
@@ -2851,59 +3015,93 @@ pub(crate) fn run_registry(
                         // the simplest thing that can work: resolve,
                         // build, launch, forget.
                         WatchAction::RunBinding(index) => {
-                            // ONE decision point: the ordered gate —
-                            // when, confirm — encloses this; today the
-                            // confirm is the whole of it.
                             let binding = &session.bindings[index];
-                            if binding.confirm.is_some() {
-                                let width =
-                                    crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-                                gate = Some(Gate::Confirming {
-                                    binding: index,
-                                    question: confirm_question(binding, width),
-                                });
-                                // Repaint at the edge: the question
-                                // appears NOW, not on the next tick.
-                                if let Some(l) = live.as_ref() {
-                                    let size = crossterm::terminal::size().unwrap_or((80, 24));
-                                    previous_key = Some(repaint(
-                                        &mut renderer,
-                                        pause.as_ref(),
-                                        live_scroll,
-                                        l,
-                                        &live_tail,
-                                        &palette,
-                                        view,
-                                        panes.key(),
-                                        focus_segment(
-                                            &registry,
-                                            &runtime,
-                                            &geom,
-                                            &panes,
-                                            gate.as_ref(),
-                                        )
-                                        .as_deref(),
-                                        None,
-                                        size,
-                                        session.max_height,
-                                        fullscreen,
-                                        &faint,
-                                        profile,
-                                        &history,
-                                    )?);
-                                }
+                            let width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+                            // At most one activation in the gate. While
+                            // an off-thread rung is in flight the gate
+                            // is not modal — the board is alive — so a
+                            // binding key reaches this arm and is
+                            // DECLINED: the newcomer, never the
+                            // in-flight activation a reader is waiting
+                            // on. (While Confirming, the intercept
+                            // above consumes binding keys as a cancel
+                            // instead — there is a question on screen
+                            // to be confused about.)
+                            let notice = if gate.is_some() {
+                                action_line(binding, ActionReport::Busy, width)
                             } else {
-                                let activation = ActivationId(next_activation);
-                                next_activation += 1;
-                                launch_activation(
-                                    binding,
+                                match begin_activation(
                                     index,
-                                    activation,
+                                    binding,
                                     &session.variables,
-                                    &scripts,
-                                    palette.appearance,
+                                    &mut ids,
                                     &tx,
-                                );
+                                    width,
+                                    crate::core::child::spawn_preparation,
+                                ) {
+                                    ActivationStart::Pending(pending) => {
+                                        gate = Some(pending);
+                                        None
+                                    }
+                                    ActivationStart::Prepared(ctx) => {
+                                        let step = next_step(binding, GateOutcome::Started)
+                                            .and_then(|_| {
+                                                next_step(
+                                                    binding,
+                                                    GateOutcome::Passed(Rung::Prepare),
+                                                )
+                                            })
+                                            .expect("a started activation has a next rung");
+                                        let (next, line) = advance(
+                                            step,
+                                            binding,
+                                            index,
+                                            ctx,
+                                            &scripts,
+                                            palette.appearance,
+                                            &tx,
+                                            width,
+                                        );
+                                        gate = next;
+                                        line
+                                    }
+                                    ActivationStart::Declined(line) => Some(line),
+                                }
+                            };
+                            // Repaint at the edge when there is
+                            // something to show: a question that just
+                            // armed, or a decline/busy line — neither
+                            // rides a pane tick.
+                            let question_armed = matches!(gate, Some(Gate::Confirming { .. }));
+                            if (notice.is_some() || question_armed)
+                                && let Some(l) = live.as_ref()
+                            {
+                                let size = crossterm::terminal::size().unwrap_or((80, 24));
+                                previous_key = Some(repaint(
+                                    &mut renderer,
+                                    pause.as_ref(),
+                                    live_scroll,
+                                    l,
+                                    &live_tail,
+                                    &palette,
+                                    view,
+                                    panes.key(),
+                                    focus_segment(
+                                        &registry,
+                                        &runtime,
+                                        &geom,
+                                        &panes,
+                                        gate.as_ref(),
+                                    )
+                                    .as_deref(),
+                                    notice,
+                                    size,
+                                    session.max_height,
+                                    fullscreen,
+                                    &faint,
+                                    profile,
+                                    &history,
+                                )?);
                             }
                         }
                         WatchAction::Ignore => {}
@@ -4910,33 +5108,34 @@ fn resolve_spawn<'a>(
     Ok(ResolvedSpawn { program, script })
 }
 
-/// Resolve, build, launch, forget — one activation past its gate. A
-/// failure to even start reaches the reader through the disposition
-/// path rather than vanishing — the same shape a live worker the OS
-/// refused takes.
-fn launch_activation(
+/// GateStep::Command — the ONE construction site of an
+/// `ActionRung::Command` spawn, reached only from `next_step`. Expands
+/// from the activation's once-resolved map at ITS spawn (the prompts
+/// plan merges prompt answers into the map first), builds through the
+/// one construction point, launches, forgets. A failure to even start
+/// reaches the reader through the disposition path rather than
+/// vanishing.
+fn launch_command(
     binding: &KeyBinding,
     index: usize,
-    activation: ActivationId,
-    vars: &SpawnVariables,
+    ctx: Activation,
     scripts: &ScriptFiles,
     appearance: Appearance,
     tx: &std::sync::mpsc::Sender<TickEvent>,
 ) {
-    let spawned =
-        resolve_action(binding, index, activation, vars, scripts, appearance).and_then(|spawn| {
-            spawn_action(
-                spawn,
-                activation,
-                index,
-                ActionRung::Command,
-                tx.clone(),
-                retention_for_action(),
-            )
-        });
+    let spawned = expand_action(binding, index, &ctx, scripts, appearance).and_then(|spawn| {
+        spawn_action(
+            spawn,
+            ctx.id,
+            index,
+            ActionRung::Command,
+            tx.clone(),
+            retention_for_action(),
+        )
+    });
     if let Err(err) = spawned {
         let _ = tx.send(TickEvent::ActionDone(ActionOutcome {
-            activation,
+            activation: ctx.id,
             binding: index,
             rung: ActionRung::Command,
             stdout: Vec::new(),
@@ -4947,56 +5146,129 @@ fn launch_activation(
     }
 }
 
-/// Resolve one activation's program — the binding sibling of
-/// `resolve_spawn`: derive the deferred variables this activation
-/// actually references, expand every element against that map, write a
-/// TEMPLATED `#!` body to its own per-activation file, and build the
-/// command through the one construction point. A template-free binding
-/// takes the arm that cannot fail — no map, no derivation, the
-/// author's bytes.
-///
-/// The synchronous derivation here is interim: the preparation rung
-/// moves it onto a worker when the gate lands, because a deferred
-/// variable's five-second bound must never ride a keypress.
-fn resolve_action(
+/// GateStep::Guard — spawn the `when` through the SAME builder and
+/// worker the command uses. No second execution path is how the guard
+/// comes to see everything the command would — the appearance today,
+/// the selection environment when the cursor plan lands — for free and
+/// with nothing to remember.
+fn launch_guard(
     binding: &KeyBinding,
     index: usize,
-    activation: ActivationId,
-    vars: &SpawnVariables,
+    ctx: &Activation,
+    appearance: Appearance,
+    tx: &std::sync::mpsc::Sender<TickEvent>,
+) -> std::io::Result<()> {
+    let when = binding
+        .when
+        .as_ref()
+        .expect("the guard rung runs only for a binding with a `when`");
+    let body = if when.refs().is_empty() {
+        when.as_str().to_string()
+    } else {
+        when.expand(&ctx.vars)
+            .map_err(|missing| std::io::Error::other(format!("expanding this `when`: {missing}")))?
+    };
+    // Load pairs these: a binding with a `when` always has its
+    // resolved shell, and one without never reaches this rung. Load
+    // refuses the only spelling that could break the pairing
+    // (`shell #false` + `when`), so this is never Direct and the
+    // builder's shell arm cannot panic.
+    let shell = binding
+        .when_shell
+        .as_ref()
+        .expect("a binding reaching the guard rung has a resolved `when` shell");
+    let spawn = build_action_command(
+        &ResolvedProgram::Script(body),
+        shell,
+        ActionScript::None,
+        appearance,
+    );
+    spawn_action(
+        spawn,
+        ctx.id,
+        index,
+        ActionRung::Guard,
+        tx.clone(),
+        retention_for_action(),
+    )
+}
+
+/// Apply one PASSED transition's step: take the next gate, or launch
+/// and leave it. Returns the gate to hold and, when a spawn could not
+/// start, the decline line to show — the caller owns the surface,
+/// because drain-time and input-time lines take different routes.
+#[allow(clippy::too_many_arguments)]
+fn advance(
+    step: GateStep,
+    binding: &KeyBinding,
+    index: usize,
+    ctx: Activation,
+    scripts: &ScriptFiles,
+    appearance: Appearance,
+    tx: &std::sync::mpsc::Sender<TickEvent>,
+    width: usize,
+) -> (Option<Gate>, Option<String>) {
+    match step {
+        GateStep::Prepare => unreachable!("preparation is entered through begin_activation"),
+        GateStep::Guard => match launch_guard(binding, index, &ctx, appearance, tx) {
+            Ok(()) => (Some(Gate::Guarding(ctx)), None),
+            // A guard that could not run has authorized nothing —
+            // fail closed.
+            Err(err) => (
+                None,
+                action_line(
+                    binding,
+                    ActionReport::Declined {
+                        rung: Rung::When,
+                        detail: Some(&err.to_string()),
+                    },
+                    width,
+                ),
+            ),
+        },
+        GateStep::Confirm => (
+            Some(Gate::Confirming {
+                question: confirm_question(binding, width),
+                ctx,
+            }),
+            None,
+        ),
+        GateStep::Command => {
+            launch_command(binding, index, ctx, scripts, appearance, tx);
+            (None, None)
+        }
+    }
+}
+
+/// One activation's command, expanded from ITS once-resolved map — the
+/// builder resolves nothing, and there is no variable machinery in
+/// scope below the preparation rung, so re-derivation is a compile
+/// error rather than a comment. A TEMPLATED `#!` body gets its own
+/// per-activation file, named by the activation so two in-flight runs
+/// of one binding cannot collide.
+fn expand_action(
+    binding: &KeyBinding,
+    index: usize,
+    ctx: &Activation,
     scripts: &ScriptFiles,
     appearance: Appearance,
 ) -> std::io::Result<ActionSpawn> {
-    let needed: Vec<&str> = match &binding.program {
-        BindingProgram::Argv(argv) => argv
-            .iter()
-            .flat_map(|word| word.refs())
-            .map(String::as_str)
-            .collect(),
-        BindingProgram::Script(body) => body.refs().iter().map(String::as_str).collect(),
+    let expand = |template: &Template| -> std::io::Result<String> {
+        if template.refs().is_empty() {
+            return Ok(template.as_str().to_string());
+        }
+        template.expand(&ctx.vars).map_err(|missing| {
+            std::io::Error::other(format!(
+                "expanding this binding's program: {missing} — a load-validated \
+                 board cannot reach this, so load validation has regressed"
+            ))
+        })
     };
-    let program = if needed.is_empty() {
-        match &binding.program {
-            BindingProgram::Argv(argv) => {
-                ResolvedProgram::Argv(argv.iter().map(|word| word.as_str().to_string()).collect())
-            }
-            BindingProgram::Script(body) => ResolvedProgram::Script(body.as_str().to_string()),
+    let program = match &binding.program {
+        BindingProgram::Argv(argv) => {
+            ResolvedProgram::Argv(argv.iter().map(expand).collect::<Result<_, _>>()?)
         }
-    } else {
-        let map = vars.for_spawn(&needed)?;
-        let expand = |template: &Template| {
-            template.expand(&map).map_err(|missing| {
-                std::io::Error::other(format!(
-                    "expanding this binding's program: {missing} — a load-validated \
-                     board cannot reach this, so load validation has regressed"
-                ))
-            })
-        };
-        match &binding.program {
-            BindingProgram::Argv(argv) => {
-                ResolvedProgram::Argv(argv.iter().map(expand).collect::<Result<_, _>>()?)
-            }
-            BindingProgram::Script(body) => ResolvedProgram::Script(expand(body)?),
-        }
+        BindingProgram::Script(body) => ResolvedProgram::Script(expand(body)?),
     };
     let script = match (&binding.program, &program) {
         (BindingProgram::Script(template), ResolvedProgram::Script(body))
@@ -5014,7 +5286,7 @@ fn resolve_action(
                     .to_path_buf();
                 ActionScript::Shared { path, dir }
             } else {
-                activation_script(&dir, &format!("key-{index}-{}", activation.0), body)?
+                activation_script(&dir, &format!("key-{index}-{}", ctx.id.0), body)?
             }
         }
         _ => ActionScript::None,
@@ -5730,19 +6002,264 @@ fn pane_body(
 /// The chrome row's failure badge: a nonzero exit, and nothing else. A
 /// spawn error's text IS the body, so it carries no badge; a successful
 /// tick returns `None`, which is how the badge clears.
+/// One activation, in flight: the binding it belongs to and the
+/// variable map its rungs expand against.
+///
+/// Created when preparation completes; dropped when the activation
+/// ends — spawned, declined, or cancelled. Nothing about it outlives
+/// that. Owning the map does NOT violate the scope line: the subject
+/// of "ratto never owns the state a keypress mutates" is the WORLD —
+/// this holds the keypress's own in-flight context and nothing else,
+/// no result, no output, no memory of what the command did.
+struct Activation {
+    /// Minted when the keypress is accepted, NOT when preparation
+    /// completes — the preparation event has to be matched by it too.
+    id: ActivationId,
+    binding: usize,
+    /// Resolved ONCE, at the preparation rung. `when` and the command
+    /// expand from this same map, which is what makes the guard and
+    /// the command judge the same bytes — a per-rung derivation would
+    /// be a time-of-check/time-of-use split inside one activation,
+    /// precisely what a guard exists to prevent.
+    vars: Bindings,
+}
+
 /// The ONE activation currently in its gate — see the loop-local
-/// `gate` field for why this state is legitimate. The precondition
-/// rung gives this enum its other arms and owns the ordering; do not
-/// add a second pending-activation field beside it, or "one activation
-/// at a time" stops being a guarantee.
+/// `gate` field for why this state is legitimate. One field, one
+/// activation: a second pending-activation variable would put "at most
+/// one" back into prose.
 enum Gate {
+    /// Preparation is on a worker. The identity and the binding, but
+    /// no map — and that honesty is the point: the type cannot
+    /// represent a prepared-but-unprepared activation.
+    Preparing { id: ActivationId, binding: usize },
+    /// `when` is running.
+    Guarding(Activation),
     /// The question is on the status row; the next KEY decides.
     Confirming {
-        binding: usize,
+        ctx: Activation,
         /// Composed at arming, clip and all, so the status-row lane
         /// carries text and never calls a composer.
         question: String,
     },
+}
+
+/// The loop's activation allocator: one monotonic counter, minted on
+/// every accepted keypress and nowhere else.
+///
+/// Checked, not wrapping: the gate matches completions BY id, so a
+/// wrapped id could collide with a live activation's and advance the
+/// wrong one. At one activation per keypress a `u64` does not run out
+/// in any reachable timeframe, so the arm is a statement of intent
+/// rather than a branch anyone will take.
+#[derive(Default)]
+struct ActivationIds(u64);
+
+impl ActivationIds {
+    fn next(&mut self) -> ActivationId {
+        self.0 = self.0.checked_add(1).expect("activation ids exhausted");
+        ActivationId(self.0)
+    }
+}
+
+/// What just happened to the activation — the input side of the
+/// transition. There is no "nothing happened yet" hiding in an
+/// `Option`: `Started` is a real outcome, the keypress itself.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum GateOutcome {
+    /// The key was pressed. Nothing has run.
+    Started,
+    /// This rung finished and said yes.
+    Passed(Rung),
+    /// This rung said no: preparation failed, `when` exited non-zero
+    /// or never started, or the reader answered anything but `y`.
+    Declined(Rung),
+}
+
+/// The next thing to do, or `None` when the activation is over.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum GateStep {
+    /// Derive this activation's variable map off-thread. Its
+    /// completion re-enters `next_step`.
+    Prepare,
+    /// Spawn `when` on a worker (`ActionRung::Guard`). Its completion
+    /// re-enters `next_step`.
+    Guard,
+    /// Arm the pending question on the status row. A key re-enters
+    /// `next_step`.
+    Confirm,
+    /// Spawn the binding's own command (`ActionRung::Command`) and
+    /// LEAVE the gate — launched and forgotten from here.
+    Command,
+}
+
+/// THE GATE ORDER — `when` → `confirm` → command — in one function,
+/// and the only place it exists.
+///
+/// **`None` is the whole point.** A declined rung has no next step,
+/// and the return type is what says so — a signature that always
+/// yields a `GateStep` could only express "do something next", which
+/// is precisely the guarantee this sequence exists to deny. The same
+/// `None` ends a successful activation after `Command`.
+///
+/// Every path into an activation goes through this function. A caller
+/// that spawns a command without asking it is a caller that can reach
+/// past a declined `when`, and nothing red will say so — which is why
+/// the guarantee lives in ONE place rather than being assembled per
+/// call site.
+fn next_step(binding: &KeyBinding, outcome: GateOutcome) -> Option<GateStep> {
+    match outcome {
+        // Always; the fast path just completes it without a worker.
+        GateOutcome::Started => Some(GateStep::Prepare),
+        GateOutcome::Passed(Rung::Prepare) => {
+            if binding.when.is_some() {
+                Some(GateStep::Guard)
+            } else if binding.confirm.is_some() {
+                Some(GateStep::Confirm)
+            } else {
+                Some(GateStep::Command)
+            }
+        }
+        GateOutcome::Passed(Rung::When) => {
+            if binding.confirm.is_some() {
+                Some(GateStep::Confirm)
+            } else {
+                Some(GateStep::Command)
+            }
+        }
+        // The prompts plan inserts its rung HERE, between Confirm and
+        // Command — one variant, one row, and the Declined arm below
+        // covers it without anyone remembering to extend it.
+        GateOutcome::Passed(Rung::Confirm) => Some(GateStep::Command),
+        GateOutcome::Passed(Rung::Command) => None,
+        // ONE arm for every rung, no exceptions — a rung added later
+        // inherits the decline guarantee for free.
+        GateOutcome::Declined(_) => None,
+    }
+}
+
+/// Whether an off-thread completion belongs to the activation the gate
+/// is waiting on — matched by IDENTITY, never by binding index. The
+/// gate is serialized but running commands are not, so one binding can
+/// have several activations alive at once; a match on the index would
+/// let a stale completion advance the wrong one into a command nobody
+/// re-asked about.
+fn gate_claims(gate: &Option<Gate>, id: ActivationId) -> bool {
+    match gate {
+        Some(Gate::Preparing { id: waiting, .. }) => *waiting == id,
+        Some(Gate::Guarding(ctx)) | Some(Gate::Confirming { ctx, .. }) => ctx.id == id,
+        None => false,
+    }
+}
+
+/// The union of `Template::refs` over one binding's spawn-typed
+/// strings — `when`, and the `command`/`script` program — the names
+/// this activation's map must cover.
+fn needed_names(binding: &KeyBinding) -> Vec<&str> {
+    let mut sources: Vec<&Template> = Vec::new();
+    match &binding.program {
+        BindingProgram::Argv(argv) => sources.extend(argv.iter()),
+        BindingProgram::Script(body) => sources.push(body),
+    }
+    if let Some(when) = &binding.when {
+        sources.push(when);
+    }
+    let mut needed: Vec<&str> = Vec::new();
+    for template in sources {
+        for name in template.refs() {
+            if !needed.contains(&name.as_str()) {
+                needed.push(name.as_str());
+            }
+        }
+    }
+    needed
+}
+
+/// What the loop does next after opening an activation, and nothing
+/// else.
+enum ActivationStart {
+    /// Preparation is running off-thread. Take this gate.
+    Pending(Gate),
+    /// The fast path resolved inline. Continue at the next rung with
+    /// this.
+    Prepared(Activation),
+    /// Nothing started. The gate stays free; show this line.
+    Declined(String),
+}
+
+/// Begin ONE activation: mint its identity, decide inline-vs-worker,
+/// and start it — returning everything the loop must then do.
+///
+/// The COMPLETE transition, not just the spawn: the Err arm — clear
+/// nothing, take no gate, emit the decline — lives HERE, so a test can
+/// assert all three parts of "no wedge" at once. The spawner is a
+/// parameter for exactly that reason: thread exhaustion cannot be
+/// arranged on demand, and an untested Err arm on THIS path wedges the
+/// keyboard rather than losing an action — do not delete the parameter
+/// as over-abstraction.
+///
+/// `ids` is the loop's allocator and minting happens HERE, inside the
+/// seam production also calls — otherwise a test can only compare ids
+/// it supplied itself, which proves nothing about allocation.
+fn begin_activation<S>(
+    binding: usize,
+    decl: &KeyBinding,
+    vars: &SpawnVariables,
+    ids: &mut ActivationIds,
+    tx: &std::sync::mpsc::Sender<TickEvent>,
+    width: usize,
+    spawn: S,
+) -> ActivationStart
+where
+    S: FnOnce(
+        ActivationId,
+        usize,
+        crate::core::child::PrepareFn,
+        std::sync::mpsc::Sender<TickEvent>,
+    ) -> std::io::Result<()>,
+{
+    let id = ids.next();
+    let needed = needed_names(decl);
+    let declined = |err: &std::io::Error| {
+        action_line(
+            decl,
+            ActionReport::Declined {
+                rung: Rung::Prepare,
+                detail: Some(&err.to_string()),
+            },
+            width,
+        )
+        .unwrap_or_default()
+    };
+    if !vars.requires_derivation(&needed) {
+        // Fast path: a map lookup that cannot spawn anything. No
+        // worker, no extra frame of latency, and no gate state to
+        // unwind. The predicate is "references a deferred name" via
+        // refs and tiers, never a re-scan of the text — a raw string's
+        // braces are literal and its refs are empty.
+        return match vars.for_spawn(&needed) {
+            Ok(map) => ActivationStart::Prepared(Activation {
+                id,
+                binding,
+                vars: map,
+            }),
+            Err(err) => ActivationStart::Declined(declined(&err)),
+        };
+    }
+    let owned: Vec<String> = needed.iter().map(|name| name.to_string()).collect();
+    let worker_vars = vars.clone();
+    let prepare: crate::core::child::PrepareFn = Box::new(move || {
+        let needed: Vec<&str> = owned.iter().map(String::as_str).collect();
+        worker_vars.for_spawn(&needed)
+    });
+    // The gate is entered ONLY on a successful spawn. Entering first
+    // and spawning second would leave a gate waiting for an
+    // ActionPrepared that is never coming — a keyboard wedged until
+    // the reader quits.
+    match spawn(id, binding, prepare, tx.clone()) {
+        Ok(()) => ActivationStart::Pending(Gate::Preparing { id, binding }),
+        Err(err) => ActivationStart::Declined(declined(&err)),
+    }
 }
 
 /// What one key means to a pending confirm.
@@ -12918,7 +13435,11 @@ mod tests {
         let mut panes = PaneView::new(registry.len());
         panes.focus = Some(SourceId(0));
         let gate = Gate::Confirming {
-            binding: 0,
+            ctx: Activation {
+                id: ActivationId(1),
+                binding: 0,
+                vars: crate::core::template::Bindings::new(),
+            },
             question: "confirm `e`: Really? [y/N]".to_string(),
         };
         let row = focus_segment(&registry, &runtime, &geom, &panes, Some(&gate))
@@ -12937,5 +13458,282 @@ mod tests {
         )
         .expect("the question alone composes");
         assert!(bare.contains("confirm `e`"), "{bare}");
+    }
+    // ─── The gate order ─────────────────────────────────────────────
+
+    fn with_when(
+        mut binding: crate::core::dashboard_file::KeyBinding,
+    ) -> crate::core::dashboard_file::KeyBinding {
+        binding.when = Some(Template::extract("test -s ./x"));
+        binding.when_shell = Some(crate::core::registry::ShellMode::Platform);
+        binding
+    }
+
+    fn with_confirm(
+        mut binding: crate::core::dashboard_file::KeyBinding,
+    ) -> crate::core::dashboard_file::KeyBinding {
+        binding.confirm = Some("Really?".to_string());
+        binding
+    }
+
+    /// Walk the ladder from the keypress to the end, passing every
+    /// rung, and record the steps.
+    fn walk(binding: &crate::core::dashboard_file::KeyBinding) -> Vec<GateStep> {
+        let mut steps = Vec::new();
+        let mut outcome = GateOutcome::Started;
+        while let Some(step) = next_step(binding, outcome) {
+            steps.push(step);
+            outcome = GateOutcome::Passed(match step {
+                GateStep::Prepare => Rung::Prepare,
+                GateStep::Guard => Rung::When,
+                GateStep::Confirm => Rung::Confirm,
+                GateStep::Command => Rung::Command,
+            });
+        }
+        steps
+    }
+
+    #[test]
+    fn the_ladder_runs_in_one_order_whatever_the_declaration_order() {
+        // INV: the declaration order inside the block is cosmetic; the
+        // runtime order is fixed. Two boards, same clauses, opposite
+        // orders — identical walks.
+        let resolve = |text: &str| {
+            let file =
+                crate::core::dashboard_kdl::parse_styled(text, false).expect("the board parses");
+            file.resolve_bindings(&crate::core::template::Bindings::new())
+                .expect("the bindings load")
+                .remove(0)
+        };
+        let forward = resolve(
+            "key \"r\" { description \"x\"\nwhen \"test -s ./x\"\nconfirm \"Go?\"\ncommand \"true\" }\npane \"a\" { command \"true\"\nheight 3 }\n",
+        );
+        let backward = resolve(
+            "key \"r\" { confirm \"Go?\"\ncommand \"true\"\nwhen \"test -s ./x\"\ndescription \"x\" }\npane \"a\" { command \"true\"\nheight 3 }\n",
+        );
+        let want = [
+            GateStep::Prepare,
+            GateStep::Guard,
+            GateStep::Confirm,
+            GateStep::Command,
+        ];
+        assert_eq!(walk(&forward), want);
+        assert_eq!(walk(&backward), want);
+    }
+
+    #[test]
+    fn every_subset_of_clauses_walks_the_same_relative_order() {
+        // The matrix, not a sample: all four combinations of
+        // when-present x confirm-present.
+        for (when, confirm) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut binding = declared_binding(Key::Char('r'));
+            if when {
+                binding = with_when(binding);
+            }
+            if confirm {
+                binding = with_confirm(binding);
+            }
+            let mut want = vec![GateStep::Prepare];
+            if when {
+                want.push(GateStep::Guard);
+            }
+            if confirm {
+                want.push(GateStep::Confirm);
+            }
+            want.push(GateStep::Command);
+            assert_eq!(walk(&binding), want, "when={when} confirm={confirm}");
+        }
+    }
+
+    #[test]
+    fn a_declined_rung_has_no_next_step() {
+        // The negative guarantee, as a matrix over every rung and every
+        // clause combination: a decline ends the activation, with no
+        // exceptions — which is what the single `Declined(_) => None`
+        // arm buys, and what a rung added later inherits for free.
+        for (when, confirm) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut binding = declared_binding(Key::Char('r'));
+            if when {
+                binding = with_when(binding);
+            }
+            if confirm {
+                binding = with_confirm(binding);
+            }
+            for rung in [Rung::Prepare, Rung::When, Rung::Confirm, Rung::Command] {
+                assert_eq!(
+                    next_step(&binding, GateOutcome::Declined(rung)),
+                    None,
+                    "when={when} confirm={confirm} {rung:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_off_thread_completion_whose_identity_is_not_the_gates_is_dropped() {
+        // Matched by IDENTITY, never by binding index: the gate is
+        // serialized but running commands are not, so one binding can
+        // have two activations alive — the same-binding-different-id
+        // arm is the one a match on `binding` cannot catch.
+        let ctx = |id: u64, binding: usize| Activation {
+            id: ActivationId(id),
+            binding,
+            vars: crate::core::template::Bindings::new(),
+        };
+        let arrived = ActivationId(9);
+        assert!(!gate_claims(&None, arrived), "no gate claims nothing");
+        assert!(
+            !gate_claims(
+                &Some(Gate::Confirming {
+                    ctx: ctx(7, 0),
+                    question: String::new(),
+                }),
+                arrived
+            ),
+            "a different activation's gate does not claim it"
+        );
+        assert!(
+            !gate_claims(&Some(Gate::Guarding(ctx(7, 0))), arrived),
+            "the SAME binding under a different id does not claim it"
+        );
+        assert!(gate_claims(&Some(Gate::Guarding(ctx(9, 0))), arrived));
+        assert!(gate_claims(
+            &Some(Gate::Preparing {
+                id: ActivationId(9),
+                binding: 0
+            }),
+            arrived
+        ));
+    }
+
+    fn deferred_vars(name: &str) -> SpawnVariables {
+        use crate::core::variables::{Tier, VarSource, Variable, VariableBlock};
+        let block = VariableBlock::new(
+            vec![Variable {
+                name: name.to_string(),
+                source: VarSource::SpawnCommand(crate::core::registry::ShellDecl::Platform),
+                text: Template::extract("echo derived-value"),
+                tier: Tier::Spawn,
+                span: 0..0,
+            }],
+            vec![0],
+        );
+        SpawnVariables::new(
+            block,
+            crate::core::template::Bindings::new(),
+            crate::core::template::Bindings::new(),
+        )
+    }
+
+    #[test]
+    fn a_binding_with_no_deferred_reference_prepares_without_a_worker() {
+        // Both halves in one test: "no event was posted" is satisfied
+        // perfectly by an activation that never started, so the
+        // deferred arm is what proves the mechanism was live.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut ids = ActivationIds::default();
+        let plain = declared_binding(Key::Char('r'));
+        let start = begin_activation(
+            0,
+            &plain,
+            &SpawnVariables::default(),
+            &mut ids,
+            &tx,
+            80,
+            crate::core::child::spawn_preparation,
+        );
+        assert!(
+            matches!(start, ActivationStart::Prepared(_)),
+            "a template-free binding prepares inline"
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "no worker round-trip for the fast path"
+        );
+        let mut deferred = declared_binding(Key::Char('e'));
+        deferred.program =
+            crate::core::dashboard_file::BindingProgram::Argv(vec![Template::extract(
+                "tool {{head}}",
+            )]);
+        let start = begin_activation(
+            1,
+            &deferred,
+            &deferred_vars("head"),
+            &mut ids,
+            &tx,
+            80,
+            crate::core::child::spawn_preparation,
+        );
+        assert!(
+            matches!(start, ActivationStart::Pending(Gate::Preparing { .. })),
+            "a deferred reference takes the worker"
+        );
+        let TickEvent::ActionPrepared(prepared) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the preparation posts")
+        else {
+            panic!("a preparation posts ActionPrepared");
+        };
+        let map = prepared.result.expect("the derivation succeeds");
+        assert_eq!(map.get("head").map(String::as_str), Some("derived-value"));
+    }
+
+    #[test]
+    fn a_preparation_whose_worker_cannot_start_declines_instead_of_wedging() {
+        // The COMPLETE transition behind one seam: the gate stays free,
+        // a line names the binding, and a following activation still
+        // starts — the failure mode is a wedged keyboard, not a lost
+        // action.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ids = ActivationIds::default();
+        let mut binding = declared_binding(Key::Char('r'));
+        binding.program =
+            crate::core::dashboard_file::BindingProgram::Argv(vec![Template::extract(
+                "tool {{head}}",
+            )]);
+        let vars = deferred_vars("head");
+        let start = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, |_, _, _, _| {
+            Err(std::io::Error::other("no threads"))
+        });
+        let ActivationStart::Declined(line) = start else {
+            panic!("an OS refusal declines instead of wedging");
+        };
+        assert!(line.contains("`r`"), "{line}");
+        let start = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, |_, _, _, _| Ok(()));
+        assert!(
+            matches!(start, ActivationStart::Pending(_)),
+            "the next activation still starts — the gate was never taken"
+        );
+    }
+
+    #[test]
+    fn the_allocator_mints_a_distinct_id_for_each_accepted_activation() {
+        // The binding references a DEFERRED variable so that BOTH calls
+        // return Pending — the fast path returns Prepared and never
+        // constructs the gate this test destructures. Same binding on
+        // purpose: distinct bindings would pass against an
+        // implementation that used the binding index as the id.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ids = ActivationIds::default();
+        let mut binding = declared_binding(Key::Char('r'));
+        binding.program =
+            crate::core::dashboard_file::BindingProgram::Argv(vec![Template::extract(
+                "tool {{head}}",
+            )]);
+        let vars = deferred_vars("head");
+        let first = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, |_, _, _, _| Ok(()));
+        let second = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, |_, _, _, _| Ok(()));
+        let (
+            ActivationStart::Pending(Gate::Preparing { id: a, .. }),
+            ActivationStart::Pending(Gate::Preparing { id: b, .. }),
+        ) = (first, second)
+        else {
+            panic!("both deferred activations take the worker path");
+        };
+        assert_ne!(
+            a, b,
+            "minted INSIDE the seam, by the allocator production uses"
+        );
     }
 }

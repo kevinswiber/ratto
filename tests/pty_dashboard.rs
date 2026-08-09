@@ -5609,3 +5609,445 @@ fn no_confirm_means_no_gate() {
         "dashboard should have exited on q"
     );
 }
+
+/// THE ordering test: a failing `when` declines BEFORE the confirm and
+/// before the command — presence anchors first (the guard ran; the
+/// decline names the binding), then the absences, with a fixture whose
+/// own text cannot satisfy them.
+#[test]
+fn a_failing_when_declines_before_the_confirm_and_before_the_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let when_counter = dir.path().join("when-counter");
+    let ran = dir.path().join("command-ran");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"a\" {{\n    description \"assess\"\n    when \"{when_cmd}; exit 1\"\n    confirm \"REVIEWCALLQUESTION\"\n    command \"touch {ran}\"\n}}\n\n\
+             pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+            when_cmd = counter_cmd(&when_counter),
+            ran = ran.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"a");
+    // Presence first: the guard RAN — without this, every absence below
+    // is satisfied by a board that never dispatched the key at all.
+    wait_for_counter(&when_counter, 1);
+    // Presence: the decline was reported and names the binding.
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`a` declined"],
+        Duration::from_secs(5),
+    );
+    // Absences, now anchored: no confirm painted, no command run.
+    assert!(
+        !contains(&seen, b"REVIEWCALLQUESTION"),
+        "the confirm was painted past a declined when: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(!ran.exists(), "the command ran past a declined when");
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The positive route the same fixture needs to be trusted: guard
+/// passes, question paints, `y` runs the command.
+#[test]
+fn a_passing_when_reaches_the_confirm_and_then_the_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"a\" {{\n    description \"assess\"\n    when \"true\"\n    confirm \"Go ahead?\"\n    command \"{counter_cmd}\"\n}}\n\n\
+             pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+            counter_cmd = counter_cmd(&counter),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"a");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"Go ahead?",
+            Duration::from_secs(5)
+        ),
+        "the question never painted after a passing when"
+    );
+    session.write_bytes(b"y");
+    wait_for_counter(&counter, 1);
+    assert_counter_settled_at(&counter, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Fail closed: a guard that could not run has authorized nothing.
+#[test]
+fn a_when_that_cannot_start_declines() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ran = dir.path().join("command-ran");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"a\" {{\n    description \"assess\"\n    when \"rat-no-such-guard-xyz\"\n    command \"touch {ran}\"\n}}\n\n\
+             pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+            ran = ran.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"a");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`a` declined"],
+        Duration::from_secs(5),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !ran.exists(),
+        "a guard that never ran authorized the command"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// INV-5 for the guard: the board keeps repainting while a `when`
+/// evaluates — a loop-blocking guard is as much a regression as a
+/// loop-blocking command.
+#[test]
+fn the_board_keeps_repainting_while_a_when_evaluates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fast = dir.path().join("fast");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"slow guard\"\n    when \"sleep 2\"\n    command \"{counter_cmd}\"\n}}\n\n\
+             pane \"fast\" {{\n    interval \"100ms\"\n    command \"{fast_cmd}\"\n}}\n",
+            counter_cmd = counter_cmd(&counter),
+            fast_cmd = labeled_counter_cmd(&fast, "fast"),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"fast-1", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"fast-3", b"fast-5", b"fast-7"],
+        Duration::from_secs(8),
+    );
+    // The guard passed and the command eventually ran — the anchor.
+    wait_for_counter(&counter, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// One activation in the gate: a binding key arriving while a `when`
+/// evaluates declines the NEWCOMER — the in-flight activation is
+/// untouched and its command still runs.
+#[test]
+fn a_second_binding_key_is_declined_while_a_when_evaluates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let slow_done = dir.path().join("slow-done");
+    let quick = dir.path().join("quick");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"slow guard\"\n    when \"sleep 1.2\"\n    command \"touch {slow_done}\"\n}}\n\n\
+             key \"e\" {{\n    description \"quick\"\n    command \"{quick_cmd}\"\n}}\n\n\
+             pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+            slow_done = slow_done.display(),
+            quick_cmd = counter_cmd(&quick),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    session.write_bytes(b"e");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`e` busy"],
+        Duration::from_secs(5),
+    );
+    assert_counter_settled_at(&quick, 0);
+    wait_for_file(&slow_done, Duration::from_secs(5));
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Seam: no second execution path. The guard sees exactly what the
+/// command would — provable today through RAT_APPEARANCE, which only
+/// `build_action_command` exports; the selection environment joins
+/// this same test family when the cursor plan lands.
+#[test]
+fn a_when_sees_the_same_environment_the_command_does() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"env probe\"\n    when \"test -n \\\"$RAT_APPEARANCE\\\"\"\n    command \"{counter_cmd}\"\n}}\n\n\
+             pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+            counter_cmd = counter_cmd(&counter),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    wait_for_counter(&counter, 1);
+    assert_counter_settled_at(&counter, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The non-rest arm for the decline route: same assertions, from a
+/// frame-scrolled board, presence-first.
+#[test]
+fn a_when_declines_from_a_frame_scrolled_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let when_counter = dir.path().join("when-counter");
+    let ran = dir.path().join("command-ran");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"a\" {{\n    description \"assess\"\n    when \"{when_cmd}; exit 1\"\n    command \"touch {ran}\"\n}}\n\n\
+             pane \"a\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n\
+             pane \"b\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}}\n",
+            when_cmd = counter_cmd(&when_counter),
+            ran = ran.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(3)),
+        "the frame never scrolled — the binding would press at live rest"
+    );
+    session.write_bytes(b"a");
+    wait_for_counter(&when_counter, 1);
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`a` declined"],
+        Duration::from_secs(5),
+    );
+    assert!(!ran.exists(), "the command ran past a declined when");
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The async gap, pinned: a guard that completes on a FROZEN frame
+/// declines rather than arming a question where its lane does not
+/// paint — and resuming and pressing again works, so the board was not
+/// simply broken.
+#[test]
+fn a_guard_that_completes_on_a_frozen_frame_declines() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let when_counter = dir.path().join("when-counter");
+    let ran = dir.path().join("command-ran");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"a\" {{\n    description \"assess\"\n    when \"{when_cmd}; sleep 0.8\"\n    confirm \"FROZENQUESTION\"\n    command \"touch {ran}\"\n}}\n\n\
+             pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+            when_cmd = counter_cmd(&when_counter),
+            ran = ran.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"a");
+    // Freeze BEFORE the slow guard finishes.
+    session.write_bytes(b"p");
+    wait_for_counter(&when_counter, 1);
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"`a` declined"],
+        Duration::from_secs(5),
+    );
+    assert!(
+        !contains(&seen, b"FROZENQUESTION"),
+        "a question armed on a frozen frame: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(!ran.exists(), "the command ran on a frozen frame");
+    // Resume and press again: the question appears and `y` runs it.
+    session.write_bytes(b"F");
+    let _ = drain_for(&session, Duration::from_millis(400));
+    session.write_bytes(b"a");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"FROZENQUESTION",
+            Duration::from_secs(5)
+        ),
+        "the resumed press never armed the question"
+    );
+    session.write_bytes(b"y");
+    wait_for_file(&ran, Duration::from_secs(5));
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// One variable resolution per activation: the guard and the command
+/// judge the SAME bytes, and the deferred derivation runs once — a
+/// per-rung derivation would be a time-of-check/time-of-use split
+/// inside one activation.
+#[test]
+fn a_when_guards_on_a_deferred_variable_and_the_command_sees_the_same_value() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let derive_counter = dir.path().join("derive-counter");
+    let recorded = dir.path().join("recorded");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+             variables {{\n    stamp \"echo run >> {dc}; wc -l < {dc}\" shell=#true defer=#true\n}}\n\n\
+             key \"r\" {{\n    description \"deferred probe\"\n    when \"test -n \\\"{{{{stamp}}}}\\\"\"\n    command \"echo {{{{stamp}}}} > {rec}\"\n}}\n\n\
+             pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+            dc = derive_counter.display(),
+            rec = recorded.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    wait_for_file(&recorded, Duration::from_secs(8));
+    // The derivation ran ONCE for the whole activation…
+    assert_counter_settled_at(&derive_counter, 1);
+    // …and the command saw the value the guard judged: the counter was
+    // 1 when both rungs expanded.
+    let value = std::fs::read_to_string(&recorded).expect("the command recorded its value");
+    assert_eq!(
+        value.trim(),
+        "1",
+        "the guard and the command judged the same bytes"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
