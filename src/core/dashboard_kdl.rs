@@ -23,7 +23,7 @@
 //! enumerated. Every row is either validated against the declared
 //! variables or has a stated reason it cannot hold a reference:
 //!
-//! | Key | Shape | Reaches | String site? |
+//! | Setting | Shape | Reaches | String site? |
 //! |---|---|---|---|
 //! | `command`, `trigger` | `List` | `many_text` | yes |
 //! | `script`, `interval`, `trigger-debounce`, `width`, `overflow`, `border`, `padding`, `title` | `Text` | `prop_text` / `one_text` | yes |
@@ -70,13 +70,13 @@ impl Set {
 /// every teaching error shows, and the one function that applies it.
 /// Dispatch, property legality and every accepted-set list read THIS —
 /// a new key is one row here and nothing else.
-struct Key {
+struct Setting {
     name: &'static str,
     example: &'static str,
     set: Set,
 }
 
-impl Key {
+impl Setting {
     /// KDL writes a property as `key=value`, so the one example serves
     /// both positions. (List keys have no property spelling and never
     /// reach here.)
@@ -85,30 +85,30 @@ impl Key {
     }
 }
 
-const PANE_KEYS: &[Key] = &[
-    Key {
+const PANE_KEYS: &[Setting] = &[
+    Setting {
         name: "command",
         example: r#"command "git" "log""#,
         set: Set::List(set_command),
     },
-    Key {
+    Setting {
         name: "script",
         // `r##`: with one hash the `"#` inside `"#!` would terminate
         // the raw string early.
         example: r##"script "#!/bin/sh\necho hi""##,
         set: Set::Text(|d, v| d.script = Some(v)),
     },
-    Key {
+    Setting {
         name: "shell",
         example: "shell #true",
         set: Set::FlagOrText(|d, v| d.shell = Some(v)),
     },
-    Key {
+    Setting {
         name: "interval",
         example: r#"interval "5s""#,
         set: Set::Text(|d, v| d.interval = Some(v)),
     },
-    Key {
+    Setting {
         name: "trigger",
         example: r#"trigger "file:./stamp""#,
         set: Set::List(|d, v, _| {
@@ -116,52 +116,52 @@ const PANE_KEYS: &[Key] = &[
             Ok(())
         }),
     },
-    Key {
+    Setting {
         name: "trigger-debounce",
         example: r#"trigger-debounce "250ms""#,
         set: Set::Text(|d, v| d.trigger_debounce = Some(v)),
     },
-    Key {
+    Setting {
         name: "height",
         example: "height 7",
         set: Set::Count(set_height),
     },
-    Key {
+    Setting {
         name: "width",
         example: r#"width "2fr""#,
         set: Set::Text(|d, v| d.width = Some(v)),
     },
-    Key {
+    Setting {
         name: "overflow",
         example: r#"overflow "keep-bottom""#,
         set: Set::Text(|d, v| d.overflow = Some(v)),
     },
-    Key {
+    Setting {
         name: "border",
         example: r#"border "rounded""#,
         set: Set::Text(|d, v| d.border = Some(v)),
     },
-    Key {
+    Setting {
         name: "padding",
         example: r#"padding "0 1""#,
         set: Set::Text(|d, v| d.padding = Some(v)),
     },
-    Key {
+    Setting {
         name: "title",
         example: r#"title "Recent commits""#,
         set: Set::Text(|d, v| d.title = Some(v)),
     },
-    Key {
+    Setting {
         name: "chrome",
         example: "chrome #false",
         set: Set::Flag(|d, v| d.chrome = Some(v)),
     },
-    Key {
+    Setting {
         name: "focusable",
         example: "focusable #false",
         set: Set::Flag(|d, v| d.focusable = Some(v)),
     },
-    Key {
+    Setting {
         name: "live",
         example: "live #true",
         set: Set::Flag(|d, v| d.live = Some(v)),
@@ -206,12 +206,12 @@ fn set_height(decl: &mut PaneDecl, cells: i128, ctx: &Ctx<'_>) -> anyhow::Result
     Ok(())
 }
 
-fn key(name: &str) -> Option<&'static Key> {
+fn pane_setting(name: &str) -> Option<&'static Setting> {
     PANE_KEYS.iter().find(|k| k.name == name)
 }
 
 /// The keys legal in the position the error is complaining about.
-fn key_list(property_position: bool) -> String {
+fn setting_list(property_position: bool) -> String {
     PANE_KEYS
         .iter()
         .filter(|k| !property_position || k.set.takes_a_property())
@@ -222,7 +222,7 @@ fn key_list(property_position: bool) -> String {
 
 /// Every shape error is generated from the key's own example, so there
 /// is no per-key error text to keep in step with the table.
-fn shape_err(k: &Key, at: &str) -> anyhow::Error {
+fn shape_err(k: &Setting, at: &str) -> anyhow::Error {
     anyhow!(
         "{at}: `{}` takes {} — write `{}`",
         k.name,
@@ -233,7 +233,7 @@ fn shape_err(k: &Key, at: &str) -> anyhow::Error {
 
 /// The same complaint against the property spelling, so the fix it
 /// shows is the one the user was reaching for.
-fn prop_shape_err(k: &Key, at: &str) -> anyhow::Error {
+fn prop_shape_err(k: &Setting, at: &str) -> anyhow::Error {
     anyhow!(
         "{at}: `{}` takes {} — write `{}`",
         k.name,
@@ -242,7 +242,7 @@ fn prop_shape_err(k: &Key, at: &str) -> anyhow::Error {
     )
 }
 
-fn takes(k: &Key) -> &'static str {
+fn takes(k: &Setting) -> &'static str {
     match k.set {
         Set::Text(_) => "one string",
         Set::Count(_) => "one integer",
@@ -279,7 +279,7 @@ fn refuse_annotation(ty: Option<&kdl::KdlIdentifier>, key: &str, at: &str) -> an
 /// it, a block under it, or an annotation anywhere on it is a token
 /// with nowhere to go — the same silent discard I-52 closes one level
 /// up, one level down.
-fn only_a_value(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<()> {
+fn only_a_value(node: &kdl::KdlNode, k: &Setting, at: &str) -> anyhow::Result<()> {
     refuse_annotation(node.ty(), k.name, at)?;
     for entry in node.entries() {
         match entry.name() {
@@ -312,7 +312,7 @@ fn only_a_value(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<()> {
 /// One key, one place, once: a key written twice on the same block —
 /// two properties, two child nodes, or one of each — is an error.
 /// Last-wins is invisible to a reader scanning a long pane block.
-fn record(seen: &mut Vec<&'static str>, k: &'static Key, at: &str) -> anyhow::Result<()> {
+fn record(seen: &mut Vec<&'static str>, k: &'static Setting, at: &str) -> anyhow::Result<()> {
     if seen.contains(&k.name) {
         bail!(
             "{at}: `{}` is declared twice — declare it once, as a property or a child node",
@@ -661,10 +661,10 @@ fn pane_block(
                 ty.value()
             );
         }
-        let Some(k) = key(prop) else {
+        let Some(k) = pane_setting(prop) else {
             bail!(
                 "{at}: unknown property {prop:?} — a pane's keys with a property spelling are {}",
-                key_list(true)
+                setting_list(true)
             );
         };
         record(&mut seen, k, &at)?;
@@ -687,10 +687,10 @@ fn pane_block(
         .unwrap_or_default()
     {
         let name = child.name().value();
-        let Some(k) = key(name) else {
+        let Some(k) = pane_setting(name) else {
             bail!(
                 "{at}: unknown node {name:?} — a pane's keys are {}",
-                key_list(false)
+                setting_list(false)
             );
         };
         record(&mut seen, k, &at)?;
@@ -711,7 +711,7 @@ fn pane_block(
 /// positions the pass raises the duplicate error, so the peek's choice
 /// never reaches a spawn.
 fn peek_shell(node: &kdl::KdlNode, at: &str) -> anyhow::Result<Option<ShellDecl>> {
-    let k = key("shell").expect("`shell` is a pane key");
+    let k = pane_setting("shell").expect("`shell` is a pane key");
     if let Some(entry) = node.entry("shell") {
         return shell_decl(entry)
             .map(Some)
@@ -738,7 +738,7 @@ struct Load<'a> {
 
 fn prop_text(
     entry: &kdl::KdlEntry,
-    k: &Key,
+    k: &Setting,
     at: &str,
     load: &Load<'_>,
 ) -> anyhow::Result<Template> {
@@ -749,11 +749,11 @@ fn prop_text(
     template_of(text, entry, load)
 }
 
-fn prop_count(value: &kdl::KdlValue, k: &Key, at: &str) -> anyhow::Result<i128> {
+fn prop_count(value: &kdl::KdlValue, k: &Setting, at: &str) -> anyhow::Result<i128> {
     value.as_integer().ok_or_else(|| prop_shape_err(k, at))
 }
 
-fn prop_flag(value: &kdl::KdlValue, k: &Key, at: &str) -> anyhow::Result<bool> {
+fn prop_flag(value: &kdl::KdlValue, k: &Setting, at: &str) -> anyhow::Result<bool> {
     value.as_bool().ok_or_else(|| prop_shape_err(k, at))
 }
 
@@ -777,7 +777,12 @@ fn positional(node: &kdl::KdlNode) -> Vec<&kdl::KdlValue> {
         .collect()
 }
 
-fn one_text(node: &kdl::KdlNode, k: &Key, at: &str, load: &Load<'_>) -> anyhow::Result<Template> {
+fn one_text(
+    node: &kdl::KdlNode,
+    k: &Setting,
+    at: &str,
+    load: &Load<'_>,
+) -> anyhow::Result<Template> {
     match positional_entries(node).as_slice() {
         [entry] => {
             let text = entry.value().as_string().ok_or_else(|| shape_err(k, at))?;
@@ -850,14 +855,14 @@ fn reference_offset(text: &str, entry: &kdl::KdlEntry, name: &str) -> usize {
     start + value_at + repr.find(&format!("{{{{{name}}}}}")).unwrap_or(0)
 }
 
-fn one_count(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<i128> {
+fn one_count(node: &kdl::KdlNode, k: &Setting, at: &str) -> anyhow::Result<i128> {
     match positional(node).as_slice() {
         [value] => value.as_integer().ok_or_else(|| shape_err(k, at)),
         _ => Err(shape_err(k, at)),
     }
 }
 
-fn one_flag(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<bool> {
+fn one_flag(node: &kdl::KdlNode, k: &Setting, at: &str) -> anyhow::Result<bool> {
     match positional(node).as_slice() {
         [value] => value.as_bool().ok_or_else(|| shape_err(k, at)),
         _ => Err(shape_err(k, at)),
@@ -869,7 +874,7 @@ fn one_flag(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<bool> {
 /// validation of a templated dialect name against the declared set.
 fn prop_mode(
     entry: &kdl::KdlEntry,
-    k: &Key,
+    k: &Setting,
     at: &str,
     load: &Load<'_>,
 ) -> anyhow::Result<ShellDecl> {
@@ -878,7 +883,12 @@ fn prop_mode(
     Ok(decl)
 }
 
-fn one_mode(node: &kdl::KdlNode, k: &Key, at: &str, load: &Load<'_>) -> anyhow::Result<ShellDecl> {
+fn one_mode(
+    node: &kdl::KdlNode,
+    k: &Setting,
+    at: &str,
+    load: &Load<'_>,
+) -> anyhow::Result<ShellDecl> {
     match positional_entries(node).as_slice() {
         [entry] => {
             let decl = shell_decl(entry).ok_or_else(|| shape_err(k, at))?;
@@ -891,7 +901,7 @@ fn one_mode(node: &kdl::KdlNode, k: &Key, at: &str, load: &Load<'_>) -> anyhow::
 
 fn many_text(
     node: &kdl::KdlNode,
-    k: &Key,
+    k: &Setting,
     at: &str,
     load: &Load<'_>,
 ) -> anyhow::Result<Vec<Template>> {
@@ -913,10 +923,10 @@ fn many_text(
 /// positional error it has today; a recognised name at ANY position
 /// counts, because `defaults #true shell` still holds the key the
 /// author was reaching for.
-fn stray_key(values: &[&kdl::KdlValue]) -> Option<&'static Key> {
+fn stray_key(values: &[&kdl::KdlValue]) -> Option<&'static Setting> {
     values
         .iter()
-        .find_map(|value| value.as_string().and_then(key))
+        .find_map(|value| value.as_string().and_then(pane_setting))
 }
 
 /// The same scan for the document settings, which are not pane keys —
@@ -935,7 +945,7 @@ fn stray_setting(values: &[&kdl::KdlValue]) -> Option<&'static str> {
 /// the table's example otherwise. A List key has no property spelling,
 /// so it gets the child-node sentence with the table's example — the
 /// same one the property path teaches.
-fn stray_key_err(at: &str, k: &Key, values: &[&kdl::KdlValue]) -> anyhow::Error {
+fn stray_key_err(at: &str, k: &Setting, values: &[&kdl::KdlValue]) -> anyhow::Error {
     if let Set::List(_) = k.set {
         return anyhow!(
             "{at}: `{}` holds a list, so it must be a child node — write `{}` inside the block",
@@ -958,7 +968,7 @@ fn stray_key_err(at: &str, k: &Key, values: &[&kdl::KdlValue]) -> anyhow::Error 
             None => value
                 .as_string()
                 .filter(|name| !name.trim().is_empty())
-                .is_some_and(|name| key(name).is_none()),
+                .is_some_and(|name| pane_setting(name).is_none()),
         },
     };
     let spelling = values
