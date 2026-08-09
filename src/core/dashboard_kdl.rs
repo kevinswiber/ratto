@@ -1994,7 +1994,7 @@ pane "nested" {
         ] {
             parse(text)
                 .expect("the example parses")
-                .into_registry()
+                .into_registry(&Bindings::new())
                 .expect("the example validates");
         }
     }
@@ -2104,9 +2104,11 @@ pane "nested" {
             ..file.clone()
         };
         assert_same_registry(
-            &file.into_registry().expect("the stated column validates"),
+            &file
+                .into_registry(&Bindings::new())
+                .expect("the stated column validates"),
             &implicit
-                .into_registry()
+                .into_registry(&Bindings::new())
                 .expect("the implicit column validates"),
         );
     }
@@ -2462,7 +2464,7 @@ pane "all" {
         let registry =
             parse("title \"Deploy status\"\npane \"a\" {\n    height 3\n    command \"date\"\n}\n")
                 .expect("parses")
-                .into_registry()
+                .into_registry(&Bindings::new())
                 .expect("validates");
         let Composition::Panes { title, .. } = registry.composition() else {
             panic!("a dashboard registry composes panes");
@@ -2473,7 +2475,7 @@ pane "all" {
         );
         let registry = parse("pane \"a\" {\n    height 3\n    command \"date\"\n}\n")
             .expect("parses")
-            .into_registry()
+            .into_registry(&Bindings::new())
             .expect("validates");
         let Composition::Panes { title, .. } = registry.composition() else {
             panic!("a dashboard registry composes panes");
@@ -2489,7 +2491,7 @@ pane "all" {
             "title ref=\"#x\"\npane \"x\" {\n    height 3\n    command \"date\"\n}\npane \"x\" {\n    height 3\n    command \"uptime\"\n}\n",
         )
         .expect("parses")
-        .into_registry()
+        .into_registry(&Bindings::new())
         .expect("validates");
         let Composition::Panes { title, .. } = registry.composition() else {
             panic!("panes")
@@ -2506,7 +2508,7 @@ pane "all" {
             "{:#}",
             parse("title ref=\"#nope\"\npane \"a\" {\n    height 3\n    command \"date\"\n}\n")
                 .expect("parses")
-                .into_registry()
+                .into_registry(&Bindings::new())
                 .unwrap_err()
         );
         assert!(err.contains("names no pane"), "{err}");

@@ -1249,3 +1249,157 @@ pane "a" {{
             "the board declares no variable `wrod`",
         ));
 }
+
+#[test]
+fn a_constant_never_executes_anything() {
+    // A variable with NO `shell`, whose VALUE is command-shaped. The
+    // classifier must read `VarSource`, never "looks like a command".
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("runs");
+    #[cfg(unix)]
+    let shaped = format!("printf x >> {}", counter.display());
+    #[cfg(windows)]
+    let shaped = format!("echo x>> \"{}\"", counter.display());
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    probe \"{shaped}\"\n}}\n\npane \"a\" {{\n    command \"{bin}\" \"style\" \"ok\"\n    height 3\n    chrome #false\n}}\n",
+            shaped = shaped.replace('\\', "\\\\").replace('"', "\\\""),
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    assert!(!counter.exists(), "a constant never spawns anything");
+}
+
+#[cfg(unix)]
+#[test]
+fn defaults_shell_does_not_reach_a_variable() {
+    // Two boards, byte-identical except that one declares
+    // `defaults { shell "fish" }`. The variable derives under ITS OWN
+    // shell either way — variables are the board's distribution
+    // surface, and a shipped template's values must not change dialect
+    // because the importing board declares a different `defaults`.
+    // The probe writes the running shell's $0, which differs by
+    // dialect; the unconditional half is that the two boards agree.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = rat_bin().replace('\\', "\\\\");
+    let mut outputs = Vec::new();
+    for (name, defaults_line) in [("plain.kdl", ""), ("fishy.kdl", "shell \"fish\"\n")] {
+        let probe = dir.path().join(format!("{name}.probe"));
+        let file = fixture(
+            dir.path(),
+            name,
+            &format!(
+                "variables {{\n    probe \"echo $0 >> {path}; echo ok\" shell=#true\n}}\n\ndefaults {{\n    height 3\n    chrome #false\n    {defaults_line}}}\n\npane \"a\" {{\n    command \"{bin}\" \"style\" \"ok\"\n    shell #false\n}}\n",
+                path = probe.display(),
+            ),
+        );
+        rat()
+            .env("NO_COLOR", "1")
+            .args(["dashboard", &file, "--once"])
+            .assert()
+            .success();
+        outputs.push(std::fs::read_to_string(&probe).expect("the probe ran"));
+    }
+    assert_eq!(outputs[0], outputs[1], "defaults leaked into a variable");
+}
+
+#[test]
+fn a_command_variable_may_reference_another_variable_in_either_order() {
+    // The unordered walk (INV-3) meets the runner end-to-end: the
+    // command TEXT is expanded against its dependencies before it
+    // runs, wherever the dependencies are declared — including a
+    // three-hop chain declared entirely backwards.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out_one = dir.path().join("one");
+    let out_two = dir.path().join("two");
+    #[cfg(unix)]
+    let (write_one, write_two) = (
+        format!(
+            "printf %s {{{{root}}}}/store >> {}; printf ok",
+            out_one.display()
+        ),
+        format!("printf %s {{{{c}}}} >> {}; printf ok", out_two.display()),
+    );
+    #[cfg(windows)]
+    let (write_one, write_two) = (
+        format!(
+            "echo {{{{root}}}}/store>> \"{}\" & echo ok",
+            out_one.display()
+        ),
+        format!("echo {{{{c}}}}>> \"{}\" & echo ok", out_two.display()),
+    );
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    store \"{w1}\" shell=#true\n    root \"/tmp/xyz\"\n    final \"{w2}\" shell=#true\n    c \"{{{{b}}}}/c\"\n    b \"{{{{a}}}}/b\"\n    a \"root\"\n}}\n\npane \"a\" {{\n    command \"{bin}\" \"style\" \"ok\"\n    height 3\n    chrome #false\n}}\n",
+            w1 = write_one.replace('\\', "\\\\").replace('"', "\\\""),
+            w2 = write_two.replace('\\', "\\\\").replace('"', "\\\""),
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let one = std::fs::read_to_string(&out_one).expect("store derived");
+    assert_eq!(one.trim(), "/tmp/xyz/store");
+    let two = std::fs::read_to_string(&out_two).expect("final derived");
+    assert_eq!(two.trim(), "root/b/c");
+}
+
+#[test]
+fn an_override_suppresses_that_names_command_entirely() {
+    // INV-4.4: `-v store=…` means store's command NEVER runs — and a
+    // sibling that was not overridden still does.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_counter = dir.path().join("store-runs");
+    let other_counter = dir.path().join("other-runs");
+    #[cfg(unix)]
+    let (store_cmd, other_cmd) = (
+        format!("printf x >> {}; printf a", store_counter.display()),
+        format!("printf y >> {}; printf b", other_counter.display()),
+    );
+    #[cfg(windows)]
+    let (store_cmd, other_cmd) = (
+        format!("echo x>> \"{}\" & echo a", store_counter.display()),
+        format!("echo y>> \"{}\" & echo b", other_counter.display()),
+    );
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    store \"{s}\" shell=#true\n    other \"{o}\" shell=#true\n}}\n\npane \"a\" {{\n    command \"{bin}\" \"style\" \"ok\"\n    height 3\n    chrome #false\n}}\n",
+            s = store_cmd.replace('\\', "\\\\").replace('"', "\\\""),
+            o = other_cmd.replace('\\', "\\\\").replace('"', "\\\""),
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once", "-v", "store=/given"])
+        .assert()
+        .success();
+    assert!(!store_counter.exists(), "the overridden command never ran");
+    let other = std::fs::read_to_string(&other_counter).expect("the sibling ran");
+    assert_eq!(other.matches('y').count(), 1);
+}
+
+#[test]
+#[ignore = "spawn-time expansion is not wired yet; un-ignore when it lands"]
+fn a_once_at_load_variable_expands_to_the_same_bytes_on_every_spawn() {
+    // The integration-level statement of the memoization claim: a pane
+    // printing {{store}} across several spawns shows the same bytes on
+    // every frame while the counter file reads exactly 1. Owned by the
+    // load-time runner even though the expansion it observes arrives
+    // with the spawn-time phase.
+    todo!("drive a live board through several spawns once expansion lands");
+}

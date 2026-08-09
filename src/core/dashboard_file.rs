@@ -148,7 +148,14 @@ impl DashboardFile {
     /// The ONE validation path: resolve defaults, parse every token,
     /// check the layout, build the registry. Every error names the
     /// pane and the fix.
-    pub fn into_registry(self) -> anyhow::Result<Registry> {
+    pub fn into_registry(
+        self,
+        bindings: &crate::core::template::Bindings,
+    ) -> anyhow::Result<Registry> {
+        // Not consumed yet: load-time site expansion is what reads the
+        // map, and it lands with the load-time-sites task. Taking the
+        // parameter NOW is what that task wrote itself against.
+        let _ = bindings;
         if self.panes.is_empty() {
             bail!("no panes declared: a dashboard needs at least one pane");
         }
@@ -704,7 +711,22 @@ pub fn load(
         .with_context(|| format!("in {}", path.display()))?;
     crate::core::variables::check_overrides(&file.variables, overrides)
         .with_context(|| format!("in {}", path.display()))?;
-    file.into_registry()
+    // The runner is passed as a PARAMETER, not called from inside
+    // `resolve_variables`: that inversion is what lets the graph walk
+    // be tested with no subprocess, lets a checker hold a
+    // `VariableBlock` while running nothing, and keeps `variables.rs`
+    // and `shell.rs` from importing each other.
+    let bindings = crate::core::variables::resolve_variables(&file.variables, overrides, &mut {
+        |request: crate::core::variables::Derivation<'_>| {
+            crate::core::shell::derive(&request).map_err(|failure| {
+                // Placeholder wording: the failure-rendering layer owns
+                // the teaching sentence for each variant.
+                anyhow::anyhow!("variable `{}`: {failure}", request.name)
+            })
+        }
+    })
+    .with_context(|| format!("in {}", path.display()))?;
+    file.into_registry(&bindings)
         .with_context(|| format!("in {}", path.display()))
 }
 
@@ -715,6 +737,7 @@ mod tests {
     use super::*;
     use crate::core::box_model::{BorderPreset, Sides};
     use crate::core::registry::{Composition, LayoutNode, SourceId};
+    use crate::core::template::Bindings;
 
     /// The smallest legal pane: a name, a command, a declared height.
     fn pane(id: &str, command: &[&str]) -> PaneDecl {
@@ -734,7 +757,7 @@ mod tests {
     }
 
     fn err_of(file: DashboardFile) -> String {
-        format!("{:#}", file.into_registry().unwrap_err())
+        format!("{:#}", file.into_registry(&Bindings::new()).unwrap_err())
     }
 
     #[test]
@@ -767,7 +790,7 @@ mod tests {
             }],
             ..DashboardFile::default()
         };
-        let shell_override = format!("{:#}", decl.into_registry().unwrap_err());
+        let shell_override = format!("{:#}", decl.into_registry(&Bindings::new()).unwrap_err());
         assert!(
             shell_override.contains("`defaults`"),
             "got {shell_override}"
@@ -803,7 +826,7 @@ mod tests {
         // Both panes declare their own height (4 — the smallest a
         // rounded border plus the chrome row admits), so only the
         // fields the panes leave open come from `defaults`.
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert_eq!(registry.len(), 2);
         for id in registry.ids() {
             assert_eq!(registry.spec(id).interval, Some(Duration::from_secs(30)));
@@ -839,7 +862,7 @@ mod tests {
             ],
             ..DashboardFile::default()
         };
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert_eq!(
             registry.spec(SourceId(0)).interval,
             Some(Duration::from_secs(2))
@@ -862,7 +885,7 @@ mod tests {
             interval: Some("never".into()),
             ..pane("manual", &["date"])
         }]);
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert_eq!(registry.spec(SourceId(0)).interval, None);
         assert!(crate::core::duration::parse_interval("never").is_err());
     }
@@ -870,7 +893,7 @@ mod tests {
     #[test]
     fn no_interval_and_no_trigger_defaults_to_two_seconds() {
         let registry = file(vec![pane("plain", &["date"])])
-            .into_registry()
+            .into_registry(&Bindings::new())
             .expect("registry");
         assert_eq!(
             registry.spec(SourceId(0)).interval,
@@ -884,7 +907,7 @@ mod tests {
             trigger: Some(vec!["file:./state".into()]),
             ..pane("watched", &["date"])
         }]);
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert_eq!(registry.spec(SourceId(0)).interval, None);
         assert_eq!(registry.spec(SourceId(0)).triggers.len(), 1);
     }
@@ -892,7 +915,7 @@ mod tests {
     #[test]
     fn a_pane_is_not_live_unless_it_says_so() {
         let registry = file(vec![pane("log", &["date"])])
-            .into_registry()
+            .into_registry(&Bindings::new())
             .expect("registry");
         assert!(!registry.spec(SourceId(0)).live);
     }
@@ -903,7 +926,7 @@ mod tests {
             live: Some(true),
             ..pane("log", &["date"])
         }])
-        .into_registry()
+        .into_registry(&Bindings::new())
         .expect("registry");
         assert!(registry.spec(SourceId(0)).live);
     }
@@ -918,7 +941,7 @@ mod tests {
             },
         ]);
         decl.defaults.live = Some(true);
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert!(registry.spec(SourceId(0)).live, "inherits the default");
         assert!(
             !registry.spec(SourceId(1)).live,
@@ -936,7 +959,7 @@ mod tests {
             },
         ]);
         decl.defaults.focusable = Some(false);
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert!(
             !registry.pane(SourceId(0)).expect("header box").focusable,
             "the header inherits the default"
@@ -947,7 +970,7 @@ mod tests {
         );
 
         let ordinary = file(vec![pane("ordinary", &["date"])])
-            .into_registry()
+            .into_registry(&Bindings::new())
             .expect("registry");
         assert!(
             ordinary.pane(SourceId(0)).expect("ordinary box").focusable,
@@ -964,7 +987,7 @@ mod tests {
             live: Some(true),
             ..pane("log", &["date"])
         }])
-        .into_registry()
+        .into_registry(&Bindings::new())
         .expect("registry");
         assert_eq!(
             registry.pane(SourceId(0)).expect("pane").overflow,
@@ -977,7 +1000,7 @@ mod tests {
         // The shipped default is untouched — a live-only override, not a
         // change to what every other pane does.
         let registry = file(vec![pane("p", &["date"])])
-            .into_registry()
+            .into_registry(&Bindings::new())
             .expect("registry");
         assert_eq!(
             registry.pane(SourceId(0)).expect("pane").overflow,
@@ -1024,7 +1047,7 @@ mod tests {
             overflow: Some("keep-top".into()),
             ..pane("p", &["date"])
         }])
-        .into_registry()
+        .into_registry(&Bindings::new())
         .expect("registry");
         assert_eq!(
             registry.pane(SourceId(0)).expect("pane").overflow,
@@ -1039,7 +1062,7 @@ mod tests {
             overflow: Some("keep-bottom".into()),
             ..pane("log", &["date"])
         }])
-        .into_registry()
+        .into_registry(&Bindings::new())
         .expect("registry");
         assert_eq!(
             registry.pane(SourceId(0)).expect("pane").overflow,
@@ -1055,7 +1078,7 @@ mod tests {
         // both panes still render, and refs (which never place) bind
         // the first declaration.
         let registry = file(vec![pane("git", &["date"]), pane("git", &["uptime"])])
-            .into_registry()
+            .into_registry(&Bindings::new())
             .expect("duplicates load");
         assert_eq!(registry.len(), 2, "both panes survive");
         assert!(
@@ -1086,7 +1109,7 @@ mod tests {
             LayoutDecl::Pane("git".to_string()),
             LayoutDecl::Pane("git".to_string()),
         ]);
-        let err = format!("{:#}", f.into_registry().unwrap_err());
+        let err = format!("{:#}", f.into_registry(&Bindings::new()).unwrap_err());
         assert!(err.contains("more times than"), "{err}");
     }
 
@@ -1120,7 +1143,7 @@ mod tests {
             pane("middle", &["date"]),
             pane("bottom", &["date"]),
         ])
-        .into_registry()
+        .into_registry(&Bindings::new())
         .expect("registry");
         let Composition::Panes { layout, .. } = registry.composition() else {
             panic!("a dashboard composes panes");
@@ -1160,7 +1183,7 @@ mod tests {
             command: Some(vec![script.into()]),
             ..pane("stamp", &["unused"])
         }]);
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         let spec = registry.spec(SourceId(0));
         assert_eq!(spec.shell, ShellMode::Platform);
         assert_eq!(spec.program, SourceProgram::Argv(vec![script.to_string()]));
@@ -1225,7 +1248,7 @@ mod tests {
         // A body with no `#!` anywhere still falls back gracefully —
         // the refusal is only for a demonstrably indented shebang.
         let decl = file(vec![script_pane("y", "echo hi")]);
-        assert!(decl.into_registry().is_ok());
+        assert!(decl.into_registry(&Bindings::new()).is_ok());
     }
 
     #[test]
@@ -1298,7 +1321,9 @@ mod tests {
         // `shell #false` with any shebang pane.
         let mut decl = script_pane("x", "#!/bin/sh\necho hi");
         decl.shell = Some(ShellDecl::Direct);
-        let registry = file(vec![decl]).into_registry().expect("registry");
+        let registry = file(vec![decl])
+            .into_registry(&Bindings::new())
+            .expect("registry");
         assert_eq!(
             registry.spec(SourceId(0)).program,
             SourceProgram::Script("#!/bin/sh\necho hi".to_string())
@@ -1313,7 +1338,7 @@ mod tests {
             panes: vec![script_pane("y", "#!/bin/sh\necho hi")],
             ..DashboardFile::default()
         };
-        assert!(decl.into_registry().is_ok());
+        assert!(decl.into_registry(&Bindings::new()).is_ok());
     }
 
     #[test]
@@ -1338,7 +1363,7 @@ mod tests {
             ],
             ..DashboardFile::default()
         };
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         for id in [SourceId(0), SourceId(1)] {
             assert_eq!(
                 registry.spec(id).program,
@@ -1383,7 +1408,7 @@ mod tests {
             panes: vec![script_pane("x", "#!/bin/sh\necho hi")],
             ..DashboardFile::default()
         };
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert_eq!(
             registry.spec(SourceId(0)).program,
             SourceProgram::Script("#!/bin/sh\necho hi".to_string())
@@ -1395,7 +1420,7 @@ mod tests {
         // A shebang-less body cannot run Direct; absence promotes to
         // the platform's shell, exactly what `shell #true` means.
         let registry = file(vec![script_pane("x", "echo hi")])
-            .into_registry()
+            .into_registry(&Bindings::new())
             .expect("registry");
         assert_eq!(registry.spec(SourceId(0)).shell, ShellMode::Platform);
     }
@@ -1411,7 +1436,7 @@ mod tests {
             panes: vec![pane("x", &["date"])],
             ..DashboardFile::default()
         };
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert_eq!(
             registry.spec(SourceId(0)).program,
             SourceProgram::Argv(vec!["date".to_string()])
@@ -1438,7 +1463,7 @@ mod tests {
             }],
             ..DashboardFile::default()
         };
-        let err = format!("{:#}", decl.into_registry().unwrap_err());
+        let err = format!("{:#}", decl.into_registry(&Bindings::new()).unwrap_err());
         assert!(err.contains("fishy"), "{err}");
         assert!(err.contains("the platform shell"), "{err}");
         assert!(err.contains("`fish`"), "{err}");
@@ -1463,7 +1488,9 @@ mod tests {
             }],
             ..DashboardFile::default()
         };
-        let registry = decl.into_registry().expect("same mode inherits fine");
+        let registry = decl
+            .into_registry(&Bindings::new())
+            .expect("same mode inherits fine");
         assert_eq!(
             registry.spec(SourceId(0)).shell,
             ShellMode::Named("fish".to_string())
@@ -1490,7 +1517,7 @@ mod tests {
             }],
             ..DashboardFile::default()
         };
-        let err = format!("{:#}", decl.into_registry().unwrap_err());
+        let err = format!("{:#}", decl.into_registry(&Bindings::new()).unwrap_err());
         assert!(err.contains("pedantic"), "{err}");
         assert!(err.contains("`sh`"), "{err}");
     }
@@ -1510,7 +1537,9 @@ mod tests {
             }],
             ..DashboardFile::default()
         };
-        let registry = decl.into_registry().expect("plain inheritance");
+        let registry = decl
+            .into_registry(&Bindings::new())
+            .expect("plain inheritance");
         assert_eq!(
             registry.spec(SourceId(0)).shell,
             ShellMode::Named("fish".to_string())
@@ -1537,7 +1566,7 @@ mod tests {
             }],
             ..DashboardFile::default()
         };
-        let err = format!("{:#}", decl.into_registry().unwrap_err());
+        let err = format!("{:#}", decl.into_registry(&Bindings::new()).unwrap_err());
         assert!(err.contains("plain"), "{err}");
         assert!(err.contains("shell"), "{err}");
         assert!(err.contains("command"), "{err}");
@@ -1555,7 +1584,7 @@ mod tests {
             }],
             ..DashboardFile::default()
         };
-        assert!(reverse.into_registry().is_err());
+        assert!(reverse.into_registry(&Bindings::new()).is_err());
 
         // Matching modes inherit fine.
         let ok = DashboardFile {
@@ -1574,7 +1603,7 @@ mod tests {
             ],
             ..DashboardFile::default()
         };
-        assert!(ok.into_registry().is_ok());
+        assert!(ok.into_registry(&Bindings::new()).is_ok());
     }
 
     #[test]
@@ -1597,7 +1626,7 @@ mod tests {
             ])]),
             ..DashboardFile::default()
         };
-        let registry = decl.into_registry().expect("registry");
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
         let Composition::Panes { layout, .. } = registry.composition() else {
             panic!("a dashboard composes panes");
         };
@@ -1627,7 +1656,7 @@ mod tests {
             ])]),
             ..DashboardFile::default()
         };
-        let err = format!("{:#}", dup.into_registry().unwrap_err());
+        let err = format!("{:#}", dup.into_registry(&Bindings::new()).unwrap_err());
         assert!(
             err.contains("\"a\"") && err.contains("more times than"),
             "{err}"
@@ -1641,7 +1670,7 @@ mod tests {
             ]),
             ..DashboardFile::default()
         };
-        let err = format!("{:#}", empty.into_registry().unwrap_err());
+        let err = format!("{:#}", empty.into_registry(&Bindings::new()).unwrap_err());
         assert!(err.contains("empty"), "{err}");
     }
 

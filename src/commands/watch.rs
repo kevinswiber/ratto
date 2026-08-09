@@ -37,6 +37,7 @@ use crate::core::registry::{
 };
 use crate::core::retain::{Keep, Retention, compact_count};
 use crate::core::schedule::{Due, TickSchedule};
+use crate::core::shell::{interpreter_name, shell_command, shell_invocation};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
 use crate::core::trigger::{
     BracketId, DebounceGate, MtimeWatchSet, PathLedger, TriggerSpec, Verdict, WindowLog,
@@ -5466,80 +5467,6 @@ fn signature(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// The program `ShellMode::Platform` runs — resolved at spawn time,
-/// exactly as `%COMSPEC%` always was.
-#[cfg(unix)]
-fn platform_shell() -> String {
-    "sh".to_string()
-}
-
-#[cfg(windows)]
-fn platform_shell() -> String {
-    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string())
-}
-
-/// The platform shell's "run this string" flag. Fixed rather than
-/// looked up in the dialect table: bare `--shell` (and `shell=#true`)
-/// keeps its exact historical bytes even when `%COMSPEC%` names
-/// something exotic — selecting different flags takes an explicit
-/// `--shell=NAME`.
-#[cfg(unix)]
-fn platform_flags() -> &'static [&'static str] {
-    &["-c"]
-}
-
-#[cfg(windows)]
-fn platform_flags() -> &'static [&'static str] {
-    &["/C"]
-}
-
-/// The shell's own flag(s) for "run this string": `cmd` takes `/C`,
-/// PowerShell `-NoProfile -Command`, and everything else `-c` — sh,
-/// bash, zsh, fish, nu, dash, ksh all agree on it. Matched on the file
-/// NAME with a `.exe` stripped and lowercased, so a full path,
-/// `pwsh.exe` and `PWSH.EXE` all land on the same row. An unknown name
-/// is not an error: `-c` is what a program invoked with a script takes,
-/// and a wrong guess surfaces as the child's own diagnostic.
-///
-/// `-NoProfile` because the child respawns every tick: the profile's
-/// load cost would recur at the interval and anything it prints would
-/// land in the frame. A script that wants the profile opts back in
-/// (`--shell=pwsh -- '. $PROFILE; …'`); there would be no way to opt
-/// out.
-fn command_flags(program: &str) -> &'static [&'static str] {
-    match interpreter_name(program).as_str() {
-        "cmd" => &["/C"],
-        "powershell" | "pwsh" => &["-NoProfile", "-Command"],
-        _ => &["-c"],
-    }
-}
-
-/// A program's dialect key: the file name, `.exe` stripped, lowercased.
-/// `command_flags` and the interpreter tables must agree on what a
-/// program is CALLED, or a full path would answer one table and not
-/// the other. Windows names a program with its extension; unix never
-/// does — and ONLY `.exe` is stripped, so a wrapper script `cmd.sh`
-/// keeps its own row.
-fn interpreter_name(program: &str) -> String {
-    let name = std::path::Path::new(program)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_ascii_lowercase();
-    name.strip_suffix(".exe").unwrap_or(&name).to_string()
-}
-
-/// The program and flags a mode spawns, or `None` when there is no
-/// shell. `Platform` NEVER consults the dialect table: bare `--shell`
-/// is frozen bytes even under an exotic `COMSPEC`.
-fn shell_invocation(mode: &ShellMode) -> Option<(String, &'static [&'static str])> {
-    match mode {
-        ShellMode::Direct => None,
-        ShellMode::Platform => Some((platform_shell(), platform_flags())),
-        ShellMode::Named(name) => Some((name.clone(), command_flags(name))),
-    }
-}
-
 /// The `--shell` flag as a mode. Absent is no shell, bare is the
 /// platform's, and a value names the program. An EMPTY value names
 /// nothing — almost always a variable that expanded to nothing — so it
@@ -5575,30 +5502,6 @@ fn spawn_program(spec: &SourceSpec) -> String {
             None => argv[0].clone(),
         },
     }
-}
-
-/// One shell, one script. The platform lives in
-/// `platform_shell`/`platform_flags` and the dialect in
-/// `command_flags`; the one `#[cfg]` here is QUOTING, a concern only
-/// Windows has — unix hands the script over as a real argv element
-/// and never serializes it into a command line.
-fn shell_command(program: &str, flags: &[&str], script: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(flags);
-    // cmd.exe does not parse the `\"` escapes MSVCRT-style argument
-    // quoting writes, so a body handed to `/C` must be the author's
-    // bytes verbatim — exactly what typing it at a prompt would send.
-    // `/C` marks the dialect: only cmd (and the Windows platform
-    // shell, which is cmd) takes it. The other dialects keep the
-    // quoted form their parsers understand.
-    #[cfg(windows)]
-    if matches!(flags, ["/C"]) {
-        use std::os::windows::process::CommandExt;
-        cmd.raw_arg(script);
-        return cmd;
-    }
-    cmd.arg(script);
-    cmd
 }
 
 /// Every source's materialized script, by `SourceId`, and the private
@@ -5849,6 +5752,7 @@ mod tests {
 
     use super::*;
     use crate::core::layout::overflow_clip;
+    use crate::core::shell::{command_flags, platform_flags, platform_shell};
     use crate::term::scroll::max_offset;
 
     const ALL_MODES: [FrameMode; 3] = [FrameMode::Live, FrameMode::LiveScrolled, FrameMode::Paused];
