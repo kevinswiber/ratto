@@ -4354,3 +4354,271 @@ fn zoom_shows_a_collapsed_panes_body_and_unzoom_returns_the_row() {
         "dashboard should have exited on q"
     );
 }
+
+// ─── Spawn-time expansion (templates) ───────────────────────────────
+
+/// A templated shebang body is re-materialized when its expanded bytes
+/// change: the deferred value read at each spawn reaches the child,
+/// not the bytes baked in at load.
+#[test]
+fn a_templated_shebang_script_is_rematerialized_when_its_bytes_change() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handoff = dir.path().join("handoff");
+    std::fs::write(&handoff, "one").expect("seed");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "variables {{\n    rev \"cat {h}\" shell=#true defer=#true\n}}\n\npane \"p\" {{\n    height 4\n    trigger \"file:{h}\"\n    interval \"never\"\n    trigger-debounce \"0ms\"\n    script \"#!/bin/sh\\necho val-{{{{rev}}}}\"\n}}\n",
+            h = handoff.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"val-one", Duration::from_secs(5)),
+        "the first expansion never painted"
+    );
+    // The writer moves the handoff; the trigger drives a respawn; the
+    // fresh derivation reaches the child through a REWRITTEN file.
+    std::fs::write(&handoff, "two").expect("update");
+    assert!(
+        wait_for(&session, &mut terminal, b"val-two", Duration::from_secs(5)),
+        "the re-materialized script never painted"
+    );
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// The non-regression sibling: a template-free shebang body keeps the
+/// write-once path. The mechanical half (no rewrite) is the unit
+/// test's; this anchors the absence with a presence — the child RAN N
+/// times — so a pane that never spawned cannot satisfy it.
+#[test]
+fn a_template_free_shebang_body_still_writes_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("count");
+    let sig = dir.path().join("sig");
+    std::fs::write(&sig, "0").expect("seed");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "pane \"p\" {{\n    height 4\n    trigger \"file:{s}\"\n    interval \"never\"\n    trigger-debounce \"0ms\"\n    script \"#!/bin/sh\\n{cmd}\"\n}}\n",
+            s = sig.display(),
+            cmd = counter_cmd(&counter).replace('"', "\\\""),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"count-1", Duration::from_secs(5)),
+        "the first run never painted"
+    );
+    for round in 2..=3 {
+        std::fs::write(&sig, format!("{round}")).expect("touch");
+        wait_for_counter(&counter, round);
+    }
+    assert!(
+        wait_for(&session, &mut terminal, b"count-3", Duration::from_secs(5)),
+        "the third run never painted"
+    );
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// INV-4.3's motivating case end to end: the interrupted zero-length
+/// write fails THAT spawn loudly in the pane's box, and the next tick
+/// — the writer finished — recovers on its own.
+#[test]
+fn empty_output_under_defer_fails_that_spawn_and_the_next_tick_recovers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handoff = dir.path().join("handoff");
+    std::fs::write(&handoff, "rev-42").expect("seed");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "variables {{\n    rev \"cat {h}\" shell=#true defer=#true\n}}\n\npane \"p\" {{\n    height 5\n    trigger \"file:{h}\"\n    interval \"never\"\n    trigger-debounce \"0ms\"\n    command \"{bin}\" \"style\" \"rev={{{{rev}}}}\"\n}}\n",
+            h = handoff.display(),
+            bin = rat_bin(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"rev=rev-42",
+            Duration::from_secs(5)
+        ),
+        "the first value never painted"
+    );
+    // The writer truncated but has not written yet.
+    std::fs::write(&handoff, "").expect("truncate");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"printed nothing",
+            Duration::from_secs(5)
+        ),
+        "the zero-length read never failed loudly"
+    );
+    // The writer finishes; the next tick recovers on its own.
+    std::fs::write(&handoff, "rev-43").expect("finish");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"rev=rev-43",
+            Duration::from_secs(5)
+        ),
+        "the recovery never painted"
+    );
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// The deferred timing route, board level: N ticks are N derivations,
+/// and the FRESH value visibly reaches the frame each time — not
+/// merely the map.
+#[test]
+fn a_deferred_variable_runs_at_every_consuming_spawn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("count");
+    let sig = dir.path().join("sig");
+    std::fs::write(&sig, "0").expect("seed");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "variables {{\n    head \"{cmd}\" shell=#true defer=#true\n}}\n\npane \"p\" {{\n    height 4\n    trigger \"file:{s}\"\n    interval \"never\"\n    trigger-debounce \"0ms\"\n    command \"{bin}\" \"style\" \"{{{{head}}}}\"\n}}\n",
+            cmd = counter_cmd(&counter).replace('"', "\\\""),
+            s = sig.display(),
+            bin = rat_bin(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"count-1", Duration::from_secs(5)),
+        "the first derivation never painted"
+    );
+    for round in 2..=3 {
+        std::fs::write(&sig, format!("{round}")).expect("touch");
+        assert!(
+            wait_for(
+                &session,
+                &mut terminal,
+                format!("count-{round}").as_bytes(),
+                Duration::from_secs(5)
+            ),
+            "derivation {round} never reached the frame"
+        );
+    }
+    wait_for_counter(&counter, 3);
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// The memoization witness, board level (owned by the load-tier
+/// runner): a once-at-load variable expands to the SAME bytes on every
+/// spawn, and its command ran exactly once — proven child-side.
+#[test]
+fn a_once_at_load_variable_expands_to_the_same_bytes_on_every_spawn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("count");
+    let sig = dir.path().join("sig");
+    std::fs::write(&sig, "0").expect("seed");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "variables {{\n    store \"{cmd}\" shell=#true\n}}\n\npane \"p\" {{\n    height 4\n    trigger \"file:{s}\"\n    interval \"never\"\n    trigger-debounce \"0ms\"\n    command \"{bin}\" \"style\" \"{{{{store}}}}\"\n}}\n",
+            cmd = counter_cmd(&counter).replace('"', "\\\""),
+            s = sig.display(),
+            bin = rat_bin(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"count-1", Duration::from_secs(5)),
+        "the memoized value never painted"
+    );
+    // Several respawns; the value is the LOAD-time one every time.
+    for round in 2..=3 {
+        std::fs::write(&sig, format!("{round}")).expect("touch");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !contains(
+                &session.read_available(Duration::from_millis(200)),
+                b"count-2"
+            ),
+            "a respawn re-derived a once-at-load variable"
+        );
+    }
+    assert_counter_settled_at(&counter, 1);
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// The required non-regression: a deferred command that READS a watched
+/// path must not make its pane wear `· looping` — a read moves no
+/// mtime, so the derivation is credited with nothing. The trace file is
+/// the falsification arm: the detector must actually have evaluated
+/// (brackets existed), or a silent pass proves nothing.
+#[test]
+fn no_looping_badge_when_a_deferred_variable_reads_a_watched_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handoff = dir.path().join("handoff");
+    let trace = dir.path().join("trace");
+    std::fs::write(&handoff, "0").expect("seed");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "variables {{\n    rev \"cat {h}\" shell=#true defer=#true\n}}\n\npane \"p\" {{\n    height 4\n    trigger \"file:{h}\"\n    interval \"never\"\n    trigger-debounce \"0ms\"\n    command \"{bin}\" \"style\" \"r-{{{{rev}}}}\"\n}}\n",
+            h = handoff.display(),
+            bin = rat_bin(),
+        ),
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_TRIGGER_TRACE", &trace.display().to_string())],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"r-0", Duration::from_secs(5)),
+        "the first derivation never painted"
+    );
+    // An external writer drives respawns hard enough for the detector
+    // to have something to evaluate.
+    let mut seen = Vec::new();
+    for round in 1..=60 {
+        std::fs::write(&handoff, format!("{round}")).expect("touch");
+        std::thread::sleep(Duration::from_millis(40));
+        seen.extend_from_slice(&session.read_available(Duration::from_millis(10)));
+    }
+    seen.extend_from_slice(&session.read_available(Duration::from_millis(400)));
+    assert!(
+        !contains(&seen, b"looping"),
+        "a deferred READ was credited as a write"
+    );
+    // The falsification arm: the detector actually answered over real
+    // brackets — a run where it never evaluated proves nothing.
+    let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+    assert!(
+        !trace_text.is_empty(),
+        "the trace file is empty — the detector never ran"
+    );
+    assert!(
+        trace_text.lines().any(|line| {
+            line.split_whitespace().any(|word| {
+                word.strip_prefix("brk=")
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .is_some_and(|n| n > 0)
+            })
+        }),
+        "no evaluation saw a bracket: {trace_text}"
+    );
+    session.kill_if_alive(Duration::from_secs(2));
+}

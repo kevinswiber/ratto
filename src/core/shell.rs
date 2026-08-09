@@ -488,9 +488,6 @@ pub(crate) fn refusal(name: &str, command: &str, failure: &DerivationFailure) ->
 /// describe it differently. What changes is only where the text lands:
 /// there is no load left to refuse, so it fails that pane's spawn
 /// instead, through the existing spawn-error path.
-// The spawn-site wiring is this family's production caller; until it
-// lands only tests reach it. Remove these four allows with that caller.
-#[allow(dead_code)]
 pub(crate) fn spawn_refusal(
     name: &str,
     command: &str,
@@ -503,13 +500,11 @@ pub(crate) fn spawn_refusal(
 /// stay unit-testable; `command` is the EXPANDED command when
 /// expansion got that far, and the raw template when it did not — the
 /// message echoes whichever is the truer thing to show the author.
-#[allow(dead_code)]
 struct Failed {
     command: String,
     failure: DerivationFailure,
 }
 
-#[allow(dead_code)]
 fn derive_one(
     var: &crate::core::variables::Variable,
     so_far: &crate::core::template::Bindings,
@@ -574,7 +569,6 @@ fn derive_one(
 /// time a bare failure reached a caller, which variable failed would
 /// be gone, so the name is attached here, where it is in scope,
 /// exactly as the load tier attaches it inside its own callback.
-#[allow(dead_code)]
 pub(crate) fn resolve_for_spawn(
     block: &crate::core::variables::VariableBlock,
     load: &crate::core::template::Bindings,
@@ -623,6 +617,63 @@ pub(crate) fn resolve_for_spawn(
         }
     }
     Ok(out)
+}
+
+/// Everything a SPAWN needs to expand a template, carried from the
+/// load that produced it to the loop that spawns children.
+///
+/// `Default` is empty and empty is the whole of today's behavior:
+/// `rat watch` builds one and every board with no `variables` block
+/// builds one. The spawn site's fast-path gate is finer-grained than
+/// this value — a PROGRAM with no recorded references skips the
+/// variable machinery entirely, whichever board it sits on.
+///
+/// The fields are PRIVATE and the constructor is the only way in: a
+/// `pub` load field would invite a caller to expand against the load
+/// map directly, skipping the deferred tier entirely — silently
+/// correct on boards with no `defer`, and wrong on exactly the boards
+/// this exists for.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpawnVariables {
+    /// The parsed block — only it knows a name's tier.
+    block: crate::core::variables::VariableBlock,
+    /// The memoized load-tier values — the base of every spawn map,
+    /// copied through and NEVER re-derived.
+    load: crate::core::template::Bindings,
+    /// The `-v` values, carried rather than pre-merged into `load`:
+    /// merging would hide an override of a DEFERRED name from
+    /// `resolve_for_spawn`, the only place that suppression can happen
+    /// — a deferred name has no load-time value to overwrite.
+    overrides: crate::core::template::Bindings,
+}
+
+impl SpawnVariables {
+    /// The ONE constructor, taking all three parts at once so a
+    /// half-built context is unrepresentable: there is no setter, so
+    /// the load map can never be attached without the block that
+    /// classifies its names.
+    pub(crate) fn new(
+        block: crate::core::variables::VariableBlock,
+        load: crate::core::template::Bindings,
+        overrides: crate::core::template::Bindings,
+    ) -> SpawnVariables {
+        SpawnVariables {
+            block,
+            load,
+            overrides,
+        }
+    }
+
+    /// The map one spawn expands against. Already worded on failure:
+    /// the identity of a failed variable is attached inside the
+    /// resolver's own walk, so this hands back an error ready for the
+    /// spawn-error path.
+    pub(crate) fn for_spawn(
+        &self,
+        needed: &[&str],
+    ) -> Result<crate::core::template::Bindings, std::io::Error> {
+        resolve_for_spawn(&self.block, &self.load, &self.overrides, needed)
+    }
 }
 
 #[cfg(test)]

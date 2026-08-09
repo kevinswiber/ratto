@@ -484,15 +484,9 @@ fn resolve_source(
             .or_else(|| defaults.command.clone())
             .filter(|words| !words.is_empty())
             .ok_or_else(|| anyhow!("{}: needs a `command` or a `script`", at(id)))?;
-        (
-            SourceProgram::Argv(
-                command
-                    .iter()
-                    .map(|word| word.as_str().to_string())
-                    .collect(),
-            ),
-            shell,
-        )
+        // The templates ride to spawn per element, flavor and all —
+        // expansion happens there, against that spawn's map (INV-2).
+        (SourceProgram::Argv(command), shell)
     };
 
     let picked_triggers = inherit(decl.trigger.as_ref(), defaults.trigger.as_ref());
@@ -596,10 +590,7 @@ fn resolve_script(
                     shell_label(own),
                 );
             }
-            Ok((
-                SourceProgram::Script(body.as_str().to_string()),
-                shell.clone(),
-            ))
+            Ok((SourceProgram::Script(body.clone()), shell.clone()))
         }
         None => {
             let first = body.as_str().lines().next().unwrap_or("");
@@ -637,7 +628,7 @@ fn resolve_script(
                 ShellDecl::Direct => ShellDecl::Platform,
                 other => other.clone(),
             };
-            Ok((SourceProgram::Script(body.as_str().to_string()), shell))
+            Ok((SourceProgram::Script(body.clone()), shell))
         }
     }
 }
@@ -856,7 +847,7 @@ pub fn load(
     // `dashboard_file.rs` may not name `dashboard_kdl.rs`, which
     // imports it.
     overrides: &crate::core::template::Bindings,
-) -> anyhow::Result<Registry> {
+) -> anyhow::Result<(Registry, crate::core::shell::SpawnVariables)> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file = crate::core::dashboard_kdl::parse_styled(&text, colored)
@@ -897,8 +888,15 @@ pub fn load(
         }
     })
     .with_context(|| format!("in {}", path.display()))?;
-    file.into_registry(&bindings)
-        .with_context(|| format!("in {}", path.display()))
+    let variables = crate::core::shell::SpawnVariables::new(
+        file.variables.clone(),
+        bindings.clone(),
+        overrides.clone(),
+    );
+    let registry = file
+        .into_registry(&bindings)
+        .with_context(|| format!("in {}", path.display()))?;
+    Ok((registry, variables))
 }
 
 #[cfg(test)]
@@ -1357,7 +1355,7 @@ mod tests {
         let registry = decl.into_registry(&Bindings::new()).expect("registry");
         let spec = registry.spec(SourceId(0));
         assert_eq!(spec.shell, ShellMode::Platform);
-        assert_eq!(spec.program, SourceProgram::Argv(vec![script.to_string()]));
+        assert_eq!(spec.program, SourceProgram::Argv(vec![script.into()]));
     }
 
     /// The smallest legal script pane: a name, a body, a height.
@@ -1497,7 +1495,7 @@ mod tests {
             .expect("registry");
         assert_eq!(
             registry.spec(SourceId(0)).program,
-            SourceProgram::Script("#!/bin/sh\necho hi".to_string())
+            SourceProgram::Script("#!/bin/sh\necho hi".into())
         );
         // Inherited #false likewise.
         let decl = DashboardFile {
@@ -1538,7 +1536,7 @@ mod tests {
         for id in [SourceId(0), SourceId(1)] {
             assert_eq!(
                 registry.spec(id).program,
-                SourceProgram::Script("#!/bin/sh\necho $RAT_PANE".to_string())
+                SourceProgram::Script("#!/bin/sh\necho $RAT_PANE".into())
             );
         }
     }
@@ -1582,7 +1580,7 @@ mod tests {
         let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert_eq!(
             registry.spec(SourceId(0)).program,
-            SourceProgram::Script("#!/bin/sh\necho hi".to_string())
+            SourceProgram::Script("#!/bin/sh\necho hi".into())
         );
     }
 
@@ -1610,7 +1608,7 @@ mod tests {
         let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert_eq!(
             registry.spec(SourceId(0)).program,
-            SourceProgram::Argv(vec!["date".to_string()])
+            SourceProgram::Argv(vec!["date".into()])
         );
     }
 

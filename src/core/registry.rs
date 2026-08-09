@@ -203,12 +203,34 @@ pub enum SourceProgram {
     /// spaces, exactly as `rat watch --shell` does) under any shell
     /// mode — the shape every surface has always constructed. Never
     /// empty: every constructor validates before building one.
-    Argv(Vec<String>),
+    ///
+    /// PER-ELEMENT templates, not strings plus a name list: `Template`
+    /// carries each element's flavor beside its references, so a raw
+    /// argv element keeps its braces literally while a normal sibling
+    /// expands — a per-program union of names would consult the BYTES
+    /// of every element and silently interpolate the raw one (INV-1).
+    Argv(Vec<Template>),
     /// A `script` body. A leading `#!` names the body's own
     /// interpreter and the body is materialized as a file; without one
     /// the body runs through `shell` — which, for a shebang-less body,
     /// is never `Direct` (`resolve_source` promotes or refuses).
-    Script(String),
+    Script(Template),
+}
+
+impl SourceProgram {
+    /// Every variable name this program references, across all argv
+    /// elements or the whole body. EMPTY is the template-free case and
+    /// the gate the spawn site checks before doing anything at all.
+    pub fn refs(&self) -> impl Iterator<Item = &str> + '_ {
+        let (argv, body) = match self {
+            SourceProgram::Argv(argv) => (Some(argv.iter()), None),
+            SourceProgram::Script(body) => (None, Some(body)),
+        };
+        argv.into_iter()
+            .flatten()
+            .chain(body)
+            .flat_map(|template| template.refs().iter().map(String::as_str))
+    }
 }
 
 /// What one source runs and how often — what every surface constructs.
@@ -682,7 +704,7 @@ mod tests {
     fn spec(id: &str) -> SourceSpec {
         SourceSpec {
             id: id.to_string(),
-            program: SourceProgram::Argv(vec!["true".to_string()]),
+            program: SourceProgram::Argv(vec!["true".into()]),
             shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(2)),
             triggers: Vec::new(),

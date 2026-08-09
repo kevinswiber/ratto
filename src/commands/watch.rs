@@ -37,8 +37,9 @@ use crate::core::registry::{
 };
 use crate::core::retain::{Keep, Retention, compact_count};
 use crate::core::schedule::{Due, TickSchedule};
-use crate::core::shell::{interpreter_name, shell_command, shell_invocation};
+use crate::core::shell::{SpawnVariables, interpreter_name, shell_command, shell_invocation};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
+use crate::core::template::Template;
 use crate::core::trigger::{
     BracketId, DebounceGate, MtimeWatchSet, PathLedger, TriggerSpec, Verdict, WindowLog,
     parse_trigger, stamps,
@@ -156,6 +157,11 @@ pub(crate) struct SessionArgs {
     /// in place (watch-only; a TTY concern — piped output already
     /// appends, so the loop gates this on ttyness).
     pub append: bool,
+    /// The variable context every spawn expands against — the block,
+    /// the memoized load bindings, and the `-v` overrides. Empty for
+    /// `rat watch` and for every board with no `variables` block,
+    /// which is the spawn site's fast-path gate.
+    pub variables: SpawnVariables,
 }
 
 /// Parse the watch flags, build the one-source registry, run it. The
@@ -184,9 +190,17 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
             program: SourceProgram::Argv(if shell.runs_a_shell() {
                 // A shell source keeps the raw script as ONE element,
                 // or split-then-join would destroy its quoting.
-                vec![args.command.join(" ")]
+                //
+                // LITERAL, never extracted: the CLI is not a KDL board,
+                // so a `{{…}}` typed at a prompt is the child's own
+                // text — `rat watch` has no variables to expand it
+                // against and must never try.
+                vec![Template::literal(&args.command.join(" "))]
             } else {
-                args.command.clone()
+                args.command
+                    .iter()
+                    .map(|word| Template::literal(word))
+                    .collect()
             }),
             shell,
             interval,
@@ -222,6 +236,9 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         help_extra,
         resize_respawn: false,
         append: args.append,
+        // `rat watch` has no board and therefore no variables: the
+        // empty context is the whole of its behavior.
+        variables: SpawnVariables::default(),
     };
     run_registry(registry, session, profile, palette)
 }
@@ -289,7 +306,7 @@ pub(crate) fn run_registry(
     // remove the directory here and now — and it is declared BEFORE the
     // shutdown guards so it drops after them: children die first, then
     // the files they were running.
-    let scripts = ScriptFiles::materialize(&registry)?;
+    let mut scripts = ScriptFiles::materialize(&registry)?;
     let _raw_guard = if interactive {
         Some(RawModeGuard::enable().context("enabling raw mode")?)
     } else {
@@ -678,11 +695,33 @@ pub(crate) fn run_registry(
                 // how a test ends up proving something the binary does
                 // not do.
                 let retention = retention_for(&registry, id);
+                // The variable resolution rides the SAME rule, for the
+                // same reason — and with a sharper edge: with it inside
+                // the builder, a tick that fell back to the inline path
+                // would run every deferred command TWICE. It must also
+                // stay BELOW `open_bracket` above: a deferred command's
+                // writes must land inside this pane's own bracket so
+                // they are attributed to it rather than read as
+                // exogenous — "resolve as early as possible" is the
+                // obvious refactor and it is wrong.
+                let resolved = match resolve_spawn(&registry, &mut scripts, &session.variables, id)
+                {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        // Already worded, naming the variable: the
+                        // same in-box surface an unspawnable child
+                        // has always used.
+                        let _ = runtime[id.0]
+                            .tx
+                            .send(TickEvent::Completed(not_started(id, err)));
+                        continue;
+                    }
+                };
                 let mut inline = session.once && plain;
                 if !inline {
                     let command = source_command(
                         &registry,
-                        &scripts,
+                        &resolved,
                         id,
                         interactive,
                         palette.appearance,
@@ -722,9 +761,12 @@ pub(crate) fn run_registry(
                     };
                 }
                 if inline {
+                    // NO re-resolution: the fallback consumes the same
+                    // ResolvedSpawn, so re-derivation is
+                    // unrepresentable rather than merely avoided.
                     let command = source_command(
                         &registry,
-                        &scripts,
+                        &resolved,
                         id,
                         interactive,
                         palette.appearance,
@@ -3094,7 +3136,7 @@ fn focus_order_excludes_non_focusable_panes_from_every_navigation_target() {
 
     let spec = |id: &str| SourceSpec {
         id: id.to_string(),
-        program: SourceProgram::Argv(vec!["true".to_string()]),
+        program: SourceProgram::Argv(vec!["true".into()]),
         shell: ShellMode::Direct,
         interval: Some(Duration::from_secs(3600)),
         triggers: Vec::new(),
@@ -4295,17 +4337,110 @@ fn spawn_first(pagers: &[PagerCommand]) -> std::io::Result<(String, std::process
 /// command never reads the terminal and never sees the palette. This
 /// function is the seam a future non-process source would replace:
 /// everything upstream of it deals only in a spec and a geometry.
+/// What ONE spawn actually runs: the post-expansion product, string
+/// backed. `SourceProgram` holds the author's TEMPLATES; this holds
+/// the bytes for this spawn, and it is the only thing the builder ever
+/// sees — which is what lets every arm below keep its shipped body.
+#[derive(Debug)]
+enum ResolvedProgram {
+    Argv(Vec<String>),
+    Script(String),
+}
+
+/// Everything a tick's child needs that could fail: the deferred
+/// derivations, the expanded program, and the script file its bytes
+/// were written to. Produced ONCE per logical tick — the threaded
+/// attempt and the inline fallback both build their Command from THIS
+/// value, so a tick that falls back cannot re-derive.
+#[derive(Debug)]
+struct ResolvedSpawn<'a> {
+    program: ResolvedProgram,
+    script: Option<&'a std::path::Path>,
+}
+
+/// Resolve one tick's program: re-run the deferred variables this
+/// spawn actually references (at most once each — the bindings map is
+/// built ONCE here, so reference count cannot become subprocess
+/// count), expand every element against that map, and write a
+/// templated script body when its bytes changed.
+///
+/// A template-free program takes the arm that CANNOT fail: no map is
+/// built, no derivation runs, and the bytes are the author's. That is
+/// the governing property — a variable-free board carries zero new
+/// failure modes.
+///
+/// A `Template::expand` failure is unreachable from a pane's own
+/// program — every referenced name was validated at load — and is
+/// worded defensively anyway; the expansion arm exists for later
+/// consumers whose maps are built at the keypress.
+fn resolve_spawn<'a>(
+    registry: &Registry,
+    scripts: &'a mut ScriptFiles,
+    vars: &SpawnVariables,
+    id: SourceId,
+) -> Result<ResolvedSpawn<'a>, std::io::Error> {
+    let spec = registry.spec(id);
+    let needed: Vec<&str> = spec.program.refs().collect();
+    let program = if needed.is_empty() {
+        match &spec.program {
+            SourceProgram::Argv(argv) => {
+                ResolvedProgram::Argv(argv.iter().map(|word| word.as_str().to_string()).collect())
+            }
+            SourceProgram::Script(body) => ResolvedProgram::Script(body.as_str().to_string()),
+        }
+    } else {
+        let bindings = vars.for_spawn(&needed)?;
+        let expand = |template: &Template| {
+            template.expand(&bindings).map_err(|missing| {
+                std::io::Error::other(format!(
+                    "expanding this pane's program: {missing} — a load-validated \
+                     board cannot reach this, so load validation has regressed"
+                ))
+            })
+        };
+        match &spec.program {
+            SourceProgram::Argv(argv) => {
+                ResolvedProgram::Argv(argv.iter().map(expand).collect::<Result<_, _>>()?)
+            }
+            SourceProgram::Script(body) => ResolvedProgram::Script(expand(body)?),
+        }
+    };
+    let script = match (&spec.program, &program) {
+        (SourceProgram::Script(template), ResolvedProgram::Script(body)) => {
+            if template.refs().is_empty() {
+                // Written once at load; the shipped path, untouched.
+                scripts.path(id)
+            } else {
+                match shebang(body) {
+                    Some(line) => {
+                        // INV-7 keeps the `#!` line template-free, so
+                        // the stem — derived from the id and that line
+                        // — is stable across generations.
+                        let id_part: String = spec.id.chars().take(40).collect();
+                        let stem = format!("{}-{}", id.0, id_part);
+                        Some(scripts.ensure(id, &line, &stem, body)?)
+                    }
+                    None => None,
+                }
+            }
+        }
+        _ => None,
+    };
+    Ok(ResolvedSpawn { program, script })
+}
+
 fn build_source_command(
-    spec: &SourceSpec,
+    program: &ResolvedProgram,
+    shell: &ShellMode,
     script: Option<&std::path::Path>,
     interactive: bool,
     appearance: Appearance,
     geom: PaneGeometry,
 ) -> std::process::Command {
-    let mut command = match (&spec.program, script) {
+    let mut command = match (program, script) {
         // A shebang body, materialized. On unix the KERNEL parses the
         // `#!`; on Windows we did.
-        (SourceProgram::Script(body), Some(path)) => {
+        (ResolvedProgram::Script(body), Some(path)) => {
             let line = shebang(body).expect("a materialized script has a shebang");
             interpreter_command(SHEBANG_ARM, &line, path)
         }
@@ -4313,15 +4448,15 @@ fn build_source_command(
         // shell takes, which is what mirrors unix ENOEXEC. Only
         // no-shebang bodies reach here (materialization covers every
         // shebang body), and those are never Direct.
-        (SourceProgram::Script(body), None) => {
-            let (program, flags) = shell_invocation(&spec.shell)
+        (ResolvedProgram::Script(body), None) => {
+            let (program, flags) = shell_invocation(shell)
                 .expect("a shebang-less script body never resolves to Direct");
             shell_command(&program, flags, body)
         }
         // Shipped behavior, untouched bytes. A shell spec holds the
         // raw script as one element, so the join reproduces it byte
         // for byte.
-        (SourceProgram::Argv(argv), _) => match shell_invocation(&spec.shell) {
+        (ResolvedProgram::Argv(argv), _) => match shell_invocation(shell) {
             Some((program, flags)) => shell_command(&program, flags, &argv.join(" ")),
             None => {
                 let mut cmd = std::process::Command::new(&argv[0]);
@@ -4396,17 +4531,28 @@ fn retention_for(registry: &Registry, id: SourceId) -> Retention {
 /// `build_source_command` plus the pane identity, which only exists
 /// under a declared layout: `Registry::pane` answers `None` without
 /// one, so no RAT_PANE is ever exported to a plain watch child.
+/// Infallible by construction: everything that can fail happened in
+/// `resolve_spawn`, once, above the threaded/inline branch.
+///
+/// This function deliberately does NOT take `SpawnVariables` — with no
+/// variable context in scope it CANNOT re-derive, so moving resolution
+/// back inside it is a compile error rather than a silent regression.
+/// The per-spawn pin only ever exercises the threaded path; the inline
+/// fallback is reachable solely through thread exhaustion, and a
+/// missing parameter is the one guard that covers a path no test
+/// drives.
 fn source_command(
     registry: &Registry,
-    scripts: &ScriptFiles,
+    resolved: &ResolvedSpawn<'_>,
     id: SourceId,
     interactive: bool,
     appearance: Appearance,
     geom: PaneGeometry,
 ) -> std::process::Command {
     let mut command = build_source_command(
-        registry.spec(id),
-        scripts.path(id),
+        &resolved.program,
+        &registry.spec(id).shell,
+        resolved.script,
         interactive,
         appearance,
         geom,
@@ -5480,7 +5626,7 @@ fn shell_mode(flag: Option<&Option<String>>) -> anyhow::Result<ShellMode> {
 /// error must name what failed to start.
 fn spawn_program(spec: &SourceSpec) -> String {
     match &spec.program {
-        SourceProgram::Script(body) => match shebang(body) {
+        SourceProgram::Script(body) => match shebang(body.as_str()) {
             Some(line) => shebang_program(SHEBANG_ARM, &line),
             // Unreachable for a well-formed spec (a shebang-less body
             // is never Direct), but a diagnostic path must not panic.
@@ -5490,7 +5636,9 @@ fn spawn_program(spec: &SourceSpec) -> String {
         },
         SourceProgram::Argv(argv) => match shell_invocation(&spec.shell) {
             Some((program, _)) => program,
-            None => argv[0].clone(),
+            // The template's own bytes: an error names what the author
+            // wrote, holes and all.
+            None => argv[0].as_str().to_string(),
         },
     }
 }
@@ -5508,11 +5656,21 @@ fn spawn_program(spec: &SourceSpec) -> String {
 struct ScriptFiles {
     /// Held for Drop alone: OWNING the TempDir is what removes the
     /// directory when this drops. Nothing reads it — the paths below
-    /// are the lookups — so the field is dead to the reachability
-    /// analysis on purpose.
-    #[allow(dead_code)]
+    /// are the lookups — so the field is read only by the templated
+    /// re-materialization path.
     dir: Option<tempfile::TempDir>,
     paths: Vec<Option<std::path::PathBuf>>,
+    /// The hash of the bytes each id's file was last written with —
+    /// the bytes ACTUALLY written (post-wrapper), so a change in the
+    /// wrapper re-writes too. `None` until a templated body's first
+    /// spawn.
+    hashes: Vec<Option<u64>>,
+    /// Per-id generation counter: each rewrite lands under a NEW file
+    /// name, because a file a child may currently be executing is
+    /// never mutated — ETXTBSY on unix, a sharing violation on
+    /// Windows, both intermittent and only under `defer`, which is
+    /// exactly where no one would look.
+    generations: Vec<usize>,
 }
 
 impl ScriptFiles {
@@ -5520,10 +5678,17 @@ impl ScriptFiles {
     /// no file — it runs through the shell fallback route instead, so
     /// `path` answering `Some` is exactly "this body has a shebang".
     fn materialize(registry: &Registry) -> anyhow::Result<ScriptFiles> {
-        let bodies: Vec<(SourceId, Shebang, &str)> = registry
+        // A TEMPLATED shebang body gets a slot but no bytes at load —
+        // its bytes do not exist until a spawn's map does, so it is
+        // written on first use (`ensure`) and its write failure is
+        // that pane's box rather than a load error. Classification
+        // over template text is still correct: INV-7 keeps the `#!`
+        // line literal.
+        let bodies: Vec<(SourceId, Shebang, &str, bool)> = registry
             .ids()
             .filter_map(|id| match &registry.spec(id).program {
-                SourceProgram::Script(body) => shebang(body).map(|line| (id, line, body.as_str())),
+                SourceProgram::Script(body) => shebang(body.as_str())
+                    .map(|line| (id, line, body.as_str(), body.refs().is_empty())),
                 SourceProgram::Argv(_) => None,
             })
             .collect();
@@ -5538,8 +5703,13 @@ impl ScriptFiles {
             builder.permissions(std::fs::Permissions::from_mode(0o700));
         }
         let dir = builder.tempdir().context("creating the script directory")?;
-        let mut paths = vec![None; registry.ids().count()];
-        for (id, line, body) in bodies {
+        let count = registry.ids().count();
+        let mut paths = vec![None; count];
+        let mut hashes = vec![None; count];
+        for (id, line, body, template_free) in bodies {
+            if !template_free {
+                continue;
+            }
             // The INDEX is what makes the name unique (duplicate ids
             // are legal, first-win); the id part is a debugging
             // courtesy, BOUNDED so a legal but long id cannot push the
@@ -5564,16 +5734,67 @@ impl ScriptFiles {
                 .open(&path)
                 .and_then(|mut file| file.write_all(bytes.as_bytes()))
                 .with_context(|| format!("writing the script for {:?}", registry.spec(id).id))?;
+            hashes[id.0] = Some(signature(bytes.as_bytes()));
             paths[id.0] = Some(path);
         }
         Ok(ScriptFiles {
             dir: Some(dir),
             paths,
+            hashes,
+            generations: vec![0; count],
         })
     }
 
     fn path(&self, id: SourceId) -> Option<&std::path::Path> {
         self.paths.get(id.0)?.as_deref()
+    }
+
+    /// The path `id`'s child should execute, given the body this spawn
+    /// resolved to. Rewrites only when the BYTES ACTUALLY WRITTEN
+    /// changed (the post-wrapper bytes are what is hashed, so a
+    /// wrapper change re-writes too) — a template-free body never
+    /// reaches here at all, so the write-once load path is untouched.
+    ///
+    /// Each generation lands under a NEW unique name and the
+    /// superseded file is removed best-effort (failure is silent
+    /// litter inside this run's own TempDir, the same disposition the
+    /// directory itself has). Never mutate a file a child may be
+    /// executing.
+    fn ensure(
+        &mut self,
+        id: SourceId,
+        line: &Shebang,
+        stem: &str,
+        body: &str,
+    ) -> std::io::Result<&std::path::Path> {
+        let (name, bytes) = script_file(SHEBANG_ARM, line, stem, body);
+        let hash = signature(bytes.as_bytes());
+        if self.hashes.get(id.0).copied().flatten() != Some(hash) || self.paths[id.0].is_none() {
+            let dir = self
+                .dir
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("no script directory exists for this run"))?;
+            let generation = self.generations[id.0];
+            self.generations[id.0] += 1;
+            let path = dir.path().join(format!("g{generation}-{name}"));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o700);
+            }
+            use std::io::Write;
+            options
+                .open(&path)
+                .and_then(|mut file| file.write_all(bytes.as_bytes()))?;
+            if let Some(old) = self.paths[id.0].take() {
+                let _ = std::fs::remove_file(old);
+            }
+            self.paths[id.0] = Some(path);
+            self.hashes[id.0] = Some(hash);
+        }
+        Ok(self.paths[id.0].as_deref().expect("just written"))
     }
 }
 
@@ -6991,7 +7212,7 @@ mod tests {
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
         let spec = |id: &str| SourceSpec {
             id: id.to_string(),
-            program: SourceProgram::Argv(vec!["true".to_string()]),
+            program: SourceProgram::Argv(vec!["true".into()]),
             shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(3600)),
             triggers: Vec::new(),
@@ -7028,7 +7249,7 @@ mod tests {
             .iter()
             .map(|(id, live)| SourceSpec {
                 id: (*id).to_string(),
-                program: SourceProgram::Argv(vec!["true".to_string()]),
+                program: SourceProgram::Argv(vec!["true".into()]),
                 shell: ShellMode::Direct,
                 interval: Some(Duration::from_secs(3600)),
                 triggers: Vec::new(),
@@ -7213,7 +7434,7 @@ mod tests {
         let registry = Registry::single(
             SourceSpec {
                 id: "watch".to_string(),
-                program: SourceProgram::Argv(vec!["true".to_string()]),
+                program: SourceProgram::Argv(vec!["true".into()]),
                 shell: ShellMode::Direct,
                 interval: Some(Duration::from_secs(2)),
                 triggers: Vec::new(),
@@ -7234,7 +7455,7 @@ mod tests {
     fn cadence_spec(live: bool, interval: Option<Duration>, triggered: bool) -> SourceSpec {
         SourceSpec {
             id: "follower".to_string(),
-            program: SourceProgram::Argv(vec!["true".to_string()]),
+            program: SourceProgram::Argv(vec!["true".into()]),
             shell: ShellMode::Direct,
             interval,
             triggers: if triggered {
@@ -7975,7 +8196,7 @@ mod tests {
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
         let spec = |id: &str| SourceSpec {
             id: id.to_string(),
-            program: SourceProgram::Argv(vec!["true".to_string()]),
+            program: SourceProgram::Argv(vec!["true".into()]),
             shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(3600)),
             triggers: Vec::new(),
@@ -8059,7 +8280,7 @@ mod tests {
         // ruling; the help states which numbers the keys reach).
         let spec = |n: usize| SourceSpec {
             id: format!("p{n:02}"),
-            program: SourceProgram::Argv(vec!["true".to_string()]),
+            program: SourceProgram::Argv(vec!["true".into()]),
             shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(3600)),
             triggers: Vec::new(),
@@ -8603,7 +8824,7 @@ mod tests {
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
         let spec = |id: &str| SourceSpec {
             id: id.to_string(),
-            program: SourceProgram::Argv(vec!["true".to_string()]),
+            program: SourceProgram::Argv(vec!["true".into()]),
             shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(3600)),
             triggers: Vec::new(),
@@ -9262,7 +9483,7 @@ mod tests {
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
         let spec = |id: &str, path: &str| SourceSpec {
             id: id.to_string(),
-            program: SourceProgram::Argv(vec!["true".to_string()]),
+            program: SourceProgram::Argv(vec!["true".into()]),
             shell: ShellMode::Direct,
             interval: None,
             triggers: vec![TriggerSpec::File(std::path::PathBuf::from(path))],
@@ -9341,7 +9562,7 @@ mod tests {
         let registry = Registry::single(
             SourceSpec {
                 id: "watch".to_string(),
-                program: SourceProgram::Argv(vec!["true".to_string()]),
+                program: SourceProgram::Argv(vec!["true".into()]),
                 shell: ShellMode::Direct,
                 interval: None,
                 triggers: vec![TriggerSpec::File(std::path::PathBuf::from("./stamp"))],
@@ -9498,12 +9719,24 @@ mod tests {
     fn source_spec(command: &[&str], shell: ShellMode) -> SourceSpec {
         SourceSpec {
             id: String::new(),
-            program: SourceProgram::Argv(command.iter().map(|s| s.to_string()).collect()),
+            program: SourceProgram::Argv(command.iter().map(|&s| Template::from(s)).collect()),
             shell,
             interval: Some(Duration::from_secs(2)),
             triggers: Vec::new(),
             debounce: Duration::from_millis(250),
             live: false,
+        }
+    }
+
+    /// A template-free spec's program, resolved — the builder's input
+    /// since expansion moved to spawn. These fixtures never carry
+    /// references, so the identity mapping is the whole resolution.
+    fn resolved(spec: &SourceSpec) -> ResolvedProgram {
+        match &spec.program {
+            SourceProgram::Argv(argv) => {
+                ResolvedProgram::Argv(argv.iter().map(|word| word.as_str().to_string()).collect())
+            }
+            SourceProgram::Script(body) => ResolvedProgram::Script(body.as_str().to_string()),
         }
     }
 
@@ -9532,8 +9765,14 @@ mod tests {
     #[test]
     fn every_child_is_told_the_frame_size_and_appearance() {
         let spec = source_spec(&["some-tool", "--flag"], ShellMode::Direct);
-        let cmd =
-            build_source_command(&spec, None, true, Appearance::Light, terminal_geom(100, 40));
+        let cmd = build_source_command(
+            &resolved(&spec),
+            &spec.shell,
+            None,
+            true,
+            Appearance::Light,
+            terminal_geom(100, 40),
+        );
         let envs: std::collections::HashMap<String, String> = cmd
             .get_envs()
             .filter_map(|(k, v)| {
@@ -9554,7 +9793,14 @@ mod tests {
     #[test]
     fn direct_mode_runs_the_command_verbatim() {
         let spec = source_spec(&["some-tool", "--flag", "value"], ShellMode::Direct);
-        let cmd = build_source_command(&spec, None, false, Appearance::Dark, terminal_geom(80, 24));
+        let cmd = build_source_command(
+            &resolved(&spec),
+            &spec.shell,
+            None,
+            false,
+            Appearance::Dark,
+            terminal_geom(80, 24),
+        );
         assert_eq!(program_of(&cmd), "some-tool");
         assert_eq!(argv_of(&cmd), ["--flag", "value"]);
     }
@@ -9562,7 +9808,14 @@ mod tests {
     #[test]
     fn a_named_shell_runs_that_program() {
         let spec = source_spec(&["echo hi"], ShellMode::Named("fish".to_string()));
-        let cmd = build_source_command(&spec, None, false, Appearance::Dark, terminal_geom(80, 24));
+        let cmd = build_source_command(
+            &resolved(&spec),
+            &spec.shell,
+            None,
+            false,
+            Appearance::Dark,
+            terminal_geom(80, 24),
+        );
         assert_eq!(program_of(&cmd), "fish");
         assert_eq!(argv_of(&cmd), ["-c", "echo hi"]);
     }
@@ -9767,7 +10020,7 @@ mod tests {
     fn script_spec(body: &str, shell: ShellMode) -> SourceSpec {
         SourceSpec {
             id: String::new(),
-            program: SourceProgram::Script(body.to_string()),
+            program: SourceProgram::Script(body.into()),
             shell,
             interval: Some(Duration::from_secs(2)),
             triggers: Vec::new(),
@@ -9781,7 +10034,8 @@ mod tests {
         let spec = script_spec("#!/usr/bin/env fish\necho hi", ShellMode::Platform);
         let path = std::path::Path::new("/tmp/rat-script/0-a");
         let cmd = build_source_command(
-            &spec,
+            &resolved(&spec),
+            &spec.shell,
             Some(path),
             false,
             Appearance::Dark,
@@ -9798,7 +10052,14 @@ mod tests {
     #[test]
     fn a_body_without_a_shebang_runs_through_the_panes_shell() {
         let spec = script_spec("echo hi", ShellMode::Named("sh".to_string()));
-        let cmd = build_source_command(&spec, None, false, Appearance::Dark, terminal_geom(80, 24));
+        let cmd = build_source_command(
+            &resolved(&spec),
+            &spec.shell,
+            None,
+            false,
+            Appearance::Dark,
+            terminal_geom(80, 24),
+        );
         assert_eq!(cmd.get_program(), "sh");
         assert_eq!(argv_of(&cmd), ["-c", "echo hi"]);
     }
@@ -9925,7 +10186,14 @@ mod tests {
         // The table is platform-free: pinning cmd→/C on unix too stops
         // a future #[cfg] creeping in.
         let spec = source_spec(&["set /a 6*7"], ShellMode::Named("cmd".to_string()));
-        let cmd = build_source_command(&spec, None, false, Appearance::Dark, terminal_geom(80, 24));
+        let cmd = build_source_command(
+            &resolved(&spec),
+            &spec.shell,
+            None,
+            false,
+            Appearance::Dark,
+            terminal_geom(80, 24),
+        );
         assert_eq!(argv_of(&cmd), ["/C", "set /a 6*7"]);
     }
 
@@ -10005,7 +10273,14 @@ mod tests {
     #[test]
     fn shell_mode_goes_through_the_platform_shell() {
         let spec = source_spec(&["echo hi"], ShellMode::Platform);
-        let cmd = build_source_command(&spec, None, false, Appearance::Dark, terminal_geom(80, 24));
+        let cmd = build_source_command(
+            &resolved(&spec),
+            &spec.shell,
+            None,
+            false,
+            Appearance::Dark,
+            terminal_geom(80, 24),
+        );
         #[cfg(unix)]
         {
             assert_eq!(program_of(&cmd), "sh");
@@ -10316,6 +10591,291 @@ mod tests {
 
             assert_eq!(slots[0].reader.fences_for_test(), 1);
             assert_eq!(slots[1].reader.fences_for_test(), 1);
+        }
+    }
+
+    // ─── Spawn-time expansion ───────────────────────────────────────
+
+    mod spawn_expansion {
+        use super::*;
+        use crate::core::registry::ShellDecl;
+        use crate::core::shell::SpawnVariables;
+        use crate::core::template::{Bindings, Template};
+        use crate::core::variables::{Tier, VarSource, Variable, VariableBlock};
+
+        fn one_spec(program: SourceProgram, shell: ShellMode) -> Registry {
+            Registry::single(
+                SourceSpec {
+                    id: "p".to_string(),
+                    program,
+                    shell,
+                    interval: Some(Duration::from_secs(2)),
+                    triggers: Vec::new(),
+                    debounce: Duration::from_millis(250),
+                    live: false,
+                },
+                None,
+            )
+        }
+
+        fn deferred_counter(name: &str, counter: &std::path::Path) -> SpawnVariables {
+            #[cfg(unix)]
+            let command = format!("printf x >> {c}; cat {c}", c = counter.display());
+            #[cfg(windows)]
+            let command = format!("echo x>> \"{c}\" & type \"{c}\"", c = counter.display());
+            let block = VariableBlock::new(
+                vec![Variable {
+                    name: name.to_string(),
+                    source: VarSource::SpawnCommand(ShellDecl::Platform),
+                    text: Template::extract(&command),
+                    tier: Tier::Spawn,
+                    span: 0..0,
+                }],
+                vec![0],
+            );
+            SpawnVariables::new(block, Bindings::new(), Bindings::new())
+        }
+
+        fn runs(counter: &std::path::Path) -> usize {
+            std::fs::read_to_string(counter)
+                .map(|text| text.matches('x').count())
+                .unwrap_or(0)
+        }
+
+        #[test]
+        fn a_template_free_program_reaches_the_builder_untouched() {
+            // The governing property: a template-free program takes a
+            // path that CANNOT fail — pinned by resolving against an
+            // EMPTY SpawnVariables, which no derivation could service.
+            let registry = one_spec(
+                SourceProgram::Argv(vec!["echo".into(), "hi".into()]),
+                ShellMode::Direct,
+            );
+            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let vars = SpawnVariables::default();
+            let resolved = resolve_spawn(&registry, &mut scripts, &vars, SourceId(0))
+                .expect("a template-free program cannot fail to resolve");
+            let cmd = source_command(
+                &registry,
+                &resolved,
+                SourceId(0),
+                false,
+                Appearance::Dark,
+                terminal_geom(80, 24),
+            );
+            assert_eq!(program_of(&cmd), "echo");
+            assert_eq!(argv_of(&cmd), ["hi"]);
+        }
+
+        #[test]
+        fn an_argv_element_expands_in_place() {
+            let registry = one_spec(
+                SourceProgram::Argv(vec!["prog".into(), "style".into(), "{{msg}}".into()]),
+                ShellMode::Direct,
+            );
+            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let vars = SpawnVariables::new(
+                VariableBlock::default(),
+                Bindings::from([("msg".to_string(), "one two".to_string())]),
+                Bindings::new(),
+            );
+            let resolved =
+                resolve_spawn(&registry, &mut scripts, &vars, SourceId(0)).expect("resolves");
+            let cmd = source_command(
+                &registry,
+                &resolved,
+                SourceId(0),
+                false,
+                Appearance::Dark,
+                terminal_geom(80, 24),
+            );
+            assert_eq!(program_of(&cmd), "prog");
+            // THREE elements in, three out: the expansion landed inside
+            // the element that held it and never split.
+            assert_eq!(argv_of(&cmd), ["style", "one two"]);
+        }
+
+        #[test]
+        fn a_raw_argument_beside_a_normal_one_keeps_its_braces() {
+            // The per-element flavor pin: this is the test that fails
+            // first if someone reverts SourceProgram to Vec<String>
+            // plus a per-program name list — a union consults BYTES,
+            // and a raw element's bytes look exactly like a normal
+            // one's.
+            let registry = one_spec(
+                SourceProgram::Argv(vec![
+                    "prog".into(),
+                    "style".into(),
+                    Template::extract("{{msg}}"),
+                    Template::literal("{{msg}}"),
+                ]),
+                ShellMode::Direct,
+            );
+            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let vars = SpawnVariables::new(
+                VariableBlock::default(),
+                Bindings::from([("msg".to_string(), "expanded".to_string())]),
+                Bindings::new(),
+            );
+            let resolved =
+                resolve_spawn(&registry, &mut scripts, &vars, SourceId(0)).expect("resolves");
+            let cmd = source_command(
+                &registry,
+                &resolved,
+                SourceId(0),
+                false,
+                Appearance::Dark,
+                terminal_geom(80, 24),
+            );
+            assert_eq!(argv_of(&cmd), ["style", "expanded", "{{msg}}"]);
+        }
+
+        #[test]
+        fn each_deferred_name_is_evaluated_once_per_spawn() {
+            let dir = tempfile::tempdir().unwrap();
+            let counter = dir.path().join("runs");
+            let vars = deferred_counter("n", &counter);
+            let registry = one_spec(
+                SourceProgram::Argv(vec!["prog".into(), Template::extract("{{n}} {{n}}")]),
+                ShellMode::Direct,
+            );
+            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let resolved =
+                resolve_spawn(&registry, &mut scripts, &vars, SourceId(0)).expect("resolves");
+            assert_eq!(runs(&counter), 1, "one derivation for two references");
+            let cmd = source_command(
+                &registry,
+                &resolved,
+                SourceId(0),
+                false,
+                Appearance::Dark,
+                terminal_geom(80, 24),
+            );
+            let argv = argv_of(&cmd);
+            let both = argv.first().expect("one element");
+            let (left, right) = both.split_once(' ').expect("two halves");
+            assert_eq!(left, right, "both occurrences agree");
+        }
+
+        #[test]
+        fn the_inline_fallback_reuses_one_resolution() {
+            // The double-derivation pin: a tick calls source_command
+            // twice when worker-thread creation fails, and with
+            // resolution inside the builder every deferred command
+            // would run twice for one logical tick — on a path only
+            // thread exhaustion reaches. One ResolvedSpawn, consumed
+            // twice, is the structural fix.
+            let dir = tempfile::tempdir().unwrap();
+            let counter = dir.path().join("runs");
+            let vars = deferred_counter("n", &counter);
+            let registry = one_spec(
+                SourceProgram::Argv(vec!["prog".into(), Template::extract("{{n}}")]),
+                ShellMode::Direct,
+            );
+            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let resolved =
+                resolve_spawn(&registry, &mut scripts, &vars, SourceId(0)).expect("resolves");
+            let first = source_command(
+                &registry,
+                &resolved,
+                SourceId(0),
+                false,
+                Appearance::Dark,
+                terminal_geom(80, 24),
+            );
+            let second = source_command(
+                &registry,
+                &resolved,
+                SourceId(0),
+                false,
+                Appearance::Dark,
+                terminal_geom(80, 24),
+            );
+            assert_eq!(runs(&counter), 1, "the fallback re-derived");
+            assert_eq!(argv_of(&first), argv_of(&second));
+        }
+
+        #[test]
+        fn an_unchanged_script_body_is_not_rewritten() {
+            let registry = one_spec(
+                SourceProgram::Script("#!/bin/sh\necho hi".into()),
+                ShellMode::Platform,
+            );
+            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let line = shebang("#!/bin/sh\necho hi").expect("a shebang");
+            let before = scripts
+                .path(SourceId(0))
+                .expect("materialized")
+                .to_path_buf();
+            let mtime = std::fs::metadata(&before).unwrap().modified().unwrap();
+            for _ in 0..2 {
+                let path = scripts
+                    .ensure(SourceId(0), &line, "0-p", "#!/bin/sh\necho hi")
+                    .expect("ensure");
+                assert_eq!(path, before, "same bytes, same file");
+            }
+            assert_eq!(
+                std::fs::metadata(&before).unwrap().modified().unwrap(),
+                mtime,
+                "the file was not rewritten"
+            );
+            let entries = std::fs::read_dir(before.parent().unwrap()).unwrap().count();
+            assert_eq!(entries, 1, "no second file appeared");
+        }
+
+        #[test]
+        fn a_changed_script_body_is_rematerialized_under_a_new_name() {
+            let registry = one_spec(
+                SourceProgram::Script("#!/bin/sh\necho hi".into()),
+                ShellMode::Platform,
+            );
+            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let line = shebang("#!/bin/sh\necho hi").expect("a shebang");
+            let before = scripts
+                .path(SourceId(0))
+                .expect("materialized")
+                .to_path_buf();
+            let path = scripts
+                .ensure(SourceId(0), &line, "0-p", "#!/bin/sh\necho other")
+                .expect("ensure")
+                .to_path_buf();
+            assert_ne!(
+                path, before,
+                "changed bytes get a NEW file, never a rewrite"
+            );
+            let bytes = std::fs::read_to_string(&path).unwrap();
+            assert!(bytes.contains("echo other"), "{bytes}");
+            assert!(!before.exists(), "the superseded file is removed");
+            assert_eq!(scripts.path(SourceId(0)), Some(path.as_path()));
+        }
+
+        #[test]
+        fn a_derivation_failure_is_returned_not_panicked() {
+            #[cfg(unix)]
+            let failing = "exit 7";
+            #[cfg(windows)]
+            let failing = "exit 7";
+            let block = VariableBlock::new(
+                vec![Variable {
+                    name: "n".to_string(),
+                    source: VarSource::SpawnCommand(ShellDecl::Platform),
+                    text: Template::extract(failing),
+                    tier: Tier::Spawn,
+                    span: 0..0,
+                }],
+                vec![0],
+            );
+            let vars = SpawnVariables::new(block, Bindings::new(), Bindings::new());
+            let registry = one_spec(
+                SourceProgram::Argv(vec!["prog".into(), Template::extract("{{n}}")]),
+                ShellMode::Direct,
+            );
+            let mut scripts = ScriptFiles::materialize(&registry).unwrap();
+            let err = resolve_spawn(&registry, &mut scripts, &vars, SourceId(0))
+                .expect_err("the derivation fails");
+            // The identity was attached inside the resolver's own walk;
+            // if the name is missing the bug is there, not here.
+            assert!(err.to_string().contains(r#"variable "n""#), "{err}");
         }
     }
 }

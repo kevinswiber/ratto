@@ -1393,16 +1393,10 @@ fn an_override_suppresses_that_names_command_entirely() {
     assert_eq!(other.matches('y').count(), 1);
 }
 
-#[test]
-#[ignore = "spawn-time expansion is not wired yet; un-ignore when it lands"]
-fn a_once_at_load_variable_expands_to_the_same_bytes_on_every_spawn() {
-    // The integration-level statement of the memoization claim: a pane
-    // printing {{store}} across several spawns shows the same bytes on
-    // every frame while the counter file reads exactly 1. Owned by the
-    // load-time runner even though the expansion it observes arrives
-    // with the spawn-time phase.
-    todo!("drive a live board through several spawns once expansion lands");
-}
+// The memoization witness lives in tests/pty_dashboard.rs
+// (`a_once_at_load_variable_expands_to_the_same_bytes_on_every_spawn`):
+// several spawns are a frame-loop affair, and the pty suite is where
+// respawns are drivable.
 
 #[test]
 fn each_failure_refuses_the_board_and_writes_no_frame() {
@@ -1478,4 +1472,259 @@ fn the_load_pass_still_refuses_a_failing_once_at_load_variable() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("variable \"bad\""));
+}
+
+#[test]
+fn a_command_argv_expands_at_spawn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    msg \"one two\"\n}}\n\npane \"p\" {{\n    height 2\n    chrome #false\n    border \"none\"\n    command \"{bin}\" \"style\" \"{{{{msg}}}}\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    // `rat style` joins multiple arguments with NEWLINES, so a re-split
+    // would show up as two rows — the decisive argv-boundary assertion.
+    assert!(
+        stdout.lines().any(|line| line.contains("one two")),
+        "the expansion reached the child on one row: {stdout}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line.trim() == "one"),
+        "a re-split would put `one` on its own row: {stdout}"
+    );
+    assert!(!stdout.contains("{{msg}}"), "{stdout}");
+}
+
+#[test]
+fn a_whole_command_line_in_one_element_names_one_program() {
+    // The expansion lands INSIDE argv[0] and is never re-split: a split
+    // would make argv[0] the path's first half and the spawn would
+    // fail.
+    let dir = tempfile::tempdir().expect("tempdir");
+    #[cfg(windows)]
+    let spaced = dir.path().join("two words.exe");
+    #[cfg(not(windows))]
+    let spaced = dir.path().join("two words");
+    std::fs::copy(rat_bin(), &spaced).expect("copy the binary");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    prog \"{prog}\"\n}}\n\npane \"p\" {{\n    height 2\n    chrome #false\n    border \"none\"\n    command \"{{{{prog}}}}\" \"style\" \"hi\"\n}}\n",
+            prog = spaced.display().to_string().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("hi"), "{stdout}");
+    assert!(!stdout.contains("os error"), "{stdout}");
+}
+
+#[test]
+fn the_same_content_under_shell_runs_as_a_command_line() {
+    // The other half of the argv-boundary rule: a board that wants a
+    // whole command line uses `shell`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    cmd \"{bin} style hi\"\n}}\n\npane \"p\" {{\n    height 2\n    chrome #false\n    border \"none\"\n    shell #true\n    command \"{{{{cmd}}}}\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("hi"), "{stdout}");
+}
+
+#[test]
+fn a_script_body_expands_at_spawn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "variables {\n    msg \"expanded-at-spawn\"\n}\n\npane \"p\" {\n    height 2\n    chrome #false\n    border \"none\"\n    shell #true\n    script \"echo start\\necho {{msg}}\"\n}\n",
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("expanded-at-spawn"), "{stdout}");
+    assert!(!stdout.contains("{{msg}}"), "{stdout}");
+}
+
+/// The byte-identity witness: green BEFORE the spawn-expansion change
+/// and green after — a witness that has never been green proves
+/// nothing. A variable-free board must take literally the same path it
+/// always took.
+#[test]
+fn a_board_with_no_variables_renders_byte_identically() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "pane \"w\" {{\n    command \"{bin}\" \"style\" \"witness\"\n    height 3\n    chrome #false\n    border \"none\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let expected = format!("{:<80}\n{:<80}\n{:<80}\n", "witness", "", "");
+    assert_eq!(stdout, expected, "the frame's exact bytes moved");
+}
+
+#[test]
+fn a_deferred_failure_renders_in_that_panes_box_and_leaves_the_board_alone() {
+    // A spawn failure is FRAME CONTENT, not an exit code: the failing
+    // pane's box carries the teaching text naming the variable, no
+    // exit badge appears (asserted via the badge's own `· exit `
+    // spelling, which the quoted command cannot produce), and the
+    // healthy pane is untouched.
+    let dir = tempfile::tempdir().expect("tempdir");
+    #[cfg(unix)]
+    let failing = "false";
+    #[cfg(windows)]
+    let failing = "exit 1";
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    head \"{failing}\" shell=#true defer=#true\n}}\n\npane \"left\" {{\n    height 4\n    command \"{bin}\" \"style\" \"{{{{head}}}}\"\n}}\n\npane \"right\" {{\n    height 4\n    command \"{bin}\" \"style\" \"right-ok\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains(r#"variable "head""#), "{stdout}");
+    assert!(
+        stdout.contains("right-ok"),
+        "the rest of the board is untouched: {stdout}"
+    );
+    assert!(
+        !stdout.contains("· exit "),
+        "a spawn error carries no badge: {stdout}"
+    );
+    // The composed line's FRAME (watch's own format), not the sentence
+    // (2.2's, improvable): the pane label leads the body. The trailing
+    // `: {program:?}` half of the frame is NOT assertable here — the
+    // teaching text is longer than the pane and the box clips it — and
+    // it stays pinned by the existing spawn-error tests over
+    // `pane_spawn_error_text` itself.
+    assert!(
+        stdout.contains(r#"left: variable "head""#),
+        "the frame leads with the pane label: {stdout}"
+    );
+}
+
+#[test]
+fn a_raw_string_holding_a_deferred_reference_runs_nothing_at_spawn() {
+    // The refs-not-text rule end to end: a raw argument's record says
+    // it references nothing, so no subprocess is spawned for it and
+    // the literal braces reach the child.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("runs");
+    #[cfg(unix)]
+    let counting = format!("printf x >> {}", counter.display());
+    #[cfg(windows)]
+    let counting = format!("echo x>> \"{}\"", counter.display());
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "variables {{\n    head \"{counting}\" shell=#true defer=#true\n}}\n\npane \"p\" {{\n    height 2\n    chrome #false\n    border \"none\"\n    command \"{bin}\" \"style\" #\"{{{{head}}}}\"#\n}}\n",
+            counting = counting.replace('\\', "\\\\").replace('"', "\\\""),
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("{{head}}"),
+        "the braces reach the child: {stdout}"
+    );
+    assert!(!counter.exists(), "no derivation ran for a raw string");
+}
+
+#[test]
+fn an_override_supplies_a_deferred_value_without_changing_its_tier() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("runs");
+    #[cfg(unix)]
+    let counting = format!("printf x >> {}", counter.display());
+    #[cfg(windows)]
+    let counting = format!("echo x>> \"{}\"", counter.display());
+    let board = format!(
+        "variables {{\n    head \"{counting}\" shell=#true defer=#true\n}}\n\n",
+        counting = counting.replace('\\', "\\\\").replace('"', "\\\""),
+    );
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "{board}pane \"p\" {{\n    height 2\n    chrome #false\n    border \"none\"\n    command \"{bin}\" \"style\" \"{{{{head}}}}\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once", "-v", "head=abc"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("abc"),
+        "the override reached the frame: {stdout}"
+    );
+    assert!(!counter.exists(), "the overridden command never ran");
+
+    // The tier half: an override supplies a VALUE, never a tier, so
+    // the same variable at a load-time site still refuses.
+    let sited = fixture(
+        dir.path(),
+        "sited.kdl",
+        &format!(
+            "{board}pane \"p\" {{\n    height 2\n    command \"true\"\n    interval \"{{{{head}}}}\"\n}}\n"
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &sited, "--once", "-v", "head=5s"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "is read when the dashboard loads",
+        ));
 }

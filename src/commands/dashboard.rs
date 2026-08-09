@@ -18,7 +18,7 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
     // one color authority it gets: anything above Ascii earns the
     // colored snippet theme.
     let overrides = parse_overrides(&args.variable)?;
-    let registry = load(&args.file, profile != ColorProfile::Ascii, &overrides)?;
+    let (registry, variables) = load(&args.file, profile != ColorProfile::Ascii, &overrides)?;
     let once_timeout = args
         .once_timeout
         .as_deref()
@@ -58,6 +58,7 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
         // don't linearize, and this arm's resize/reflow machinery would
         // need its own treatment first.
         append: false,
+        variables,
     };
     run_registry(registry, session, profile, palette)
 }
@@ -275,7 +276,7 @@ mod tests {
     fn registry(triggers: bool) -> Registry {
         let spec = |id: &str, path: &str| SourceSpec {
             id: id.to_string(),
-            program: SourceProgram::Argv(vec!["true".to_string()]),
+            program: SourceProgram::Argv(vec!["true".into()]),
             shell: ShellMode::Direct,
             interval: (!triggers).then(|| Duration::from_secs(5)),
             triggers: if triggers {
@@ -315,7 +316,7 @@ mod tests {
     fn live_registry() -> Registry {
         let batch = SourceSpec {
             id: "a".to_string(),
-            program: SourceProgram::Argv(vec!["true".to_string()]),
+            program: SourceProgram::Argv(vec!["true".into()]),
             shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(5)),
             triggers: Vec::new(),
@@ -324,7 +325,7 @@ mod tests {
         };
         let follow = SourceSpec {
             id: "follow".to_string(),
-            program: SourceProgram::Argv(vec!["true".to_string()]),
+            program: SourceProgram::Argv(vec!["true".into()]),
             shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(2)),
             triggers: Vec::new(),
