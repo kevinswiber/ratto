@@ -13006,9 +13006,10 @@ mod tests {
 
     #[test]
     fn an_empty_binding_list_is_the_identity() {
-        // The structural half of INV-3, total: a board that declares no
-        // bindings takes exactly the dispatch it took before this plan
-        // existed, for every key it is possible to press.
+        // The structural half of inertness, total: a board that
+        // declares no bindings takes exactly the dispatch it took
+        // before boards could bind keys, for every key it is possible
+        // to press.
         for key in crate::core::key_spelling::ascii_spellable() {
             for mode in FRAME_MODES {
                 assert_eq!(
@@ -13022,7 +13023,8 @@ mod tests {
 
     #[test]
     fn the_call_site_chain_answers_the_same_thing() {
-        // 0026's fixture blind spot, discharged where it is cheap and
+        // A recorded fixture blind spot — every fixture once pressed
+        // its key at live rest — discharged where it is cheap and
         // total: the composed chain is driven over a PaneView matrix
         // that is NOT only rest, so neither resolver upstream can eat
         // or alter a binding answer in any pane state.
@@ -13053,7 +13055,7 @@ mod tests {
 
     #[test]
     fn a_scrolled_live_frame_still_runs_its_bindings() {
-        // The sibling trap as its own named test: 0026's live pass
+        // The sibling trap as its own named test: a live pass once
         // caught `mode == Live` gating in the field — every fixture had
         // pressed its key at live rest. `LiveScrolled` is on the firing
         // side; `Paused` is not.

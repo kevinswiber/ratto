@@ -4663,7 +4663,7 @@ fn the_live_route_expands_like_the_piped_ones() {
     session.kill_if_alive(Duration::from_secs(2));
 }
 
-/// INV-3's falsification arm, and the only test in the phase that
+/// Inertness's falsification arm, and the only test of it that
 /// presses a key: nothing sends a keystroke down a pipe, so the piped
 /// byte-identity witnesses would pass just as happily against a build
 /// that dispatched bindings on piped boards. A `--once` run on a real
@@ -4781,7 +4781,7 @@ fn a_binding_spawns_its_command() {
     );
 }
 
-/// THE INV-5 test — the one that catches a regression to loop-blocking.
+/// THE async test — the one that catches a regression to loop-blocking.
 /// The pane counter is MONOTONIC so "it kept painting" is provable: the
 /// differ writes nothing for an identical frame, so a constant pane
 /// would make a stalled board and a healthy one look the same.
@@ -4826,7 +4826,7 @@ fn the_board_keeps_repainting_while_a_slow_action_runs() {
     );
 }
 
-/// The sibling that anchors the INV-5 test from the other side: the
+/// The sibling that anchors the async test from the other side: the
 /// action really ran, exactly once, WHILE the panes advanced — without
 /// this, a board whose binding did nothing at all would pass above.
 #[test]
@@ -4914,9 +4914,9 @@ fn a_second_binding_key_runs_beside_a_slow_one() {
     );
 }
 
-/// Phase 2's forwarded pty obligation, first arm: the binding fires
-/// from a FOCUSED pane — and from a zoomed one, since zoom stays on
-/// the firing side of the mode rule.
+/// The dispatch table's forwarded pty obligation, first arm: the
+/// binding fires from a FOCUSED pane — and from a zoomed one, since
+/// zoom stays on the firing side of the mode rule.
 #[test]
 fn a_binding_runs_from_a_focused_pane() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -4971,10 +4971,10 @@ fn a_binding_runs_from_a_focused_pane() {
     );
 }
 
-/// Phase 2's forwarded pty obligation, second arm — 0026's fixture
-/// blind spot: a binding fires from a FRAME-SCROLLED board, waiting on
-/// the scrolled needle first so this cannot silently press at live
-/// rest.
+/// The dispatch table's forwarded pty obligation, second arm — the
+/// recorded fixture blind spot: a binding fires from a FRAME-SCROLLED
+/// board, waiting on the scrolled needle first so this cannot
+/// silently press at live rest.
 #[test]
 fn a_binding_runs_from_a_frame_scrolled_board() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -5785,7 +5785,7 @@ fn a_when_that_cannot_start_declines() {
     );
 }
 
-/// INV-5 for the guard: the board keeps repainting while a `when`
+/// The async rule for the guard: the board keeps repainting while a `when`
 /// evaluates — a loop-blocking guard is as much a regression as a
 /// loop-blocking command.
 #[test]

@@ -2907,7 +2907,7 @@ fn piped_live_capture(decl: &str) -> (String, String) {
     (seen_out, seen_err)
 }
 
-/// INV-3's byte-level half, piped live route. A witness rather than a
+/// Inertness's byte-level half, piped live route. A witness rather than a
 /// regression test: it was green the first time it ran, and its value
 /// is that the binding transport can never move a piped board's bytes.
 /// stderr matters as much as stdout — a binding diagnostic would land
@@ -2922,8 +2922,8 @@ fn a_piped_live_board_is_byte_identical_with_and_without_bindings() {
     assert_eq!(err_plain, err_bound, "stderr moved");
 }
 
-/// INV-3's byte-level half, piped `--once` route — the cheapest
-/// witness in the plan: two complete runs, compared byte for byte.
+/// Inertness's byte-level half, piped `--once` route — the cheapest
+/// witness there is: two complete runs, compared byte for byte.
 #[test]
 fn a_piped_once_board_is_byte_identical_with_and_without_bindings() {
     let dir = tempfile::tempdir().expect("tempdir");
