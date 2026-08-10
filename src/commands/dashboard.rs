@@ -814,6 +814,7 @@ mod tests {
             title: None,
             chrome: true,
             focusable: true,
+            selectable: true,
         };
         Registry::panes(
             vec![spec("a", "./sa"), spec("b", "./sb")],
@@ -859,6 +860,7 @@ mod tests {
             title: None,
             chrome: true,
             focusable: true,
+            selectable: true,
         };
         Registry::panes(
             vec![batch, follow],

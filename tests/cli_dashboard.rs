@@ -2999,6 +2999,68 @@ fn a_panes_board_renders_byte_identically_with_the_view_state_in_place() {
     assert_eq!(stdout, expected, "the frame's exact bytes moved");
 }
 
+/// The same board twice, differing only in one pane declaration: the
+/// one that says the pane's body is a picture rather than a list. The
+/// helper asserts that the pair differs in nothing else, so the
+/// comparison below is about the declaration and not about a fixture.
+fn selectability_pair(dir: &std::path::Path) -> (String, String) {
+    let seeded = dir.join("seed.txt");
+    std::fs::write(&seeded, "inert-needle\n").expect("seed");
+    // `chrome #false` for the reason the bindings pair records: the
+    // footer row carries a wall-clock stamp, and two runs a second
+    // apart would differ in the clock rather than in anything the
+    // declaration could touch.
+    let body = |declared: &str| {
+        format!(
+            "pane \"a\" {{\n    interval \"never\"\n    command \"{bin}\" \"__cat\" \"{seed}\"\n    height 3\n    chrome #false\n    border \"none\"\n{declared}}}\n",
+            bin = rat_bin().escape_default(),
+            seed = seeded.display().to_string().escape_default(),
+        )
+    };
+    const DECLARED: &str = "    selectable #false\n";
+    let (plain, declaring) = (body(""), body(DECLARED));
+    assert_eq!(
+        declaring.replace(DECLARED, ""),
+        plain,
+        "the pair differs only in the declaration"
+    );
+    (
+        fixture(dir, "plain.kdl", &plain),
+        fixture(dir, "declaring.kdl", &declaring),
+    )
+}
+
+/// A load-time declaration that changes rendered bytes is a bug, and
+/// this is the cheapest place to catch one: two complete runs, compared
+/// byte for byte. Opting a pane out of the cursor is a statement about
+/// a gesture nothing on this route can make, so the frame it composes
+/// must be the frame it composed before the property existed.
+#[test]
+fn declining_the_cursor_changes_none_of_a_boards_rendered_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (plain, declaring) = selectability_pair(dir.path());
+    let run = |decl: &str| {
+        rat()
+            .env("NO_COLOR", "1")
+            .env("RAT_WIDTH", "60")
+            .env("RAT_HEIGHT", "12")
+            .args(["dashboard", decl, "--once"])
+            .output()
+            .expect("run rat dashboard --once")
+    };
+    let (a, b) = (run(&plain), run(&declaring));
+    assert!(a.status.success(), "plain board failed: {a:?}");
+    assert!(b.status.success(), "declaring board failed: {b:?}");
+    // The anti-vacuity anchor: two boards that both refused to load
+    // would compare equal and empty.
+    assert!(
+        String::from_utf8_lossy(&b.stdout).contains("inert-needle"),
+        "the declaring board never rendered: {b:?}"
+    );
+    assert_eq!(a.stdout, b.stdout, "stdout moved");
+    assert_eq!(a.stderr, b.stderr, "stderr moved");
+}
+
 /// The repaint gate on the route with no terminal. Both panes complete
 /// on every tick and compose an identical frame, so the silence here is
 /// two frame keys comparing equal — not the absence of work. A digest

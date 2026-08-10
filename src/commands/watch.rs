@@ -2765,18 +2765,25 @@ pub(crate) fn run_registry(
                                 continue;
                             };
                             let total = runtime[id.0].output.as_ref().map_or(0, Vec::len);
-                            let next = pane_cursor_toggle(&panes, id, total);
+                            // The board's own answer about this pane's
+                            // body, read where the gesture is dispatched
+                            // rather than carried in the view state: it
+                            // is fixed at load, so nothing repaints when
+                            // it is consulted.
+                            let selectable = registry.pane(id).is_some_and(|pane| pane.selectable);
+                            let next = pane_cursor_toggle(&panes, id, selectable, total);
                             if next == panes.cursor[id.0] {
                                 // Nothing to raise and nothing to drop —
-                                // an empty pane, or one whose body is
-                                // off screen. The gesture changes a
-                                // cursor or it changes nothing, and that
-                                // includes the focus it would otherwise
-                                // have implied: pressing the select key
-                                // on a pane with no line in it must not
-                                // quietly move the focus instead. No
-                                // repaint either, so the gate is
-                                // undisturbed.
+                                // an empty pane, one whose body is off
+                                // screen, or one the board declared is
+                                // not a list of lines at all. The
+                                // gesture changes a cursor or it changes
+                                // nothing, and that includes the focus
+                                // it would otherwise have implied:
+                                // pressing the select key on a pane with
+                                // no line in it must not quietly move
+                                // the focus instead. No repaint either,
+                                // so the gate is undisturbed.
                                 continue;
                             }
                             let moved_focus = panes.focus != Some(id);
@@ -4257,6 +4264,7 @@ fn focus_order_excludes_non_focusable_panes_from_every_navigation_target() {
         title: None,
         chrome: false,
         focusable,
+        selectable: true,
     };
     let registry = Registry::panes(
         vec![spec("header"), spec("log"), spec("clock")],
@@ -5082,7 +5090,31 @@ fn toggled_cursor(current: Option<usize>, scroll: LiveScroll, total: usize) -> O
 /// pane's whole body back on screen without clearing the bit, so a
 /// gesture gated on the bit alone would refuse a pane the reader is
 /// looking straight at.
-fn pane_cursor_toggle(panes: &PaneView, id: SourceId, total: usize) -> Option<usize> {
+///
+/// `selectable` is the board's own declaration that this pane's body is
+/// made of lines at all, and it is asked FIRST: it cannot change while
+/// the board runs, which makes it the stronger fact, and the three
+/// questions then read in the order a reader asks them — may this pane
+/// ever hold a mark, is its body on screen, is there a line to sit on.
+/// It arrives as an argument rather than being read from the registry
+/// here, so this stays a function of what it is handed.
+///
+/// A pane that declares itself unmarkable therefore holds no cursor for
+/// the whole run, which is what keeps the answer this cheap: nothing
+/// downstream needs a new condition, because the state those conditions
+/// test for never comes into existence. The `Some(_)` case under a
+/// `false` declaration is unreachable rather than handled — this arm is
+/// the reason it cannot happen — and answering "unchanged" keeps the
+/// function total without pretending to serve a live case.
+fn pane_cursor_toggle(
+    panes: &PaneView,
+    id: SourceId,
+    selectable: bool,
+    total: usize,
+) -> Option<usize> {
+    if !selectable {
+        return panes.cursor[id.0];
+    }
     if panes.body_hidden(id) {
         return panes.cursor[id.0];
     }
@@ -8903,12 +8935,12 @@ mod tests {
             WatchAction::ClearCursor
         );
         // The toggle, by contrast, returns before it reads the cursor.
-        assert_eq!(pane_cursor_toggle(&panes, SourceId(1), 20), Some(4));
+        assert_eq!(pane_cursor_toggle(&panes, SourceId(1), true, 20), Some(4));
 
         // Zoom the collapsed pane: the body is on screen, so the cursor
         // is awake again — the toggle drops it and movement moves it.
         panes.zoomed = Some(SourceId(1));
-        assert_eq!(pane_cursor_toggle(&panes, SourceId(1), 20), None);
+        assert_eq!(pane_cursor_toggle(&panes, SourceId(1), true, 20), None);
         assert!(!panes.body_hidden(SourceId(1)));
         assert_eq!(
             resolve_cursor(
@@ -10037,6 +10069,7 @@ mod tests {
             title: None,
             chrome: true,
             focusable: true,
+            selectable: true,
         };
         Registry::panes(
             vec![spec("tail"), spec("head")],
@@ -10077,6 +10110,7 @@ mod tests {
                 title: None,
                 chrome: true,
                 focusable: true,
+                selectable: true,
             })
             .collect::<Vec<_>>();
         let cells = (0..panes.len())
@@ -10339,6 +10373,7 @@ mod tests {
             title: None,
             chrome: false,
             focusable: true,
+            selectable: true,
         };
         use crate::core::registry::TitleSource;
         let build = |title: Option<&str>| {
@@ -10491,6 +10526,7 @@ mod tests {
                 title: None,
                 chrome: false,
                 focusable: true,
+                selectable: true,
             }],
             LayoutNode::Pane(SourceId(0)),
             0,
@@ -10549,6 +10585,7 @@ mod tests {
                 title: None,
                 chrome: true,
                 focusable: true,
+                selectable: true,
             }],
             LayoutNode::Pane(SourceId(0)),
             0,
@@ -11021,6 +11058,7 @@ mod tests {
             title: None,
             chrome: true,
             focusable: true,
+            selectable: true,
         };
         Registry::panes(
             vec![spec("left"), spec("right")],
@@ -11105,6 +11143,7 @@ mod tests {
             title: None,
             chrome: false,
             focusable: true,
+            selectable: true,
         };
         let n = 11;
         let registry = Registry::panes(
@@ -11793,6 +11832,7 @@ mod tests {
             title: None,
             chrome: true,
             focusable: true,
+            selectable: true,
         };
         Registry::panes(
             vec![spec("left"), spec("right")],
@@ -12258,14 +12298,14 @@ mod tests {
 
         panes.zoomed = Some(SourceId(0));
         assert_eq!(
-            pane_cursor_toggle(&panes, SourceId(0), 20),
+            pane_cursor_toggle(&panes, SourceId(0), true, 20),
             Some(0),
             "the zoom put the body on screen, so the gesture raises"
         );
 
         panes.zoomed = None;
         assert_eq!(
-            pane_cursor_toggle(&panes, SourceId(0), 20),
+            pane_cursor_toggle(&panes, SourceId(0), true, 20),
             None,
             "a hidden body has no line to mark"
         );
@@ -12274,12 +12314,55 @@ mod tests {
         // the frame, so this is exactly backwards from "is anything
         // zoomed".
         panes.zoomed = Some(SourceId(1));
-        assert_eq!(pane_cursor_toggle(&panes, SourceId(0), 20), None);
+        assert_eq!(pane_cursor_toggle(&panes, SourceId(0), true, 20), None);
 
         // And the decline is "unchanged", not "cleared": a pane that
         // already holds a cursor keeps it when its body goes off screen.
         panes.cursor[0] = Some(4);
-        assert_eq!(pane_cursor_toggle(&panes, SourceId(0), 20), Some(4));
+        assert_eq!(pane_cursor_toggle(&panes, SourceId(0), true, 20), Some(4));
+    }
+
+    #[test]
+    fn a_pane_that_declared_no_lines_answers_unchanged_whatever_state_it_is_in() {
+        // A board may say a pane's body is a picture — a nested board, a
+        // table, a chart — and the gesture then has nothing to point at.
+        //
+        // The declining rows are the point, but the raising rows are
+        // what makes them mean anything: they are the answers the
+        // toggle's own table already gives for these inputs, COPIED
+        // rather than re-derived, so a mistake in the new argument's
+        // plumbing shows up here as a changed old row.
+        let mut panes = PaneView::new(1);
+        panes.scroll[0] = LiveScroll::at(6, 20, 14);
+
+        let table: &[(bool, Option<usize>, Option<usize>)] = &[
+            // A pane whose body is a list: raise at the pane's own top,
+            // and drop wherever the mark had got to.
+            (true, None, Some(6)),
+            (true, Some(11), None),
+            // A pane whose body is not: unchanged, both ways. The second
+            // row is the state the declaration makes unreachable — no
+            // press can raise a cursor here, so none can be holding one
+            // — and it is pinned so the answer is a fact rather than a
+            // sentence in a doc comment.
+            (false, None, None),
+            (false, Some(11), Some(11)),
+        ];
+        for (selectable, current, want) in table {
+            panes.cursor[0] = *current;
+            assert_eq!(
+                pane_cursor_toggle(&panes, SourceId(0), *selectable, 20),
+                *want,
+                "selectable {selectable} over cursor {current:?}"
+            );
+        }
+
+        // The declaration outranks nothing and is outranked by nothing:
+        // a hidden body and an unmarkable one decline the same way, so
+        // the two checks compose rather than one masking the other.
+        panes.collapsed[0] = true;
+        panes.cursor[0] = None;
+        assert_eq!(pane_cursor_toggle(&panes, SourceId(0), false, 20), None);
     }
 
     #[test]
@@ -12862,6 +12945,7 @@ mod tests {
             title: None,
             chrome: true,
             focusable: true,
+            selectable: true,
         };
         Registry::panes(
             vec![spec("a", a), spec("b", b)],

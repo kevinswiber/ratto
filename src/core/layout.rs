@@ -608,6 +608,7 @@ mod tests {
             title: None,
             chrome,
             focusable: true,
+            selectable: true,
         }
     }
 

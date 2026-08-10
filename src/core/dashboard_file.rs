@@ -145,6 +145,12 @@ pub struct PaneDecl {
     pub chrome: Option<bool>,
     /// Whether pane-navigation gestures may target this pane.
     pub focusable: Option<bool>,
+    /// Whether this pane's body is a list of lines a reader can mark
+    /// one of. A composed frame — a nested board, a table, a chart —
+    /// says `#false` and takes no cursor, while keeping every
+    /// navigation gesture: focus is about where you are, this is about
+    /// what is there.
+    pub selectable: Option<bool>,
     /// The child is long-lived: spawn it once and show its output as it
     /// arrives, rather than waiting for an exit that is not coming.
     pub live: Option<bool>,
@@ -1292,6 +1298,7 @@ fn resolve_box(
         },
         chrome: decl.chrome.or(defaults.chrome).unwrap_or(true),
         focusable: decl.focusable.or(defaults.focusable).unwrap_or(true),
+        selectable: decl.selectable.or(defaults.selectable).unwrap_or(true),
     })
 }
 
@@ -1784,6 +1791,45 @@ mod tests {
         assert!(
             ordinary.pane(SourceId(0)).expect("ordinary box").focusable,
             "omission preserves the existing focus behavior"
+        );
+    }
+
+    /// Selectability travels the same road focusability does, and is a
+    /// different answer from it: a board says a pane's body is a
+    /// picture rather than a list without giving up the navigation
+    /// gestures that reach it.
+    #[test]
+    fn selectability_defaults_true_and_inherits_with_an_override() {
+        let mut decl = file(vec![
+            pane("nested", &["date"]),
+            PaneDecl {
+                selectable: Some(true),
+                ..pane("log", &["date"])
+            },
+        ]);
+        decl.defaults.selectable = Some(false);
+        let registry = decl.into_registry(&Bindings::new()).expect("registry");
+        assert!(
+            !registry.pane(SourceId(0)).expect("nested box").selectable,
+            "the nested board inherits the default"
+        );
+        assert!(
+            registry.pane(SourceId(1)).expect("log box").selectable,
+            "a pane can opt back in"
+        );
+        // Independent answers: declining a cursor must not quietly cost
+        // a pane its place in the focus order.
+        assert!(
+            registry.pane(SourceId(0)).expect("nested box").focusable,
+            "opting out of selection is not opting out of focus"
+        );
+
+        let ordinary = file(vec![pane("ordinary", &["date"])])
+            .into_registry(&Bindings::new())
+            .expect("registry");
+        assert!(
+            ordinary.pane(SourceId(0)).expect("ordinary box").selectable,
+            "omission leaves every board written before this selectable"
         );
     }
 

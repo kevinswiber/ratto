@@ -269,6 +269,13 @@ pub struct PaneBox {
     /// Whether Tab, directional focus, and Alt-number jumps may target
     /// this pane. It remains visible, live, and laid out either way.
     pub focusable: bool,
+    /// Whether this pane's body is a list of lines a reader can mark
+    /// one of. A separate question from `focusable`: a pane whose body
+    /// is a composed picture is still one a reader wants to reach, zoom
+    /// and scroll — it just has no line to point at. Declared at load
+    /// and never touched again, which is why it lives here rather than
+    /// with the state a gesture moves.
+    pub selectable: bool,
 }
 
 impl PaneBox {
@@ -730,6 +737,7 @@ mod tests {
             title: None,
             chrome: true,
             focusable: true,
+            selectable: true,
         }
     }
 

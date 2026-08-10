@@ -726,6 +726,141 @@ fn a_cursor_marks_the_focused_panes_row_and_leaves_the_others_alone() {
     );
 }
 
+/// The same two stacked panes, with the first declaring that its body
+/// is not a list of lines. Pane `b` is left alone on purpose: a decline
+/// proves nothing on a board where the gesture works nowhere, so every
+/// arm below ends on a pane the mark still reaches.
+fn stacked_bodies_with_an_unmarkable_first(height: u16) -> String {
+    format!(
+        "row-gap 0\n\n\
+         defaults {{\n    height {height}\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+         pane \"a\" {{\n    interval \"1h\"\n    selectable #false\n    command \"printf 'A%s\\n' 01 02 03\"\n}}\n\
+         pane \"b\" {{\n    interval \"1h\"\n    command \"printf 'B%s\\n' 01 02 03\"\n}}\n"
+    )
+}
+
+/// Settle the board this pair uses, then require that it has genuinely
+/// stopped writing. Both panes run once an hour, so this is a finished
+/// board rather than a quiet one — which is what lets the arms below
+/// assert that a keystroke wrote NOTHING.
+///
+/// `drain_for`, not `read_available`: the latter returns at its first
+/// chunk, and a first-composition tail spread over two reads would land
+/// in the next window and read as a repaint.
+fn settle_and_require_silence(session: &PtySession, terminal: &mut FakeTerminal) {
+    assert!(
+        wait_for(session, terminal, b"B03", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    let _ = drain_for(session, Duration::from_millis(500));
+    let quiet = session.read_available(Duration::from_millis(800));
+    assert!(
+        quiet.is_empty(),
+        "a settled board repainted on its own: {:?}",
+        String::from_utf8_lossy(&quiet)
+    );
+}
+
+/// The control both declining arms end on: the neighbour holds lines,
+/// so the mark lands there. Silence is also what a dead pty produces,
+/// and this is what says the decline was the declaration's doing.
+fn the_mark_still_lands_next_door(session: &PtySession, terminal: &mut FakeTerminal) {
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(session, terminal, b"focus b", Duration::from_secs(3)),
+        "the focus never reached the second pane"
+    );
+    session.write_bytes(b"s");
+    let marked = wait_for_bytes(session, terminal, b"cursor 1/3", Duration::from_secs(3))
+        .expect("the mark never reached a pane that holds lines");
+    let row = row_containing(&marked, b"B01").expect("pane b's first row");
+    assert!(
+        contains(row, b"> "),
+        "the marked row must carry the marker: {:?}",
+        String::from_utf8_lossy(row)
+    );
+}
+
+/// From rest, with the first pane in reading order declaring that it
+/// holds no lines: the gesture declines rather than hunting for the
+/// first pane that would accept it. Skipping would make this the one
+/// key on the board that moves the focus somewhere the reader did not
+/// point it; a reader who wants a cursor further down presses `Tab` and
+/// then the key, which is one deliberate keystroke instead of one
+/// surprising one.
+///
+/// The decline is total and silent — no mark, no footer segment, no
+/// repaint of any kind. And the focus it would otherwise have implied
+/// does not move either, which the `Tab` after it measures: from rest
+/// the first `Tab` lands on pane `a`, and it could only land on `b` if
+/// the declined gesture had quietly focused `a` on its way out.
+#[test]
+fn from_rest_the_cursor_gesture_declines_on_a_pane_that_declared_no_lines() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(dir.path(), &stacked_bodies_with_an_unmarkable_first(4));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    settle_and_require_silence(&session, &mut terminal);
+
+    session.write_bytes(b"s");
+    let after = session.read_available(Duration::from_millis(800));
+    assert!(
+        after.is_empty(),
+        "the gesture must change nothing — not a mark, not the focus: {:?}",
+        String::from_utf8_lossy(&after)
+    );
+
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "the declined gesture moved the focus it would have implied"
+    );
+    the_mark_still_lands_next_door(&session, &mut terminal);
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The focused route through the same decline, and the whole point of
+/// the declaration being its own answer: this pane is reachable by
+/// number, so a reader can be standing in it when they press the key.
+/// Opting out of the mark cost it nothing else.
+#[test]
+fn a_focused_pane_that_declared_no_lines_declines_the_cursor_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(dir.path(), &stacked_bodies_with_an_unmarkable_first(4));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    settle_and_require_silence(&session, &mut terminal);
+
+    session.write_bytes(b"\x1b1");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "the jump never reached the first pane"
+    );
+    let _ = drain_for(&session, Duration::from_millis(400));
+
+    session.write_bytes(b"s");
+    let after = session.read_available(Duration::from_millis(800));
+    assert!(
+        after.is_empty(),
+        "a focused pane that declared no lines must answer the same way: {:?}",
+        String::from_utf8_lossy(&after)
+    );
+    the_mark_still_lands_next_door(&session, &mut terminal);
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// The non-rest arm. A board taller than the window, scrolled before
 /// the first gesture: a mark that only appears at live rest is the
 /// failure this fixture shape exists to catch.
@@ -1905,6 +2040,18 @@ fn read_probe(out: &std::path::Path) -> Option<String> {
 
 /// A numbered pane and a binding that probes its environment.
 fn probe_board(dir: &std::path::Path, body: &str) -> (std::path::PathBuf, String) {
+    probe_board_declaring(dir, body, "")
+}
+
+/// The same board with one more line inside the pane block, so an arm
+/// that needs a differently-declared pane does not need a second
+/// fixture family beside this one. `declaration` carries its own
+/// indentation and newline, or is empty.
+fn probe_board_declaring(
+    dir: &std::path::Path,
+    body: &str,
+    declaration: &str,
+) -> (std::path::PathBuf, String) {
     let out = dir.join("probe.txt");
     let script = dir.join("probe.sh");
     write_script(&script, PROBE_SH, &out);
@@ -1912,7 +2059,7 @@ fn probe_board(dir: &std::path::Path, body: &str) -> (std::path::PathBuf, String
         "row-gap 0\n\n\
          key \"x\" {{\n    description \"probe\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
          pane \"numbered\" {{\n    height 8\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
-         command \"{body}\"\n}}\n",
+         command \"{body}\"\n{declaration}}}\n",
         script = script.display(),
     );
     (out, board)
@@ -1969,6 +2116,56 @@ fn no_cursor_leaves_the_three_variables_unset() {
         "a blank selected line is set and empty, not unset: {blank}"
     );
     assert!(blank.contains("LINE=[2]"), "{blank}");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A pane that declared it holds no lines exports nothing, because no
+/// cursor can be standing in it to export. One arm rather than three:
+/// the absence machinery is pinned in full above, and what this adds is
+/// that the declaration reaches it — by never letting the state exist
+/// in the first place, from the focused pane, after a press of the very
+/// key that would have raised one.
+#[test]
+fn a_pane_that_declared_no_lines_exports_no_selection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (out, board) = probe_board_declaring(
+        dir.path(),
+        "for i in $(seq -w 1 20); do echo L$i; done",
+        "    selectable #false\n",
+    );
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"L05", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"focus numbered",
+            Duration::from_secs(3)
+        ),
+        "the focus never landed"
+    );
+    session.write_bytes(b"s");
+    session.write_bytes(b"x");
+    let absent = read_probe(&out).expect("the binding never probed its environment");
+    assert!(
+        absent.contains("SEL=[<unset>]")
+            && absent.contains("PRESENT=[]")
+            && absent.contains("PANE=[<unset>]")
+            && absent.contains("LINE=[<unset>]"),
+        "a pane that takes no cursor must export none of the three: {absent}"
+    );
 
     session.write_bytes(b"q");
     assert!(

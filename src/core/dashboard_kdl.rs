@@ -31,7 +31,7 @@
 //! | `script`, `interval`, `trigger-debounce`, `width`, `overflow`, `border`, `padding`, `title` | `Text` | `prop_text` / `one_text` | yes |
 //! | `shell` | `FlagOrText` | `shell_decl` → `ShellDecl::Named(Template)` | yes, in its string arm |
 //! | `height` | `Count` | `prop_count` / `one_count` | no — integers never reach a string (INV-3) |
-//! | `chrome`, `focusable`, `live` | `Flag` | `prop_flag` / `one_flag` | no |
+//! | `chrome`, `focusable`, `selectable`, `live` | `Flag` | `prop_flag` / `one_flag` | no |
 //! | document `title` text | — | `title_field` | yes |
 //! | document `title` `ref` | — | `title_field` | **refused** — an id is identity (INV-3) |
 //! | document `gap`, `row-gap` | — | `usize_field` | no — integers |
@@ -173,6 +173,11 @@ const PANE_KEYS: &[Setting<PaneDecl>] = &[
         name: "focusable",
         example: "focusable #false",
         set: Set::Flag(|d, v| d.focusable = Some(v)),
+    },
+    Setting {
+        name: "selectable",
+        example: "selectable #false",
+        set: Set::Flag(|d, v| d.selectable = Some(v)),
     },
     Setting {
         name: "live",
@@ -2588,7 +2593,7 @@ pane "nested" {
         );
     }
 
-    /// One table, thirteen keys: every key a pane accepts must land on
+    /// One table, fourteen keys: every key a pane accepts must land on
     /// the declaration through it. A key the table forgets shows up
     /// here as a `None` field, not as a silently ignored node.
     #[test]
@@ -2609,6 +2614,7 @@ pane "all" {
     title "Recent commits"
     chrome #false
     focusable #false
+    selectable #false
 }
 "#,
         )
@@ -2640,6 +2646,7 @@ pane "all" {
         );
         assert_eq!(pane.chrome, Some(false));
         assert_eq!(pane.focusable, Some(false));
+        assert_eq!(pane.selectable, Some(false));
     }
 
     #[test]
@@ -3074,7 +3081,7 @@ pane "all" {
     fn a_scalar_key_may_be_written_as_a_property_or_a_child_node() {
         let as_properties = parse(
             r#"
-pane "log" interval="15s" height=7 width="2fr" chrome=#false focusable=#false {
+pane "log" interval="15s" height=7 width="2fr" chrome=#false focusable=#false selectable=#false {
     command "git" "log"
 }
 "#,
@@ -3088,6 +3095,7 @@ pane "log" {
     width "2fr"
     chrome #false
     focusable #false
+    selectable #false
     command "git" "log"
 }
 "#,
