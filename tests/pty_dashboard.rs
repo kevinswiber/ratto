@@ -3221,6 +3221,331 @@ fn alt_digit_carries_the_zoom_to_its_number() {
     );
 }
 
+/// The headline witness for the ladder's new rung, and it needs no
+/// painted mark: only the COUNT of Escs it takes to lose `focus b`.
+/// Before the cursor rung, two; after it, three.
+///
+/// The assertions key on what the status row SAYS, never on silence and
+/// never on the arrival of `lines 9-30 of 30`. That range is on screen
+/// continuously while the frame is scrolled, so any repaint touching
+/// the row re-emits the substring — and once the row learns to name a
+/// selection, a cursor gesture legitimately redraws it. A test that
+/// demanded silence, or read that substring's arrival as proof of a
+/// focus change, would go red on a correct change.
+#[test]
+fn esc_peels_the_cursor_before_the_focus() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    // Focus pane b below the fold: the frame window slides to it, and
+    // everything after this happens off live rest.
+    session.write_bytes(b"\t\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 9-30 of 30", b"focus b"],
+        Duration::from_secs(3),
+    );
+
+    session.write_bytes(b"s");
+    // The new rung. In this phase nothing arrives at all and the check
+    // below is vacuous; once the status row names a selection it stops
+    // being, and it holds either way because it judges the row's
+    // content rather than its arrival.
+    session.write_bytes(b"\x1b");
+    let after_first = drain_for(&session, Duration::from_millis(750));
+    if let Some(row) = row_containing(&after_first, b"lines 9-30 of 30") {
+        assert!(
+            contains(row, b"focus b"),
+            "the first Esc must not drop the focus: {:?}",
+            String::from_utf8_lossy(row)
+        );
+    }
+
+    // The control, and the real assertion. The focus segment rides LAST
+    // on the scrolled row, so its absence is an end-of-row fact with no
+    // needle: drain until the newest row carrying the range has lost
+    // it. `wait_for` would return at the first repaint of a row that is
+    // on screen continuously, including one that still says `focus b`.
+    session.write_bytes(b"\x1b");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut newest: Vec<u8> = Vec::new();
+    let dropped = loop {
+        let chunk = drain_for(&session, Duration::from_millis(200));
+        if !chunk.is_empty() {
+            newest = chunk;
+        }
+        if row_containing(&newest, b"lines 9-30 of 30").is_some_and(|row| !contains(row, b"focus"))
+        {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+    };
+    assert!(
+        dropped,
+        "the second Esc must drop the focus: {:?}",
+        String::from_utf8_lossy(&newest)
+    );
+
+    // And the frame rung, unchanged, one Esc further down.
+    session.write_bytes(b"\x1b");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"more lines"],
+        Duration::from_secs(3),
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A cursor is per-pane state and survives every view gesture that is
+/// not the toggle or Esc. Zoom and unzoom both re-derive geometry and
+/// run the reconcile with a very different window in each direction, so
+/// a lossless round trip is the property that would catch a clamp
+/// measuring against the window instead of the body.
+///
+/// The witness is behavioural: with no mark painted yet, a surviving
+/// cursor is one that still takes the movement keys, and a lost one
+/// hands them back to the pane's own window — which shows up as the
+/// pane's scroll badge appearing. That badge is a sound needle because
+/// `pane_scroll_badge` yields nothing at rest: the text cannot be
+/// synthesized by a repaint, only by the window actually moving.
+///
+/// The bodies are constant, so this is a claim about the INDEX. A
+/// reconciled index is always valid for the body that exists now; it
+/// was never a promise that the line under it says the same thing.
+#[test]
+fn a_cursor_survives_a_zoom_round_trip_and_a_collapse() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    // Only the status row moves: the frame is at rest, so pane a's head
+    // is already on screen and no repaint re-emits it.
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "the focus never landed"
+    );
+    session.write_bytes(b"s");
+
+    // The round trip is driven by `z` both ways, not by Esc: with a
+    // cursor up Esc peels the mark first, which is the whole point of
+    // the rung this fixture sits beside.
+    // A zoomed pane a gets the whole window, so its last line becomes
+    // visible — a needle no unzoomed frame can produce, and one that
+    // does not lean on a border this board does not draw.
+    session.write_bytes(b"z");
+    assert!(
+        wait_for(&session, &mut terminal, b"A20", Duration::from_secs(5)),
+        "the zoom never painted"
+    );
+    session.write_bytes(b"z");
+    assert!(
+        wait_for(&session, &mut terminal, b"B01", Duration::from_secs(5)),
+        "the unzoom never painted"
+    );
+
+    session.write_bytes(b"j");
+    assert!(
+        !wait_for(
+            &session,
+            &mut terminal,
+            b"lines 2-15 of 20",
+            Duration::from_millis(750)
+        ),
+        "the pane's window moved: the cursor was lost in the zoom round trip"
+    );
+
+    session.write_bytes(b" ");
+    session.write_bytes(b" ");
+    session.write_bytes(b"j");
+    assert!(
+        !wait_for(
+            &session,
+            &mut terminal,
+            b"lines 2-15 of 20",
+            Duration::from_millis(750)
+        ),
+        "the pane's window moved: the cursor was lost in the collapse"
+    );
+
+    // The control, on the same channel: drop the cursor and the same
+    // key drives the window again, so the session was alive and
+    // decoding through both absences above.
+    session.write_bytes(b"s");
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"lines 2-15 of 20",
+            Duration::from_secs(3)
+        ),
+        "the same key on the same channel never arrived"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A zoom overrules a collapse in the composer without clearing the
+/// bit, so a collapsed-then-zoomed pane's whole body is on screen — and
+/// its cursor is awake. Dormancy keyed on the raw bit would leave a
+/// mark the reader can see and cannot toggle.
+///
+/// Movement cannot carry this test: on a collapsed-zoomed pane a
+/// correct build moves the mark invisibly and a raw-bit build declines,
+/// and BOTH leave the pane's window badge absent. The toggle is the
+/// discriminator, because dropping a cursor has a consequence this
+/// phase can see — the movement keys go back to the window.
+///
+/// What this cannot prove yet: that the mark MOVES while
+/// collapsed-zoomed, and that the index is held by number across the
+/// round trip. Both stay invisible until something paints or prints the
+/// cursor; extend this fixture there rather than reading it as complete.
+#[test]
+fn a_zoom_wakes_a_dormant_cursor_and_the_unzoom_puts_it_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "the focus never landed"
+    );
+    session.write_bytes(b"s");
+    session.write_bytes(b" ");
+
+    // Zoom the collapsed pane. The bit is still set and the composer
+    // shows the body anyway — this wait is the fixture's spine: without
+    // it the board is not in the state the test claims and nothing
+    // after it means anything.
+    session.write_bytes(b"z");
+    assert!(
+        wait_for(&session, &mut terminal, b"A01", Duration::from_secs(5)),
+        "a zoomed pane must show its body regardless of collapse"
+    );
+
+    // Awake, so this DROPS the cursor. Invisible; nothing to wait for.
+    session.write_bytes(b"s");
+    session.write_bytes(b"z");
+    session.write_bytes(b" ");
+    assert!(
+        wait_for(&session, &mut terminal, b"B01", Duration::from_secs(5)),
+        "the unzoom and expand never painted"
+    );
+
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"lines 2-15 of 20",
+            Duration::from_secs(3)
+        ),
+        "with no cursor `j` must drive the pane's window again — the toggle \
+         declined on the raw bit and the mark is still up"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// Esc peels one layer at a time: with a pane focused on a scrolled
 /// frame, the first Esc only deselects — the frame window HOLDS its
 /// place — and the second returns the frame to the live view.
@@ -3812,6 +4137,81 @@ fn z_fills_the_frame_with_the_focused_pane_and_back() {
         "both panes are back in one row: {:?}",
         String::from_utf8_lossy(top)
     );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// Esc's ladder gained a rung above the unzoom. With a cursor up, the
+/// first Esc drops the mark and leaves the zoom alone; only the second
+/// unzooms — one Esc later than before, and the focus still survives.
+///
+/// Step 3 is a bounded negative because peeling a mark nothing paints
+/// recomposes to identical bytes, and an identical frame writes
+/// nothing. Step 4 is the control that makes the negative honest: the
+/// same key on the same channel does bring the second pane back.
+#[test]
+fn esc_peels_the_cursor_before_the_unzoom() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    let decl = write_dashboard(dir.path(), &two_pane_row(&left, &right));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"right-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    let wide = "─".repeat(60);
+    session.write_bytes(b"\tz");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"left-1"],
+        Duration::from_secs(5),
+    );
+
+    session.write_bytes(b"s");
+    // A bare ESC needs ESC_HOLD (50ms) of SILENCE to decode: no other
+    // byte may be written inside that window, so each Esc below is its
+    // own write with a wait between.
+    session.write_bytes(b"\x1b");
+    assert!(
+        !wait_for(
+            &session,
+            &mut terminal,
+            b"right-1",
+            Duration::from_millis(750)
+        ),
+        "the first Esc must peel the cursor, not the zoom"
+    );
+
+    session.write_bytes(b"\x1b");
+    let back = wait_for_bytes(&session, &mut terminal, b"right-1", Duration::from_secs(5))
+        .expect("the second Esc must unzoom");
+    assert_eq!(
+        String::from_utf8_lossy(row_containing(&back, "╭".as_bytes()).expect("top border"))
+            .matches('╮')
+            .count(),
+        2,
+        "both panes are back in one row"
+    );
+
+    // The focus survived both rungs: `z` re-zooms the same pane, which
+    // is only reachable with a focused pane.
+    session.write_bytes(b"z");
+    let again = wait_for_bytes(
+        &session,
+        &mut terminal,
+        wide.as_bytes(),
+        Duration::from_secs(5),
+    )
+    .expect("the second zoom");
+    let at = position(&again, wide.as_bytes()).expect("the second zoom");
+    assert!(position(&again[at..], b"right-1").is_none());
 
     session.write_bytes(b"q");
     assert!(

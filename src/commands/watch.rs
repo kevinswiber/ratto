@@ -2681,6 +2681,63 @@ pub(crate) fn run_registry(
                                 &history,
                             )?);
                         }
+                        WatchAction::ClearCursor => {
+                            if live.is_none() {
+                                continue;
+                            }
+                            // The resolver only answers this with a live
+                            // cursor on the focused pane, so the target
+                            // is the focus; re-read it rather than
+                            // trusting the resolver's word, because the
+                            // arm is what owns the mutation.
+                            let Some(id) = panes.focus else { continue };
+                            if panes.cursor[id.0].is_none() {
+                                continue;
+                            }
+                            // No visibility guard: clearing a mark needs
+                            // no window, and a reader who set one while
+                            // the pane was open must be able to drop it
+                            // after collapsing.
+                            panes.cursor[id.0] = None;
+                            recompose_live(
+                                &mut live,
+                                &registry,
+                                &runtime,
+                                &geom,
+                                &panes,
+                                view.alt_time,
+                                &palette,
+                                profile,
+                            );
+                            let Some(live) = live.as_ref() else { continue };
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &live_tail,
+                                &palette,
+                                view,
+                                panes.key(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
+                                None,
+                                size,
+                                session.max_height,
+                                fullscreen,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
                         WatchAction::ToggleCursor => {
                             if live.is_none() {
                                 continue;
@@ -3713,6 +3770,11 @@ enum WatchAction {
     /// exists is pane state. The movement keys arrive as ordinary
     /// scrolls and are retargeted where the pane view is visible.
     CursorMove(ScrollStep),
+    /// Drop the focused pane's cursor — Esc's first rung, and the only
+    /// gesture besides the toggle that clears one. Distinct from the
+    /// toggle on purpose: a ladder rung that could RAISE a cursor is a
+    /// trap with a silent symptom, and this one cannot.
+    ClearCursor,
     /// Run the board's declared binding at this index.
     ///
     /// The table above NEVER produces this: it is context-blind by
@@ -3958,6 +4020,10 @@ fn describes(action: WatchAction) -> &'static str {
         // from it. The match is total on purpose, so give it the honest
         // phrase rather than a panic.
         WatchAction::CursorMove(_) => "moves the pane's line cursor",
+        // Never reached through the claimed-key lookup either — the
+        // table answers Esc with a focus action, and this is a resolved
+        // refinement of it.
+        WatchAction::ClearCursor => "drops the pane's line cursor",
         // Never reached through the claimed-key lookup — the key table
         // cannot answer with a binding, so this action never comes back
         // from it. The match is total on purpose, so give it the honest
@@ -4009,13 +4075,24 @@ fn scroll_phrase(step: ScrollStep) -> &'static str {
 /// scroll step's identical decline already is — there is no window on
 /// screen to move a mark in, and the key must never fall back to the
 /// whole frame.
+///
+/// Esc's ladder gains its first rung here. The peel order is cursor →
+/// zoom → focus → frame scroll, and the cursor comes off first because
+/// it is the least destructive step: a reader who overshoots gets it
+/// back with one keypress, where an unzoom would have thrown away the
+/// surface they were reading in order to drop a mark. The zoom and
+/// focus rungs are the dispatch arm's; the frame rung is the next
+/// resolver's; this one is here so the ladder's first step is a fact a
+/// unit test can check. Clearing needs no window, so it has no
+/// visibility gate: a mark set before a collapse can still be dropped
+/// after it.
 fn resolve_cursor(action: WatchAction, mode: FrameMode, panes: &PaneView) -> WatchAction {
-    let WatchAction::Scroll(step) = action else {
-        return action;
-    };
-    match cursor_at(mode, panes) {
-        Some(_) => WatchAction::CursorMove(step),
-        None => action,
+    match action {
+        WatchAction::Scroll(step) if cursor_at(mode, panes).is_some() => {
+            WatchAction::CursorMove(step)
+        }
+        WatchAction::ClearFocus if cursor_at(mode, panes).is_some() => WatchAction::ClearCursor,
+        _ => action,
     }
 }
 
@@ -8413,6 +8490,205 @@ mod tests {
             WatchAction::Resume
         );
         assert_eq!(resolve_esc(WatchAction::Quit, &panes), WatchAction::Quit);
+    }
+
+    #[test]
+    fn esc_peels_the_cursor_before_the_zoom() {
+        let mut panes = PaneView::new(2);
+        panes.focus = Some(SourceId(1));
+        panes.zoomed = Some(SourceId(1));
+        panes.cursor[1] = Some(4);
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(
+                resolve_cursor(WatchAction::ClearFocus, mode, &panes),
+                WatchAction::ClearCursor,
+                "{mode:?}"
+            );
+        }
+        // The rung consumed itself: with the cursor gone the next Esc
+        // is the zoom's, which is the arm's rung and reaches it
+        // unchanged.
+        panes.cursor[1] = None;
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(
+                resolve_cursor(WatchAction::ClearFocus, mode, &panes),
+                WatchAction::ClearFocus,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ladder_is_four_rungs_deep_and_in_this_order() {
+        // The rungs live in three places — this resolver, the dispatch
+        // arm, and the frame resolver — so the order is only visible
+        // through the composed chain. Rows two to four are the shipped
+        // behaviour re-asserted through the widened chain: inserting a
+        // seat did not change what Esc means with no cursor up.
+        let chain = |mode: FrameMode, panes: &PaneView| {
+            let action = resolve_page_or_zoom(action_for(Key::Esc, mode), mode, panes);
+            let action = resolve_cursor(action, mode, panes);
+            resolve_esc(action, panes)
+        };
+        let mut all = PaneView::new(2);
+        all.focus = Some(SourceId(1));
+        all.zoomed = Some(SourceId(1));
+        all.cursor[1] = Some(4);
+        let mut zoomed = PaneView::new(2);
+        zoomed.focus = Some(SourceId(1));
+        zoomed.zoomed = Some(SourceId(1));
+        let mut focused = PaneView::new(2);
+        focused.focus = Some(SourceId(1));
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            // The cursor rung is this resolver's.
+            assert_eq!(chain(mode, &all), WatchAction::ClearCursor, "{mode:?}");
+            // The zoom rung and the focus rung are both the dispatch
+            // arm's, which sees the same action and peels the zoom
+            // first.
+            assert_eq!(chain(mode, &zoomed), WatchAction::ClearFocus, "{mode:?}");
+            assert_eq!(chain(mode, &focused), WatchAction::ClearFocus, "{mode:?}");
+            // Nothing pane-side left: the frame rung.
+            assert_eq!(
+                chain(mode, &PaneView::new(2)),
+                WatchAction::Resume,
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn esc_never_raises_a_cursor() {
+        // Why the rung is its own action rather than the toggle: a
+        // ladder rung capable of RAISING a cursor is a trap with a
+        // silent symptom. Written against a rung that answered
+        // `ToggleCursor`, this fails on every row.
+        let mut focused = PaneView::new(2);
+        focused.focus = Some(SourceId(1));
+        let mut zoomed = PaneView::new(2);
+        zoomed.focus = Some(SourceId(1));
+        zoomed.zoomed = Some(SourceId(1));
+        let mut scrolled = PaneView::new(2);
+        scrolled.focus = Some(SourceId(1));
+        scrolled.scroll[1] = LiveScroll::at(3, 30, 10);
+        for panes in [PaneView::new(2), focused, zoomed, scrolled] {
+            for mode in FRAME_MODES {
+                assert_eq!(
+                    resolve_cursor(action_for(Key::Esc, mode), mode, &panes),
+                    action_for(Key::Esc, mode),
+                    "{mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_cursor_resolver_claims_two_actions_and_passes_the_rest() {
+        let panes = with_cursor(SourceId(1), 4);
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            // The two claimed actions, as positive controls: a
+            // pass-through matrix with no rewritten rows would pass on a
+            // resolver that did nothing at all.
+            assert_eq!(
+                resolve_cursor(WatchAction::Scroll(ScrollStep::LineDown), mode, &panes),
+                WatchAction::CursorMove(ScrollStep::LineDown)
+            );
+            assert_eq!(
+                resolve_cursor(WatchAction::ClearFocus, mode, &panes),
+                WatchAction::ClearCursor
+            );
+            for action in [
+                WatchAction::FocusNext,
+                WatchAction::FocusPrev,
+                WatchAction::FocusJump(0),
+                WatchAction::FocusMove(FocusDir::Left),
+                WatchAction::ToggleZoom,
+                WatchAction::ToggleCollapse,
+                WatchAction::Freeze,
+                WatchAction::Resume,
+                WatchAction::ToggleCursor,
+                WatchAction::ScrollN(ScrollStep::LineDown, 3),
+                WatchAction::RunBinding(0),
+                WatchAction::Ignore,
+            ] {
+                assert_eq!(
+                    resolve_cursor(action, mode, &panes),
+                    action,
+                    "{action:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dormant_cursor_can_be_lost_but_not_raised_and_a_zoom_wakes_it() {
+        let mut panes = with_cursor(SourceId(1), 4);
+        panes.collapsed[1] = true;
+
+        // Clearing needs no window: a reader who marked a row and then
+        // collapsed the pane must still be able to drop the mark. A
+        // decline exists to stop a gesture doing something invisible,
+        // and dropping state the reader knows they set is the thing
+        // they asked for.
+        assert_eq!(
+            resolve_cursor(WatchAction::ClearFocus, FrameMode::Live, &panes),
+            WatchAction::ClearCursor
+        );
+        // The toggle, by contrast, returns before it reads the cursor.
+        assert_eq!(pane_cursor_toggle(&panes, SourceId(1), 20), Some(4));
+
+        // Zoom the collapsed pane: the body is on screen, so the cursor
+        // is awake again — the toggle drops it and movement moves it.
+        panes.zoomed = Some(SourceId(1));
+        assert_eq!(pane_cursor_toggle(&panes, SourceId(1), 20), None);
+        assert!(!panes.body_hidden(SourceId(1)));
+        assert_eq!(
+            resolve_cursor(
+                WatchAction::Scroll(ScrollStep::LineDown),
+                FrameMode::Live,
+                &panes
+            ),
+            WatchAction::CursorMove(ScrollStep::LineDown)
+        );
+    }
+
+    #[test]
+    fn esc_on_a_paused_frame_is_still_just_a_resume() {
+        // A frozen frame is a composed string with no pane identity
+        // left in it, so the whole pane vocabulary is inert there. The
+        // table already answers `Resume` rather than a focus action, so
+        // the rung's own action never arrives.
+        let panes = with_cursor(SourceId(1), 4);
+        assert_eq!(action_for(Key::Esc, FrameMode::Paused), WatchAction::Resume);
+        assert_eq!(
+            resolve_cursor(WatchAction::Resume, FrameMode::Paused, &panes),
+            WatchAction::Resume
+        );
+        // A freeze is a reading posture, not a reset: the cursor is
+        // still there when the frame comes back.
+        assert_eq!(panes.cursor[1], Some(4));
+        assert_eq!(
+            resolve_cursor(WatchAction::ClearFocus, FrameMode::Live, &panes),
+            WatchAction::ClearCursor
+        );
+    }
+
+    #[test]
+    fn the_table_never_answers_with_a_cursor_move_or_a_clear() {
+        // The table answers `ToggleCursor` and nothing else
+        // cursor-shaped: the other two are RESOLVED answers, and the
+        // table is pane-blind. Its doc comment promises this; here it
+        // is as a theorem over the whole spellable space.
+        for key in crate::core::key_spelling::ascii_spellable() {
+            for mode in FRAME_MODES {
+                assert!(
+                    !matches!(
+                        action_for(key, mode),
+                        WatchAction::CursorMove(_) | WatchAction::ClearCursor
+                    ),
+                    "{key:?} mode={mode:?}"
+                );
+            }
+        }
     }
 
     #[test]
