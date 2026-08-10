@@ -2244,6 +2244,13 @@ pub(crate) fn run_registry(
                             // with it, which is the same answer the next
                             // tick's clamp would give.
                             panes.cursor[id.0] = next;
+                            // The window follows the mark, so a step
+                            // past the edge scrolls the pane instead of
+                            // moving a cursor off screen. A mark the
+                            // reader cannot see is worse than none: it
+                            // is the line an action will act on.
+                            panes.scroll[id.0] =
+                                follow_cursor(panes.scroll[id.0], next, total, window);
                             recompose_live(
                                 &mut live,
                                 &registry,
@@ -2769,6 +2776,18 @@ pub(crate) fn run_registry(
                             }
                             let moved_focus = panes.focus != Some(id);
                             panes.cursor[id.0] = next;
+                            // A raise lands at the top of the pane's own
+                            // window, so this is normally identity — but
+                            // "the cursor implies focus" makes the first
+                            // press reach a pane whose window the toggle
+                            // did not choose, and the follow is what
+                            // keeps that first keystroke visible.
+                            panes.scroll[id.0] = follow_cursor(
+                                panes.scroll[id.0],
+                                next,
+                                total,
+                                geom[id.0].inner_rows as usize,
+                            );
                             panes.focus = Some(id);
                             recompose_live(
                                 &mut live,
@@ -5056,6 +5075,49 @@ fn follow_focus(
     (target > 0).then(|| LiveScroll::at(target, total, window))
 }
 
+/// The pane's window follows its cursor: the smallest adjustment that
+/// puts the cursor's line inside the window. [`follow_focus`]'s rule one
+/// scope down, over a pane's own retained body instead of the composed
+/// frame — and, like it, a target already in view holds the window
+/// EXACTLY as it stands, pin bit included. That last clause is why this
+/// returns the input rather than rebuilding an identical offset:
+/// rebuilding would unpin a tailing pane at rest, which is how a pane
+/// silently stops tailing with no gesture and no badge to say so.
+///
+/// A cursor is one line, so the below-the-window target is exact and
+/// needs no taller-than-the-window guard; the frame-scope twin has one
+/// because a pane's BLOCK can outgrow the window and a line cannot. Nor
+/// does offset zero mean anything special here: at frame scope it IS
+/// the live view and collapses the mode, while a pane's zero is an
+/// ordinary rest position.
+///
+/// The constructor clamps to the window's own limit, but for any line
+/// inside the body the target computed here is already inside it — the
+/// clamp is belt-and-braces, not the mechanism. Simplify the arithmetic
+/// on the assumption that it is doing the work and the last line goes
+/// wrong.
+///
+/// No cursor is not a special case: the window is returned untouched,
+/// which is what makes calling this unconditionally at the end of the
+/// reconcile correct for the overwhelmingly common resting board.
+fn follow_cursor(
+    scroll: LiveScroll,
+    cursor: Option<usize>,
+    total: usize,
+    window: usize,
+) -> LiveScroll {
+    let Some(line) = cursor else { return scroll };
+    let window = window.max(1);
+    let offset = scroll.offset();
+    if line < offset {
+        LiveScroll::at(line, total, window)
+    } else if line >= offset + window {
+        LiveScroll::at(line + 1 - window, total, window)
+    } else {
+        scroll
+    }
+}
+
 /// Re-clamp the frame window after the composition changed shape under
 /// it — a zoom composes a frame that fits the window, a collapse
 /// shortens a column. Reaching the top collapses the mode; a pinned
@@ -5150,12 +5212,21 @@ fn clamp_cursor(cursor: Option<usize>, total: usize) -> Option<usize> {
 /// body that empties drops it. Nothing here resets on a hash change or
 /// a failure: the clamp is the only thing allowed to move a reader's
 /// place.
+///
+/// Three steps per pane, and the ORDER is load-bearing. The cursor
+/// clamps first, so what follows sees the index the body can actually
+/// hold. The window reanchors second, so the follow sees the window
+/// this tick produced rather than the one it inherited. The follow runs
+/// last: reversed, a pinned pane's reanchor would slam the window back
+/// to its tail and undo the follow every tick — on exactly the tailing
+/// logs where a reader most wants a cursor.
 fn reanchor_pane_view(panes: &mut PaneView, runtime: &[SourceRuntime], geom: &[PaneGeometry]) {
     for (i, (scroll, cursor)) in panes.scroll.iter_mut().zip(&mut panes.cursor).enumerate() {
         let total = runtime[i].output.as_ref().map_or(0, Vec::len);
         let window = geom[i].inner_rows as usize;
-        *scroll = scroll.reanchor(total, window);
         *cursor = clamp_cursor(*cursor, total);
+        *scroll = scroll.reanchor(total, window);
+        *scroll = follow_cursor(*scroll, *cursor, total, window);
     }
 }
 
@@ -11932,6 +12003,155 @@ mod tests {
         // replacement: that is today's behavior, unchanged.
         let tail = initial_pane_scroll(Overflow::KeepBottom, 40, 5);
         assert_eq!(tail.reanchor(400, 5).offset(), max_offset(400, 5));
+    }
+
+    #[test]
+    fn a_cursor_above_the_window_pulls_it_up_to_the_line() {
+        let at = |offset| LiveScroll::at(offset, 40, 5);
+        assert_eq!(follow_cursor(at(10), Some(3), 40, 5).offset(), 3);
+        // The boundary, so "smallest adjustment" is asserted where it
+        // is actually at stake rather than only in the middle.
+        assert_eq!(follow_cursor(at(10), Some(9), 40, 5).offset(), 9);
+    }
+
+    #[test]
+    fn a_cursor_below_the_window_pulls_it_down_to_end_at_the_line() {
+        let at = |offset| LiveScroll::at(offset, 40, 5);
+        for (offset, cursor, want) in [(0usize, 7usize, 3usize), (0, 5, 1)] {
+            let moved = follow_cursor(at(offset), Some(cursor), 40, 5);
+            assert_eq!(moved.offset(), want, "cursor {cursor} from offset {offset}");
+            // The property, computed, beside the number: the number
+            // states the smallest-move claim, this states the point.
+            assert!(
+                moved.offset() <= cursor && cursor < moved.offset() + 5,
+                "the window must contain the cursor: {} vs {cursor}",
+                moved.offset()
+            );
+        }
+    }
+
+    #[test]
+    fn a_visible_cursor_holds_the_window_and_its_pin() {
+        // The pin half is the one an obvious implementation drops.
+        // Rebuilding an identical offset through `LiveScroll::at`
+        // silently unpins a tailing pane at rest, and it stops riding
+        // its tail with no gesture and no badge change until the next
+        // growth.
+        let pinned = LiveScroll::start(ScrollStep::Bottom, 40, 5);
+        let held = LiveScroll::at(10, 40, 5);
+        for scroll in [pinned, held] {
+            for line in scroll.offset()..scroll.offset() + 5 {
+                assert_eq!(
+                    follow_cursor(scroll, Some(line), 40, 5),
+                    scroll,
+                    "cursor {line} is already inside"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_follow_unpins() {
+        // A carried offset means HOLD the reader's place, never chase a
+        // growing tail — so a pane that has to move to show its cursor
+        // stops riding.
+        let pinned = LiveScroll::start(ScrollStep::Bottom, 40, 5);
+        assert!(pinned.pinned(), "fixture premise");
+        let moved = follow_cursor(pinned, Some(2), 40, 5);
+        assert_eq!(moved.offset(), 2);
+        assert!(!moved.pinned());
+    }
+
+    #[test]
+    fn no_cursor_holds_the_window_exactly() {
+        // The resting board's whole guarantee, in one test: the follow
+        // runs unconditionally at the end of the reconcile, so absence
+        // must be a total no-op rather than a case.
+        for scroll in [
+            LiveScroll::start(ScrollStep::Bottom, 40, 5),
+            LiveScroll::at(0, 40, 5),
+            LiveScroll::at(12, 40, 5),
+        ] {
+            assert_eq!(follow_cursor(scroll, None, 40, 5), scroll);
+        }
+    }
+
+    #[test]
+    fn a_cursor_on_the_last_line_needs_no_clamp_to_be_correct() {
+        // The computed target is already inside the window's own limit,
+        // so the constructor's clamp is belt-and-braces rather than the
+        // mechanism. A reader who assumes otherwise "simplifies" the
+        // arithmetic and gets exactly this case wrong.
+        for (total, window) in [(40usize, 5usize), (3, 10)] {
+            let moved = follow_cursor(
+                LiveScroll::at(0, total, window),
+                Some(total - 1),
+                total,
+                window,
+            );
+            assert!(
+                moved.offset() <= max_offset(total, window),
+                "{total} lines in a {window}-row window"
+            );
+            let last = total - 1;
+            assert!(moved.offset() <= last && last < moved.offset() + window.max(1));
+        }
+    }
+
+    #[test]
+    fn the_clamp_then_the_reanchor_then_the_follow() {
+        let registry = zoom_row_registry();
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let mut panes = view_zooming(&registry, None);
+        let geom = derive_geometry(&registry, (80, 24), None, false, &panes);
+        let window = geom[0].inner_rows as usize;
+        assert_eq!(window, 2, "fixture premise");
+
+        // A pinned pane whose body grows past its window, with a cursor
+        // parked upstream: an implementation that follows BEFORE
+        // reanchoring ends at the tail, because the reanchor slams a
+        // pinned window back to it.
+        runtime[0].output = Some((1..=40).map(|i| format!("a{i}")).collect());
+        runtime[1].output = Some((1..=40).map(|i| format!("b{i}")).collect());
+        panes.scroll[0] = LiveScroll::start(ScrollStep::Bottom, 40, window);
+        panes.cursor[0] = Some(5);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
+        assert_eq!(panes.scroll[0].offset(), 5, "the window ends at the cursor");
+        assert!(!panes.scroll[0].pinned(), "and stops riding the tail");
+
+        // A body that shrank below the cursor: the clamp lowers the
+        // index and the follow shows the CLAMPED line. Following first
+        // would leave the window one line off.
+        runtime[0].output = Some((1..=3).map(|i| format!("c{i}")).collect());
+        reanchor_pane_view(&mut panes, &runtime, &geom);
+        assert_eq!(panes.cursor[0], Some(2));
+        let offset = panes.scroll[0].offset();
+        assert!(
+            offset <= 2 && 2 < offset + window,
+            "the window must show the clamped line, got offset {offset}"
+        );
+    }
+
+    #[test]
+    fn the_reanchor_is_idempotent_with_a_cursor() {
+        // A follow written relatively rather than absolutely passes its
+        // first call and drifts on the second — which is what happens
+        // the moment two of the call sites fire in one iteration.
+        let registry = zoom_row_registry();
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let body: Vec<String> = (1..=40).map(|i| format!("r{i}")).collect();
+        runtime[0].output = Some(body.clone());
+        runtime[1].output = Some(body);
+        let mut panes = view_zooming(&registry, None);
+        let geom = derive_geometry(&registry, (80, 24), None, false, &panes);
+        panes.cursor[0] = Some(30);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
+        let once = (panes.scroll[0], panes.cursor[0]);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
+        assert_eq!((panes.scroll[0], panes.cursor[0]), once);
+        // And the function itself.
+        let scroll = follow_cursor(LiveScroll::at(0, 40, 5), Some(20), 40, 5);
+        assert_eq!(follow_cursor(scroll, Some(20), 40, 5), scroll);
     }
 
     #[test]

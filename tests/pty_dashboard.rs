@@ -890,6 +890,251 @@ fn a_collapsed_pane_shows_no_mark_until_a_zoom_puts_its_body_back() {
     );
 }
 
+/// One pane deeper than its window, over a fixed body, beside a
+/// neighbour.
+///
+/// **Nothing on this board ticks**, and that is the point: the tick's
+/// own reconcile also follows the cursor, so a board with a 250ms
+/// neighbour hides a missing follow in the movement arm behind the very
+/// next tick. With every interval parked, the arm's own call is the
+/// only thing that can move the window.
+fn a_deep_pane_and_a_neighbour() -> String {
+    "row-gap 0\n\n\
+     defaults {\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n}\n\n\
+     pane \"a\" {\n    height 5\n    command \"printf 'A%s\\n' 01 02 03 04 05 06 07 08 09 10\"\n}\n\
+     pane \"b\" {\n    height 4\n    command \"printf 'B%s\\n' 01 02 03\"\n}\n"
+        .to_string()
+}
+
+/// A cursor the reader cannot see is worse than no cursor: it is the
+/// line an action will act on, off screen. Walking it past the bottom
+/// of the pane's window brings the window with it — and the pane's own
+/// badge says where it now is.
+#[test]
+fn a_cursor_walking_off_the_bottom_scrolls_its_own_pane() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(dir.path(), &a_deep_pane_and_a_neighbour());
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"A04", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "the focus never landed"
+    );
+    session.write_bytes(b"s");
+    for _ in 0..5 {
+        session.write_bytes(b"j");
+    }
+    // The window followed, so a line the resting window could not show
+    // is on screen — and the badge, derived from the same value, says
+    // which lines those are. The badge is a sound needle because a pane
+    // at rest emits none at all: no repaint can synthesize it, only the
+    // window actually moving.
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"A06", b"lines 3-6 of 10"],
+        Duration::from_secs(5),
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A pane's window and the frame's window are different objects. Moving
+/// a cursor inside a pane must leave the frame exactly where the reader
+/// put it — the property that breaks the moment someone routes the
+/// follow through the frame's own re-clamp by analogy.
+#[test]
+fn a_cursor_move_never_touches_the_frames_own_window() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    // Focus the pane BELOW the fold, so the frame stays scrolled while
+    // the cursor works. Focusing the top pane would bring the frame
+    // back to its live view and leave nothing to hold still.
+    session.write_bytes(b"\t\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 9-30 of 30", b"focus b"],
+        Duration::from_secs(3),
+    );
+    session.write_bytes(b"s");
+    for _ in 0..15 {
+        session.write_bytes(b"j");
+    }
+    let seen = wait_for_bytes(&session, &mut terminal, b"B16", Duration::from_secs(5))
+        .expect("the pane's window never followed the cursor");
+    // Judged on what the NEWEST status row says, not on a substring's
+    // arrival: the frame's range is on screen continuously while it is
+    // scrolled, so an earlier row in the same capture legitimately
+    // carries the range from before the gesture. `of 30` is the frame's
+    // total and the pane's is 20, so this locates the frame's row.
+    let status = row_containing(&seen, b" of 30").expect("the frame's status row");
+    assert!(
+        contains(status, b"lines 9-30 of 30"),
+        "a pane cursor must not move the frame's window: {:?}",
+        String::from_utf8_lossy(status)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A tailing pane with a cursor stops chasing its tail the moment
+/// growth pushes the cursor out of the window — the follow moves it
+/// back and unpins it, and the badge appearing is how the pane says so.
+///
+/// That is `LiveScroll::at`'s own contract reaching the case it was
+/// written for: a carried offset means HOLD the reader's place, never
+/// chase a growing tail. A cursor that rode the tail would move under
+/// the reader's hand between the row they read and the key they press.
+#[test]
+fn a_tailing_pane_with_a_cursor_stops_chasing_its_tail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("log");
+    std::fs::write(&log, "seed\n").expect("seed the log");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\n\
+             pane \"a\" {{\n    height 5\n    border \"none\"\n    chrome #true\n    shell #true\n    \
+             overflow \"keep-bottom\"\n    interval \"250ms\"\n    \
+             command \"printf 'L%s\\n' $(wc -l < {log}) >> {log}; cat -n {log} | tail -n 40\"\n}}\n",
+            log = log.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // A tailing pane at rest shows its newest lines and no badge.
+    assert!(
+        wait_for(&session, &mut terminal, b"L5", Duration::from_secs(10)),
+        "the tail never grew"
+    );
+    session.write_bytes(b"\t");
+    session.write_bytes(b"s");
+    // Park the cursor upstream of the tail.
+    for _ in 0..3 {
+        session.write_bytes(b"k");
+    }
+    // The pane stops riding: the badge exists only for a pane off its
+    // declared rest, so its arrival IS the pin dropping.
+    assert!(
+        wait_for(&session, &mut terminal, b" of ", Duration::from_secs(5)),
+        "a cursor'd tailing pane must stop chasing its tail"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Zoom changes the pane's window, and the zoom arms already run the
+/// one reconcile — so the follow rides along with no call site of its
+/// own. Driven with `z` both ways, never Esc: Esc's bottom rung peels
+/// the cursor first, so the round trip would assert the visibility of a
+/// mark it had just destroyed.
+#[test]
+fn a_zoom_refollows_the_cursor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(dir.path(), &a_deep_pane_and_a_neighbour());
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"A04", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "the focus never landed"
+    );
+    session.write_bytes(b"s");
+    for _ in 0..7 {
+        session.write_bytes(b"j");
+    }
+    let marked = wait_for_bytes(&session, &mut terminal, b"A08", Duration::from_secs(5))
+        .expect("the window never followed the cursor");
+    assert!(
+        contains(
+            row_containing(&marked, b"A08").expect("the cursor's row"),
+            b"> "
+        ),
+        "the cursor's own row must be on screen"
+    );
+
+    session.write_bytes(b"z");
+    let zoomed = wait_for_bytes(&session, &mut terminal, b"A08", Duration::from_secs(5))
+        .expect("the zoom never painted");
+    assert!(
+        contains(
+            row_containing(&zoomed, b"A08").expect("the cursor's row, zoomed"),
+            b"> "
+        ),
+        "the cursor's row must survive the zoom"
+    );
+
+    session.write_bytes(b"z");
+    let back = wait_for_bytes(&session, &mut terminal, b"A08", Duration::from_secs(5))
+        .expect("the unzoom never painted");
+    assert!(
+        contains(
+            row_containing(&back, b"A08").expect("the cursor's row, unzoomed"),
+            b"> "
+        ),
+        "the cursor's row must survive the unzoom"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// The mark takes two columns from the pane's content and `RAT_WIDTH`
 /// deliberately does not move with it: a view gesture that changed the
 /// exported width would read as a resize and restart every child on the
