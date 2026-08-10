@@ -479,9 +479,9 @@ focused pane wears the accent border and the footer names it. On a
 board taller than the window the frame viewport follows the focus:
 focusing a pane below the fold scrolls it into view, and the gestures
 work from a scrolled frame too. `Esc` peels one layer at a time — the
-zoom, then the focus (the frame scroll holds its place), then the
-frame scroll itself. Only a paused or scrubbed frame ignores the pane
-keys; freeze/scrub stay whole-frame, unchanged.
+cursor, then the zoom, then the focus (the frame scroll holds its
+place), then the frame scroll itself. Only a paused or scrubbed frame
+ignores the pane keys; freeze/scrub stay whole-frame, unchanged.
 
 With a pane focused, the scroll keys (`j/k`, `d/u`, `f/b`, `g/G`) and
 the wheel drive that pane's own window over its retained lines instead
@@ -493,6 +493,25 @@ place when the pane's next run replaces the body — clamped into the
 new shape, never reset. The horizontal shift (`h/l`) is a plain-watch
 affair: pane content is clipped to its box, so on a board those keys
 are inert.
+
+`s` puts a line cursor in the focused pane — a `>` mark on one of its
+own retained lines — and `s` again takes it away. With no pane
+focused, `s` focuses the first one and marks a line there, the way
+every pane gesture behaves from rest. While a cursor is up the scroll
+keys move it rather than the window (`j/k` a line, `d/u` a half,
+`f/b` a window, `g/G` the ends) and the window follows the cursor
+rather than the other way round; the footer names the mark's place as
+`cursor 7/40`. The cursor holds its line when the pane's next run
+replaces the body — clamped into the new shape, never reset, the same
+rule the per-pane window already follows — and an emptied pane loses
+the cursor rather than keeping a mark over nothing. Only the focused
+pane shows its mark: move the focus and another pane's cursor keeps
+its line quietly until you come back. A pane collapsed to its title
+row sleeps the same way — its cursor keeps its line, draws nothing,
+and goes nowhere until the pane is expanded, which the footer says as
+`cursor 7/40 (collapsed)`. `Esc` drops the cursor first, before the
+zoom. What a key action does with the marked line is under Key actions
+below.
 
 `z` zooms the focused pane to the full frame and back. A live pane
 just re-clips to the new width — a view gesture never restarts a
@@ -695,7 +714,9 @@ variables layer — the three evaluation forms, the `-v` parameter, and
 a raw string that stays literal — and
 [`examples/review.kdl`](examples/review.kdl) is a review console whose
 paths derive at load, so the same file works in a primary checkout, a
-linked worktree, or a clone.
+linked worktree, or a clone; it is also where the line cursor and a
+handoff file compose — mark a changed file with `s`, press `x`, and
+the panes below pick it up on their own triggers.
 [`examples/keys.kdl`](examples/keys.kdl) is a board that acts — three
 key bindings, one guarded, one confirmed, each `output` disposition
 shown once. Every one of these ships inside the binary too:
@@ -758,6 +779,61 @@ at the top of the command: a guard inside the command fires after the
 question has already been answered, which is the wrong end of the
 interaction. The convention is the shell's own, the one `test` and
 `if` already use — zero runs it, non-zero does not.
+
+**The cursor, if there is one.** When a pane has a line cursor (`s` —
+see Pane navigation above), the binding's command sees three more
+variables, and so does its `when`:
+
+| | |
+|---|---|
+| `RAT_SELECTION` | the marked line's text, with styling stripped |
+| `RAT_SELECTION_PANE` | the id of the pane the cursor is in |
+| `RAT_SELECTION_LINE` | the line's 1-based place in that pane's body |
+
+With no cursor — and with the cursor's pane collapsed to its title
+row, where there is nothing on screen to have selected — all three are
+**absent** rather than empty. That distinction needs the right test,
+and the obvious one is not it: `[ -n "$RAT_SELECTION" ]` asks whether
+the marked line has any text in it, and a blank line is a real
+selection. To ask whether anything is marked, test for the variable's
+presence — `[ -n "${RAT_SELECTION+x}" ]`, which is `x` when the
+variable is set and empty when it is unset, whatever the value — or
+test `RAT_SELECTION_PANE`, which holds a pane id and so is never
+legitimately blank. Either way, a `when` written that way declines
+before anything runs.
+
+The three are read once, when the key is pressed: a binding that asks
+a question first, or whose guard takes a moment, still acts on the
+line that was marked when you pressed it, even if the pane re-ran in
+between.
+
+The text is what the pane shows, minus the styling — rat strips the
+escape sequences so a command does not have to, and the raw form is
+not offered. Two consequences worth knowing before you parse it: it
+contains no tab characters, because rat expands tabs to the next
+eight-column stop as it reads a child's output, so split on whitespace
+rather than on `\t`; and a `\r\n` line arrives without its carriage
+return, so the value compares equal to what you read on screen.
+
+**`RAT_SELECTION_LINE` is a coordinate, under three conditions.** The
+index lets a command re-derive the pane's own output and find the same
+row — turning "the line I was looking at" into a file and a line
+number — but the technique is only sound when all three hold. The
+pane's content must be **reproducible**: running its command again has
+to yield the same lines, so a live log, or anything that changes
+between runs, cannot be indexed this way at all. The output the script
+re-derives must have the **same line count** as the pane's — a tool
+that adds or drops rows when its color or format flag changes breaks
+the mapping while both outputs still look right. And the pane must
+keep its **head**, `overflow "keep-top"`: retention drops lines from
+the other end, so a `keep-bottom` pane's indices shift as it grows.
+Where the three do not hold, `RAT_SELECTION` itself is the honest
+value to use.
+
+A *pane's* command never sees any of this — a pane would have to
+respawn on every cursor move to keep it true — so a selection reaches
+panes the way every other choice does, through the handoff file the
+section below describes.
 
 **Actions are asynchronous unless they need the screen.** A binding's
 command runs on a worker, exactly the way a pane's child does, so the

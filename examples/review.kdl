@@ -1,16 +1,33 @@
 // A review console you can ship: every path derives at load, so the
 // SAME file works in a primary checkout, a linked worktree, or a fresh
-// clone — nothing is hand-edited per machine. Run from any git
-// repository:
+// clone — nothing is hand-edited per machine. Run it from any git
+// repository with something uncommitted in it:
 //
 //   rat dashboard examples/review.kdl
 //
-// The board reads its selection from a handoff file: a small file the
-// `x` binding below writes and these panes trigger on. The state lives
-// in that file, in the filesystem — the panes only read it, which is
-// also why it can still be driven by hand from another terminal:
+// Focus the `changed` pane, press `s` to put a cursor in it, walk the
+// cursor with j/k, and press `x`. The path under the cursor lands in a
+// handoff file: a small file the `x` binding writes and the panes below
+// trigger on. The choice lives in that file, in the filesystem — the
+// panes only read it, which is also why it can still be driven by hand
+// from another terminal:
 //
 //   echo src/main.rs > "$(git rev-parse --git-common-dir)/review.sel"
+//
+// 1. `s` is rat's own key, not this board's: it marks a line in the
+//    focused pane. Every key action then sees that line as
+//    $RAT_SELECTION with its styling stripped, its pane as
+//    $RAT_SELECTION_PANE, and its 1-based row as $RAT_SELECTION_LINE.
+// 2. With no cursor up, none of the three is SET — not set to empty.
+//    Gating on $RAT_SELECTION_PANE, as `x` does below, is what tells
+//    "nothing is marked" from "the marked line is blank".
+// 3. `when` sees the same variables the command does, so `x` declines
+//    before it runs anything when the cursor is somewhere else.
+// 4. With a clean tree the `changed` pane holds nothing but a blank
+//    line. `s` still marks it — a blank line is a real selection, which
+//    is why the guard below asks which PANE the cursor is in rather
+//    than whether the marked text is empty — and `x` writes it, leaving
+//    the console in its empty state. Edit a file and the board fills.
 
 title "review"
 
@@ -44,16 +61,33 @@ defaults {
     border "rounded"
 }
 
-pane "selection" {
-    title "current selection"
-    // Event-driven: `interval "never"` plus a trigger on the handoff
-    // file, so this pane runs only when the selection changes. A
-    // trigger on a path that does not exist yet is fine — the watch
-    // simply fires when the file appears.
-    interval "never"
-    trigger "file:{{sel}}"
-    shell #true
-    command "echo {{cur}}"
+// The two small panes share a row so the diff keeps its height: the
+// whole board has to fit an 80x24 terminal, and a frame taller than
+// the window puts the diff below the fold where a reader has to scroll
+// to see the thing they just chose.
+row {
+    // The cursor's home: one path per line, which is what makes a line
+    // index mean a file. Nothing here is derived — this pane is what
+    // the reader points at.
+    pane "changed" {
+        title "changed files — s, then j/k, then x"
+        height 8
+        interval "10s"
+        shell #true
+        command "git diff --name-only HEAD"
+    }
+
+    pane "selection" {
+        title "current selection"
+        // Event-driven: `interval "never"` plus a trigger on the
+        // handoff file, so this pane runs only when the selection
+        // changes. A trigger on a path that does not exist yet is fine
+        // — the watch simply fires when the file appears.
+        interval "never"
+        trigger "file:{{sel}}"
+        shell #true
+        command "echo {{cur}}"
+    }
 }
 
 pane "diff" {
@@ -67,23 +101,33 @@ pane "diff" {
     command "test \"{{cur}}\" = - && echo select a file to review || git diff HEAD -- \"{{cur}}\""
 }
 
-// The write half of the console: the selection lands in the handoff
-// file, and the panes above find out through their own triggers — the
-// dashboard itself keeps nothing. `hide` is the right disposition for
-// a write whose effect is already visible in the frame.
-// `s` raises the line cursor in the focused pane, so the write half of
-// this console answers to `x`, and clearing moves up to `X`.
+// The write half of the console: the line under the cursor becomes the
+// selection, and the panes above find out through their own triggers —
+// the dashboard itself keeps nothing. `hide` is the right disposition
+// for a write whose effect is already visible in the frame.
+//
+// The guard is on the PANE, not the text: it declines when the cursor
+// sits in the diff pane, where a line is a diff line and not a path,
+// and it covers the no-cursor case for free — an unset variable
+// expands to empty, and empty is not `changed`. Testing the text with
+// `-n` instead would call a blank line "nothing marked".
+//
+// `printf` rather than `echo`: the line is arbitrary text, and `echo`
+// interprets backslashes on some shells and adds a newline on all of
+// them.
 key "x" {
-    description "select the first changed file"
+    description "review the file under the cursor"
+    when "test \"$RAT_SELECTION_PANE\" = changed"
     shell #true
     output "hide"
-    command "git diff --name-only HEAD | head -n 1 > \"{{sel}}\""
+    command "printf '%s' \"$RAT_SELECTION\" > \"{{sel}}\""
 }
 
 key "X" {
     description "clear the selection"
-    // The guard half: a `when` on the same handoff file, so pressing
-    // `X` with nothing selected declines instead of running.
+    // The guard half, and the reason for the capital: `x` chooses, `X`
+    // undoes. A `when` on the handoff file itself, so pressing it with
+    // nothing selected declines instead of running.
     when "test -s \"{{sel}}\""
     shell #true
     output "hide"

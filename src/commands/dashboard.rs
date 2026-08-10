@@ -290,7 +290,8 @@ const PANE_GESTURE_HELP: &[&str] = &[
     "    Tab, BackTab     cycle focus between panes — a zoom rides along",
     "    Alt-h/j/k/l      move focus directionally",
     "    Alt-1..9         jump straight to a numbered focusable pane",
-    "    Esc              unzoom, then drop focus, then the frame scroll",
+    "    s                put a line cursor in the focused pane, or drop it",
+    "    Esc              peel one layer: cursor, zoom, focus, frame scroll",
     "    Enter            zoom the focused pane; zoomed, page its body",
     "    z                zoom the focused pane to the full frame",
     "    Space            collapse the focused pane to its title row",
@@ -301,6 +302,10 @@ const PANE_GESTURE_HELP: &[&str] = &[
     "    focus is held, every focusable title counts itself in layout",
     "    order; Alt-1..9 jumps to the first nine (from rest, too),",
     "    and Tab reaches the rest of a larger board.",
+    "    With a cursor up, the scroll keys move the cursor instead and",
+    "    the pane's window follows it; a key action then reads the",
+    "    marked line as RAT_SELECTION. The cursor holds its line when",
+    "    the pane re-runs, and a paused frame ignores all of this.",
 ];
 
 /// What the `live` label means, and what `interval` means under it.
@@ -986,7 +991,10 @@ mod tests {
                 "    Tab, BackTab     cycle focus between panes — a zoom rides along".to_string(),
                 "    Alt-h/j/k/l      move focus directionally".to_string(),
                 "    Alt-1..9         jump straight to a numbered focusable pane".to_string(),
-                "    Esc              unzoom, then drop focus, then the frame scroll".to_string(),
+                "    s                put a line cursor in the focused pane, or drop it"
+                    .to_string(),
+                "    Esc              peel one layer: cursor, zoom, focus, frame scroll"
+                    .to_string(),
                 "    Enter            zoom the focused pane; zoomed, page its body".to_string(),
                 "    z                zoom the focused pane to the full frame".to_string(),
                 "    Space            collapse the focused pane to its title row".to_string(),
@@ -997,6 +1005,10 @@ mod tests {
                 "    focus is held, every focusable title counts itself in layout".to_string(),
                 "    order; Alt-1..9 jumps to the first nine (from rest, too),".to_string(),
                 "    and Tab reaches the rest of a larger board.".to_string(),
+                "    With a cursor up, the scroll keys move the cursor instead and".to_string(),
+                "    the pane's window follows it; a key action then reads the".to_string(),
+                "    marked line as RAT_SELECTION. The cursor holds its line when".to_string(),
+                "    the pane re-runs, and a paused frame ignores all of this.".to_string(),
             ]
         );
         // Stated rather than implied: a board with no bindings gains
@@ -1024,6 +1036,10 @@ mod tests {
             "z ",
             "Space",
             "focus",
+            // Not `"s"` or `"s "`: both match incidentally, in `pane
+            // gestures`, in `panes`, in half the prose. A phrase that
+            // can only come from the new row.
+            "line cursor",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in {text}");
         }
