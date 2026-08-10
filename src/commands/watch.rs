@@ -588,6 +588,13 @@ pub(crate) fn run_registry(
     // move it, the composer reads it, and the repaint gate sees it
     // through the digest.
     let mut panes = PaneView::new(registry.len());
+    // Whether the cursor key means anything on this board. Read once:
+    // it is a declaration, so it cannot change while the loop runs, and
+    // a board where no pane asked for a cursor hands the letter back to
+    // its own bindings.
+    let takes_a_cursor = registry
+        .ids()
+        .any(|id| registry.pane(id).is_some_and(|pane| pane.selectable));
     // Loop-persistent geometry state: the one size/geometry pair the
     // spawn step, the composer, and the (future) resize arm consume. It
     // outlives the spawn branch — a completion can arrive in an
@@ -2105,7 +2112,13 @@ pub(crate) fn run_registry(
                                 // way for a reason: it fires only on a
                                 // declined key, so a built-in has
                                 // already had every chance to answer.
-                                resolve_binding(action, mode, key, &session.bindings)
+                                resolve_binding(
+                                    action,
+                                    mode,
+                                    key,
+                                    &session.bindings,
+                                    takes_a_cursor,
+                                )
                             }
                         }
                         // Gated on LIVE capture, not just the flag: a
@@ -4010,11 +4023,22 @@ const FRAME_MODES: [FrameMode; 3] = [FrameMode::Live, FrameMode::LiveScrolled, F
 ///
 /// Returns a phrase rather than a `WatchAction` so the action
 /// vocabulary stays private to this module.
-pub(crate) fn builtin_key(key: Key) -> Option<&'static str> {
+/// `cursor` is whether ANY pane on this board asked for a line cursor.
+/// It is the one input that can un-claim a key: the cursor toggle is
+/// the only built-in with nothing to do on a board that did not ask for
+/// it, so there the letter goes back to the board. Every other key is
+/// claimed the same way whatever the panes declared.
+///
+/// Both consumers are handed the same fact — the load-time refusal and
+/// the runtime binding gate — because a key refused at load that the
+/// loop would have answered costs an author a letter for nothing, and
+/// the reverse is a binding that never fires.
+pub(crate) fn builtin_key(key: Key, cursor: bool) -> Option<&'static str> {
     FRAME_MODES
         .into_iter()
         .map(|mode| action_for(key, mode))
         .find(|action| *action != WatchAction::Ignore)
+        .filter(|action| cursor || *action != WatchAction::ToggleCursor)
         .map(describes)
 }
 
@@ -4206,8 +4230,18 @@ fn resolve_binding(
     mode: FrameMode,
     key: Key,
     bindings: &[KeyBinding],
+    cursor: bool,
 ) -> WatchAction {
-    if action != WatchAction::Ignore || mode == FrameMode::Paused || builtin_key(key).is_some() {
+    // The one built-in that hands its key back. A cursor is opt-in, so
+    // on a board where no pane asked for one the toggle has nothing to
+    // act on and the letter is the board's — `builtin_key` is told the
+    // same fact one line down, and the load-time refusal reads it from
+    // there, so the three cannot disagree about whose key this is.
+    let toggle_without_a_cursor = action == WatchAction::ToggleCursor && !cursor;
+    if (action != WatchAction::Ignore && !toggle_without_a_cursor)
+        || mode == FrameMode::Paused
+        || builtin_key(key, cursor).is_some()
+    {
         return action;
     }
     match bindings.iter().position(|declared| declared.key == key) {
@@ -14446,7 +14480,7 @@ mod tests {
             (Key::Char('F'), FrameMode::Live),
         ] {
             assert_eq!(action_for(key, blind), WatchAction::Ignore, "{key:?}");
-            assert!(builtin_key(key).is_some(), "{key:?} is still claimed");
+            assert!(builtin_key(key, true).is_some(), "{key:?} is still claimed");
         }
         // `Esc`'s two arms cover all three modes between them, so it is
         // the control case: claimed everywhere, blind nowhere.
@@ -14464,7 +14498,7 @@ mod tests {
         let blind_somewhere: Vec<Key> = crate::core::key_spelling::ascii_spellable()
             .into_iter()
             .filter(|key| {
-                builtin_key(*key).is_some()
+                builtin_key(*key, true).is_some()
                     && FRAME_MODES
                         .into_iter()
                         .any(|mode| action_for(*key, mode) == WatchAction::Ignore)
@@ -14481,22 +14515,28 @@ mod tests {
 
     #[test]
     fn a_claimed_key_says_what_it_already_does() {
-        assert_eq!(builtin_key(Key::Char('j')), Some("scrolls down one line"));
-        assert_eq!(builtin_key(Key::Char('q')), Some("quits"));
         assert_eq!(
-            builtin_key(Key::Enter),
+            builtin_key(Key::Char('j'), true),
+            Some("scrolls down one line")
+        );
+        assert_eq!(builtin_key(Key::Char('q'), true), Some("quits"));
+        assert_eq!(
+            builtin_key(Key::Enter, true),
             Some("zooms the focused pane, or pages the frame")
         );
         assert_eq!(
-            builtin_key(Key::Alt('1')),
+            builtin_key(Key::Alt('1'), true),
             Some("jumps the focus to a numbered pane")
         );
-        assert_eq!(builtin_key(Key::CtrlC), Some("aborts"));
+        assert_eq!(builtin_key(Key::CtrlC, true), Some("aborts"));
         assert_eq!(
-            builtin_key(Key::Char('s')),
+            builtin_key(Key::Char('s'), true),
             Some("raises or drops the pane's line cursor")
         );
-        assert_eq!(builtin_key(Key::Char('a')), None);
+        // The same key on a board where nothing asked for a cursor:
+        // unclaimed, and the board's own to bind.
+        assert_eq!(builtin_key(Key::Char('s'), false), None);
+        assert_eq!(builtin_key(Key::Char('a'), true), None);
     }
 
     #[test]
@@ -14507,7 +14547,7 @@ mod tests {
         // budget, and spending it should require looking at this line.
         let claimed: Vec<String> = crate::core::key_spelling::ascii_spellable()
             .into_iter()
-            .filter(|key| builtin_key(*key).is_some())
+            .filter(|key| builtin_key(*key, true).is_some())
             .map(crate::core::key_spelling::spelling_of)
             .collect();
         let mut expected: Vec<String> = Vec::new();
@@ -14534,19 +14574,39 @@ mod tests {
         let mut claimed = claimed;
         claimed.sort();
         assert_eq!(claimed, expected);
+
+        // And the whole cost of the cursor to the keyspace, as one
+        // assertion: a board where no pane asked for one is claimed
+        // EXACTLY as this repository was before the gesture existed.
+        // The set difference is the honest way to say that — a count
+        // would pass if a different key moved in the same change.
+        let without: Vec<String> = crate::core::key_spelling::ascii_spellable()
+            .into_iter()
+            .filter(|key| builtin_key(*key, false).is_some())
+            .map(crate::core::key_spelling::spelling_of)
+            .collect();
+        let given_back: Vec<&String> = expected.iter().filter(|k| !without.contains(k)).collect();
+        assert_eq!(given_back, ["s"], "only the cursor key is ever handed back");
     }
 
     #[test]
     fn the_free_lowercase_range_is_eight_letters() {
-        // The ceiling, as an assertion rather than a paragraph. `s` was
-        // the ninth and the line cursor spent it; this edit is the
-        // record of that spend, and it belongs in a diff.
+        // The ceiling, as an assertion rather than a paragraph. `s` is
+        // the ninth, and the line cursor spends it only on a board that
+        // asked for a cursor; this edit is the record of that spend,
+        // and it belongs in a diff.
         let free: String = ('a'..='z')
-            .filter(|c| builtin_key(Key::Char(*c)).is_none())
+            .filter(|c| builtin_key(Key::Char(*c), true).is_none())
             .collect();
         assert_eq!(free, "aeinorxy");
+        // A board with no cursor keeps `s` too, which is the majority
+        // case and the reason the claim is conditional at all.
+        let free_without: String = ('a'..='z')
+            .filter(|c| builtin_key(Key::Char(*c), false).is_none())
+            .collect();
+        assert_eq!(free_without, "aeinorsxy");
         // Bare digits are all free — only ALT-digits are bound.
-        assert!(('0'..='9').all(|c| builtin_key(Key::Char(c)).is_none()));
+        assert!(('0'..='9').all(|c| builtin_key(Key::Char(c), true).is_none()));
         // Every spellable NAMED key is claimed — the two that were free,
         // `Backspace` and `Delete`, are exactly the two the unix tap does
         // not deliver, so the spelling parser refuses them first and they
@@ -14555,7 +14615,7 @@ mod tests {
             crate::core::key_spelling::ascii_spellable()
                 .into_iter()
                 .filter(|key| !matches!(key, Key::Char(_) | Key::Alt(_)))
-                .all(|key| builtin_key(key).is_some()),
+                .all(|key| builtin_key(key, true).is_some()),
             "a board's real keyspace in v1 is characters and Alt-characters"
         );
     }
@@ -14655,7 +14715,7 @@ mod tests {
         // sees: no key ever comes back described as a binding.
         let binding_phrase = describes(WatchAction::RunBinding(0));
         for key in crate::core::key_spelling::ascii_spellable() {
-            assert_ne!(builtin_key(key), Some(binding_phrase), "{key:?}");
+            assert_ne!(builtin_key(key, true), Some(binding_phrase), "{key:?}");
         }
     }
     // ─── resolve_binding ────────────────────────────────────────────
@@ -14689,7 +14749,7 @@ mod tests {
         ];
         for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
             assert_eq!(
-                resolve_binding(WatchAction::Ignore, mode, Key::Char('r'), &bindings),
+                resolve_binding(WatchAction::Ignore, mode, Key::Char('r'), &bindings, true),
                 WatchAction::RunBinding(1),
                 "{mode:?}"
             );
@@ -14707,7 +14767,7 @@ mod tests {
         ];
         for mode in FRAME_MODES {
             assert_eq!(
-                resolve_binding(WatchAction::Ignore, mode, Key::Char('y'), &bindings),
+                resolve_binding(WatchAction::Ignore, mode, Key::Char('y'), &bindings, true),
                 WatchAction::Ignore,
                 "{mode:?}"
             );
@@ -14751,7 +14811,7 @@ mod tests {
         for action in actions {
             for mode in FRAME_MODES {
                 assert_eq!(
-                    resolve_binding(action, mode, Key::Char('r'), &bindings),
+                    resolve_binding(action, mode, Key::Char('r'), &bindings, true),
                     action,
                     "{action:?} in {mode:?}"
                 );
@@ -14766,16 +14826,24 @@ mod tests {
     /// is not tested at all.
     #[test]
     fn a_claimed_key_never_reaches_a_binding() {
-        for key in crate::core::key_spelling::ascii_spellable() {
-            if builtin_key(key).is_none() {
-                continue;
-            }
-            for mode in FRAME_MODES {
-                assert_eq!(
-                    resolve_binding(action_for(key, mode), mode, key, &[declared_binding(key)]),
-                    action_for(key, mode),
-                    "{key:?} mode={mode:?}"
-                );
+        for cursor in [false, true] {
+            for key in crate::core::key_spelling::ascii_spellable() {
+                if builtin_key(key, cursor).is_none() {
+                    continue;
+                }
+                for mode in FRAME_MODES {
+                    assert_eq!(
+                        resolve_binding(
+                            action_for(key, mode),
+                            mode,
+                            key,
+                            &[declared_binding(key)],
+                            cursor
+                        ),
+                        action_for(key, mode),
+                        "{key:?} mode={mode:?} cursor={cursor}"
+                    );
+                }
             }
         }
     }
@@ -14786,15 +14854,56 @@ mod tests {
         // declares no bindings takes exactly the dispatch it took
         // before boards could bind keys, for every key it is possible
         // to press.
-        for key in crate::core::key_spelling::ascii_spellable() {
-            for mode in FRAME_MODES {
-                assert_eq!(
-                    resolve_binding(action_for(key, mode), mode, key, &[]),
-                    action_for(key, mode),
-                    "{key:?} mode={mode:?}"
-                );
+        for cursor in [false, true] {
+            for key in crate::core::key_spelling::ascii_spellable() {
+                for mode in FRAME_MODES {
+                    assert_eq!(
+                        resolve_binding(action_for(key, mode), mode, key, &[], cursor),
+                        action_for(key, mode),
+                        "{key:?} mode={mode:?} cursor={cursor}"
+                    );
+                }
             }
         }
+    }
+
+    /// The one built-in that can hand its key back. A cursor is opt-in,
+    /// so on a board where no pane asked for one the toggle has nothing
+    /// to act on — and a key that answers nothing is a key the board
+    /// may bind for itself.
+    ///
+    /// Both directions matter, and the second is the sharper: the same
+    /// board with a pane that DID ask keeps the key, which is what
+    /// stops this being a hole in "built-ins always win".
+    #[test]
+    fn the_cursor_key_reaches_a_binding_only_where_no_pane_asked_for_a_cursor() {
+        let key = Key::Char('s');
+        let bindings = [declared_binding(key)];
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(
+                resolve_binding(action_for(key, mode), mode, key, &bindings, false),
+                WatchAction::RunBinding(0),
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                resolve_binding(action_for(key, mode), mode, key, &bindings, true),
+                WatchAction::ToggleCursor,
+                "a board that asked for a cursor keeps the key: mode={mode:?}"
+            );
+        }
+        // A frozen frame is inert for bindings exactly as it is for
+        // every pane gesture, and handing the key back does not change
+        // that.
+        assert_eq!(
+            resolve_binding(
+                action_for(key, FrameMode::Paused),
+                FrameMode::Paused,
+                key,
+                &bindings,
+                false
+            ),
+            action_for(key, FrameMode::Paused),
+        );
     }
 
     #[test]
@@ -14808,7 +14917,7 @@ mod tests {
         let chain = |key: Key, mode: FrameMode, panes: &PaneView| {
             let action = resolve_page_or_zoom(action_for(key, mode), mode, panes);
             let action = resolve_esc(action, panes);
-            resolve_binding(action, mode, key, &bindings)
+            resolve_binding(action, mode, key, &bindings, true)
         };
         let mut focused = PaneView::new(2);
         focused.focus = Some(SourceId(1));
@@ -14821,7 +14930,7 @@ mod tests {
             for mode in FRAME_MODES {
                 assert_eq!(
                     chain(Key::Char('r'), mode, &panes),
-                    resolve_binding(WatchAction::Ignore, mode, Key::Char('r'), &bindings),
+                    resolve_binding(WatchAction::Ignore, mode, Key::Char('r'), &bindings, true),
                     "{mode:?} panes={:?}",
                     panes.key()
                 );
@@ -15066,7 +15175,7 @@ mod tests {
             let action = resolve_page_or_zoom(action_for(key, mode), mode, panes);
             let action = resolve_cursor(action, mode, panes);
             let action = resolve_esc(action, panes);
-            resolve_binding(action, mode, key, &bindings)
+            resolve_binding(action, mode, key, &bindings, true)
         };
         let mut focused = PaneView::new(2);
         focused.focus = Some(SourceId(1));
@@ -15101,7 +15210,7 @@ mod tests {
                 // into the chain did not disturb the one below it.
                 assert_eq!(
                     chain(Key::Char('r'), mode, &panes),
-                    resolve_binding(WatchAction::Ignore, mode, Key::Char('r'), &bindings),
+                    resolve_binding(WatchAction::Ignore, mode, Key::Char('r'), &bindings, true),
                     "{mode:?} panes={:?}",
                     panes.key()
                 );
@@ -15121,7 +15230,8 @@ mod tests {
                 WatchAction::Ignore,
                 FrameMode::LiveScrolled,
                 Key::Char('r'),
-                &bindings
+                &bindings,
+                true
             ),
             WatchAction::RunBinding(0)
         );
@@ -15130,7 +15240,8 @@ mod tests {
                 WatchAction::Ignore,
                 FrameMode::Paused,
                 Key::Char('r'),
-                &bindings
+                &bindings,
+                true
             ),
             WatchAction::Ignore
         );
@@ -15153,7 +15264,8 @@ mod tests {
                 WatchAction::Ignore,
                 FrameMode::Live,
                 Key::Char('r'),
-                &bindings
+                &bindings,
+                true
             ),
             WatchAction::RunBinding(0)
         );

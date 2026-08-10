@@ -261,6 +261,21 @@ pub enum BindingOutput {
 }
 
 impl DashboardFile {
+    /// Whether any pane on this board asked for a line cursor — the
+    /// fact that decides whether the cursor key is rat's or the
+    /// board's.
+    ///
+    /// Answered off the DECLARATIONS, because the surface that needs it
+    /// runs before anything is resolved: a board whose key is not its
+    /// to bind should not pay for expansion first. Nothing here
+    /// expands, so that ordering is preserved. The inheritance rule is
+    /// the resolver's own, shared rather than restated.
+    pub fn takes_a_cursor(&self) -> bool {
+        self.panes
+            .iter()
+            .any(|decl| selectable(decl, &self.defaults))
+    }
+
     /// The ONE validation path: resolve defaults, parse every token,
     /// check the layout, build the registry. Every error names the
     /// pane and the fix.
@@ -1853,6 +1868,42 @@ mod tests {
             !ordinary.pane(SourceId(0)).expect("ordinary box").selectable,
             "a pane that asked for nothing takes no cursor"
         );
+    }
+
+    /// The board-level answer, read straight off the declarations
+    /// because the surface that needs it runs before anything is
+    /// resolved: does the cursor key mean anything on this board at all.
+    #[test]
+    fn a_board_takes_a_cursor_only_when_some_pane_asked_for_one() {
+        assert!(
+            !file(vec![pane("a", &["date"]), pane("b", &["date"])]).takes_a_cursor(),
+            "no pane asked"
+        );
+
+        let one = file(vec![
+            pane("a", &["date"]),
+            PaneDecl {
+                selectable: Some(true),
+                ..pane("b", &["date"])
+            },
+        ]);
+        assert!(one.takes_a_cursor(), "one pane is enough");
+
+        // Inherited, not merely declared — the same rule the box
+        // resolver applies, so the two can never answer differently
+        // about the same board.
+        let mut inherited = file(vec![pane("a", &["date"])]);
+        inherited.defaults.selectable = Some(true);
+        assert!(inherited.takes_a_cursor(), "a default reaches every pane");
+
+        // And a pane can opt back out of an inherited yes, all the way
+        // down to a board that takes no cursor after all.
+        let mut opted_out = file(vec![PaneDecl {
+            selectable: Some(false),
+            ..pane("a", &["date"])
+        }]);
+        opted_out.defaults.selectable = Some(true);
+        assert!(!opted_out.takes_a_cursor(), "the only pane opted back out");
     }
 
     #[test]

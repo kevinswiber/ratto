@@ -832,6 +832,54 @@ fn from_rest_the_cursor_gesture_finds_the_pane_that_asked_for_it() {
     );
 }
 
+/// The end-to-end half of handing the key back: on a board where no
+/// pane asked for a cursor, `s` is the board's own key and its binding
+/// actually RUNS.
+///
+/// The unit matrices pin the resolver and the load-time refusal
+/// separately, and the two can agree with each other while both are
+/// wrong about the loop. Only a real keypress on a real board proves
+/// the key reaches the command.
+#[test]
+fn a_board_with_no_cursor_may_bind_the_cursor_key_and_it_fires() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("ran.txt");
+    let script = dir.path().join("ran.sh");
+    write_script(&script, "printf 'the board ran it' > @OUT@\n", &out);
+    let board = format!(
+        "row-gap 0\n\n\
+         key \"s\" {{\n    description \"the board's own key\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+         pane \"a\" {{\n    height 4\n    border \"none\"\n    chrome #false\n    shell #true\n    interval \"1h\"\n    \
+         command \"printf 'A%s\\n' 01 02 03\"\n}}\n",
+        script = script.display(),
+    );
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"A03", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"s");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let ran = loop {
+        if std::fs::read_to_string(&out).is_ok_and(|text| text.contains("ran it")) {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+    };
+    assert!(ran, "the board's own binding never ran");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// The focused route, and the reason the FOCUS is not filtered the way
 /// the from-rest candidates are: a reader standing in a pane that asked
 /// for nothing gets a decline, not a jump somewhere else. Moving the

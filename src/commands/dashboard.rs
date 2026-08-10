@@ -110,7 +110,8 @@ pub(crate) fn validated(
     overrides: &Bindings,
 ) -> anyhow::Result<Board> {
     let (text, file) = read_and_parse(path, colored, overrides)?;
-    refuse_claimed_bindings(&file.bindings).with_context(|| format!("in {}", path.display()))?;
+    refuse_claimed_bindings(&file.bindings, file.takes_a_cursor())
+        .with_context(|| format!("in {}", path.display()))?;
     finish_load(path, &text, file, overrides)
 }
 
@@ -118,6 +119,13 @@ pub(crate) fn validated(
 /// writes `key "j"` gets an error naming what `j` already does — the
 /// alternative is a binding that quietly never fires, which is the
 /// worst outcome this grammar can produce.
+///
+/// `takes_a_cursor` is the board's own answer to whether any pane asked
+/// for a line cursor, and it is the one input that can un-claim a key:
+/// the cursor toggle has nothing to act on where nothing asked for it,
+/// so there the letter is the board's. It comes from the declarations
+/// rather than a registry, which is what keeps this check ahead of the
+/// load step.
 ///
 /// Takes the DECLARED form, and runs before the load step expands
 /// anything: it needs only the key and the spelling, both of which
@@ -128,9 +136,12 @@ pub(crate) fn validated(
 /// and not in `into_registry`, because its two inputs sit on opposite
 /// sides of the layering: the loop's table and the board's
 /// declaration.
-pub(crate) fn refuse_claimed_bindings(bindings: &[KeyBindingDecl]) -> anyhow::Result<()> {
+pub(crate) fn refuse_claimed_bindings(
+    bindings: &[KeyBindingDecl],
+    takes_a_cursor: bool,
+) -> anyhow::Result<()> {
     for binding in bindings {
-        if let Some(does) = crate::commands::watch::builtin_key(binding.key) {
+        if let Some(does) = crate::commands::watch::builtin_key(binding.key, takes_a_cursor) {
             // The author's own bytes, not a re-rendering: the error
             // quotes the line they wrote.
             let spelling = &binding.spelling;
@@ -552,7 +563,7 @@ fn check_board(args: CheckArgs, profile: ColorProfile) -> AppResult {
     // command must never build. A future board-validating route
     // carries the same two obligations: invoke the refusal, and add an
     // arm to the two-route integration test.
-    refuse_claimed_bindings(&file.bindings)
+    refuse_claimed_bindings(&file.bindings, file.takes_a_cursor())
         .with_context(|| format!("in {}", args.file.display()))?;
     // NOT resolve_variables: no command runs. The partial resolver
     // walks the same graph and returns Known for constants, -v
@@ -1070,7 +1081,7 @@ mod tests {
             // thing standing between that and a shipped release was a
             // pair of integration tests that happen to shell out to
             // `check` — this is the whole registry, in a unit test.
-            refuse_claimed_bindings(&file.bindings)
+            refuse_claimed_bindings(&file.bindings, file.takes_a_cursor())
                 .unwrap_or_else(|err| panic!("{} binds a claimed key: {err:#}", template.name));
             // No commands run: a template's shell=#true variables are
             // Opaque here, exactly as under `rat dashboard check`.
@@ -1359,7 +1370,7 @@ mod tests {
         use crate::ui::key::Key;
         let err = format!(
             "{:#}",
-            refuse_claimed_bindings(&[binding(Key::Char('j'))]).unwrap_err()
+            refuse_claimed_bindings(&[binding(Key::Char('j'))], true).unwrap_err()
         );
         assert_eq!(
             err,
@@ -1369,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn a_board_can_no_longer_bind_the_cursor_key() {
+    fn a_board_that_asked_for_a_cursor_can_no_longer_bind_the_cursor_key() {
         // The load-time half of the collision, through the surface a
         // board actually hits. The derivation and the refusal are
         // already proved to agree over the whole spellable space; what
@@ -1377,16 +1388,33 @@ mod tests {
         use crate::ui::key::Key;
         let err = format!(
             "{:#}",
-            refuse_claimed_bindings(&[binding(Key::Char('s'))]).unwrap_err()
+            refuse_claimed_bindings(&[binding(Key::Char('s'))], true).unwrap_err()
         );
         assert!(err.starts_with("key \"s\":"), "{err}");
         assert!(err.contains("line cursor"), "{err}");
     }
 
     #[test]
+    fn a_board_with_no_cursor_keeps_the_cursor_key_for_itself() {
+        // A cursor is opt-in, so on a board where no pane asked for one
+        // the key does nothing, and taking a letter away from every
+        // board to serve the few that use it is a cost with no matching
+        // benefit.
+        use crate::ui::key::Key;
+        refuse_claimed_bindings(&[binding(Key::Char('s'))], false)
+            .expect("a key the loop will not answer is the board's to bind");
+        // Nothing else moved with it: the keys claimed for gestures that
+        // work on every board stay claimed on every board.
+        assert!(
+            refuse_claimed_bindings(&[binding(Key::Char('j'))], false).is_err(),
+            "the scroll keys are claimed whatever the panes declared"
+        );
+    }
+
+    #[test]
     fn a_binding_on_a_free_key_is_accepted() {
         use crate::ui::key::Key;
-        refuse_claimed_bindings(&[binding(Key::Char('a')), binding(Key::Alt('x'))])
+        refuse_claimed_bindings(&[binding(Key::Char('a')), binding(Key::Alt('x'))], true)
             .expect("both free");
     }
 
@@ -1394,13 +1422,19 @@ mod tests {
     fn the_refusal_fires_for_exactly_the_keys_the_derivation_claims() {
         // The matrix again, through the surface a board actually hits —
         // so a refusal that reads the derivation correctly but applies it
-        // to the wrong field cannot pass.
-        for key in crate::core::key_spelling::ascii_spellable() {
-            assert_eq!(
-                refuse_claimed_bindings(&[binding(key)]).is_err(),
-                crate::commands::watch::builtin_key(key).is_some(),
-                "{key:?}"
-            );
+        // to the wrong field cannot pass. Run under BOTH answers to the
+        // cursor question, because the refusal and the loop have to
+        // agree about `s` in each: a key refused at load that the loop
+        // would have handed to the board costs the author a letter for
+        // nothing, and the reverse is a binding that never fires.
+        for cursor in [false, true] {
+            for key in crate::core::key_spelling::ascii_spellable() {
+                assert_eq!(
+                    refuse_claimed_bindings(&[binding(key)], cursor).is_err(),
+                    crate::commands::watch::builtin_key(key, cursor).is_some(),
+                    "{key:?} on a board where cursor={cursor}"
+                );
+            }
         }
     }
 
@@ -1409,11 +1443,14 @@ mod tests {
         use crate::ui::key::Key;
         let err = format!(
             "{:#}",
-            refuse_claimed_bindings(&[
-                binding(Key::Char('a')),
-                binding(Key::Char('q')),
-                binding(Key::Char('j'))
-            ])
+            refuse_claimed_bindings(
+                &[
+                    binding(Key::Char('a')),
+                    binding(Key::Char('q')),
+                    binding(Key::Char('j'))
+                ],
+                true
+            )
             .unwrap_err()
         );
         assert!(err.starts_with("key \"q\":"), "{err}");
