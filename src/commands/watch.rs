@@ -2085,6 +2085,16 @@ pub(crate) fn run_registry(
                             } else {
                                 let action =
                                     resolve_page_or_zoom(action_for(key, mode), mode, &panes);
+                                // Ahead of the Esc rung, because the
+                                // ladder reads in the order it peels:
+                                // the cursor comes off first, and the
+                                // frame rung below is the last thing to
+                                // run. It is also the seat that does not
+                                // depend on a cursor always having a
+                                // focus — if that ever stopped holding,
+                                // resolving Esc first would snap the
+                                // live tail back instead of peeling.
+                                let action = resolve_cursor(action, mode, &panes);
                                 let action = resolve_esc(action, &panes);
                                 // Last in the chain, and it reads that
                                 // way for a reason: it fires only on a
@@ -2195,6 +2205,83 @@ pub(crate) fn run_registry(
                                     &history,
                                 )?);
                             }
+                        }
+                        WatchAction::CursorMove(step) => {
+                            let Some(id) =
+                                scroll_target(mode_of(pause.as_ref(), live_scroll), &panes)
+                            else {
+                                continue;
+                            };
+                            // A pane whose body is off screen has no
+                            // window to move a mark in; the step declines
+                            // HERE, never by falling back to the whole
+                            // frame. The one predicate — a zoom overrules
+                            // a collapse, and the raw bit would freeze a
+                            // mark the reader can see.
+                            //
+                            // The scroll arm below reads the raw bit, so
+                            // on a collapsed-then-zoomed pane `j` moves a
+                            // cursor and declines a window step. Each is
+                            // right under its own rule; do not align them
+                            // while working here.
+                            if panes.body_hidden(id) {
+                                continue;
+                            }
+                            let Some(at) = panes.cursor[id.0] else {
+                                continue;
+                            };
+                            let total = runtime[id.0].output.as_ref().map_or(0, Vec::len);
+                            let window = geom[id.0].inner_rows as usize;
+                            let next = cursor_step(at, step, total, window);
+                            if next == Some(at) {
+                                // The mark did not move — a `k` at the
+                                // top, a `G` already at the bottom. No
+                                // repaint, so the gate is not disturbed.
+                                continue;
+                            }
+                            // `None` here is a body that emptied between
+                            // the tick and the keypress: the mark goes
+                            // with it, which is the same answer the next
+                            // tick's clamp would give.
+                            panes.cursor[id.0] = next;
+                            recompose_live(
+                                &mut live,
+                                &registry,
+                                &runtime,
+                                &geom,
+                                &panes,
+                                view.alt_time,
+                                &palette,
+                                profile,
+                            );
+                            let Some(live) = live.as_ref() else { continue };
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &live_tail,
+                                &palette,
+                                view,
+                                panes.key(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
+                                None,
+                                size,
+                                session.max_height,
+                                fullscreen,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
                         }
                         action @ (WatchAction::Scroll(_) | WatchAction::ScrollN(..)) => {
                             let (step, n) = match action {
@@ -3621,6 +3708,11 @@ enum WatchAction {
     /// from rest — a cursor that is not on the focused pane is a mark
     /// nothing can act on.
     ToggleCursor,
+    /// Move the focused pane's cursor by one step. The table NEVER
+    /// produces this: it is pane-blind by design, and whether a cursor
+    /// exists is pane state. The movement keys arrive as ordinary
+    /// scrolls and are retargeted where the pane view is visible.
+    CursorMove(ScrollStep),
     /// Run the board's declared binding at this index.
     ///
     /// The table above NEVER produces this: it is context-blind by
@@ -3861,6 +3953,11 @@ fn describes(action: WatchAction) -> &'static str {
         WatchAction::ToggleZoom => "zooms the focused pane",
         WatchAction::ToggleCollapse => "collapses or restores the focused pane",
         WatchAction::ToggleCursor => "raises or drops the pane's line cursor",
+        // Never reached through the claimed-key lookup — the table
+        // cannot answer with a cursor move, so this never comes back
+        // from it. The match is total on purpose, so give it the honest
+        // phrase rather than a panic.
+        WatchAction::CursorMove(_) => "moves the pane's line cursor",
         // Never reached through the claimed-key lookup — the key table
         // cannot answer with a binding, so this action never comes back
         // from it. The match is total on purpose, so give it the honest
@@ -3885,6 +3982,48 @@ fn scroll_phrase(step: ScrollStep) -> &'static str {
         ScrollStep::Top => "jumps to the top of the frame",
         ScrollStep::Bottom => "jumps to the bottom of the frame",
     }
+}
+
+/// The movement keys' meaning when the focused pane carries a line
+/// cursor: they move the CURSOR, not the pane's window. The same trick
+/// that gave panes a scroll without new keys, one level in — a reader
+/// who knows `j` and `k` already knows how to move the mark, and a
+/// nearly full keymap spends nothing.
+///
+/// Live frames only, scrolled or not, and the predicate is
+/// `scroll_target`'s rather than a fourth copy of it: a frozen frame is
+/// a composed string with no pane identity in it, so `j` there moves
+/// the frozen window, which is the only thing on screen with lines.
+///
+/// Only the FOCUSED pane's cursor is live. Cursors are per-pane and
+/// persist, so a board can hold several; the unfocused ones are marks
+/// waiting to be returned to, and neither the movement keys nor the
+/// exported selection reaches them.
+///
+/// `Scroll` only. A wheel notch arrives as `ScrollN` from a sibling arm
+/// of the event match that calls no resolver, and it is meant to stay a
+/// WINDOW gesture: a reader spinning the wheel is moving what they can
+/// see, not choosing a row.
+///
+/// A pane whose body is off screen is handled at the arm, where the
+/// scroll step's identical decline already is — there is no window on
+/// screen to move a mark in, and the key must never fall back to the
+/// whole frame.
+fn resolve_cursor(action: WatchAction, mode: FrameMode, panes: &PaneView) -> WatchAction {
+    let WatchAction::Scroll(step) = action else {
+        return action;
+    };
+    match cursor_at(mode, panes) {
+        Some(_) => WatchAction::CursorMove(step),
+        None => action,
+    }
+}
+
+/// The focused pane's cursor on a live frame, or `None`. The one place
+/// anything asks "is there a cursor to drive", shared by the retarget
+/// and by the Esc rung so the two can never disagree about it.
+fn cursor_at(mode: FrameMode, panes: &PaneView) -> Option<usize> {
+    panes.cursor[scroll_target(mode, panes)?.0]
 }
 
 /// Esc's ladder, resolved where the pane state is visible: leave the
@@ -4767,6 +4906,51 @@ fn pane_cursor_toggle(panes: &PaneView, id: SourceId, total: usize) -> Option<us
         return panes.cursor[id.0];
     }
     toggled_cursor(panes.cursor[id.0], panes.scroll[id.0], total)
+}
+
+/// One movement step, in the cursor's own units. It borrows
+/// `ScrollStep`'s vocabulary — a half is half a window, a page is a
+/// window, and `d` moves the mark exactly as far as it would have moved
+/// the view — but NOT `LiveScroll`'s clamp: a window stops at
+/// `total - window`, a cursor at `total - 1`. Sharing the clamp would
+/// make the bottom rows of every pane unselectable, which looks like a
+/// stuck key.
+///
+/// A zero window counts as one, the same treatment the window stepper
+/// gives it.
+///
+/// The bound is not computed here. `clamp_cursor` owns "the last line,
+/// and an empty body holds none", and a deliberate move is bounded by
+/// the same rule that holds a cursor inside a shrinking body — one
+/// clamp, not two that agree until someone edits one of them.
+///
+/// **Never `max_offset` in this path — not even `max_offset(total, 1)`.**
+/// That is the same number by arithmetic and the wrong sentence by
+/// meaning: its own doc calls it "the last offset that still fills the
+/// window", which is a rule about windows. It compiles, it passes every
+/// test here, and it quietly ties a selection's limit to a definition
+/// that is not about selections — so the next person who legitimately
+/// changes `max_offset` breaks selection without touching anything
+/// named cursor. No test can catch a value that is right for the wrong
+/// reason; this comment is the only place that can.
+///
+/// The window sizes a STEP and never bounds a selection. That is why
+/// `window` is a parameter here and deliberately absent from
+/// `clamp_cursor`.
+fn cursor_step(at: usize, step: ScrollStep, total: usize, window: usize) -> Option<usize> {
+    let window = window.max(1);
+    let half = (window / 2).max(1);
+    let moved = match step {
+        ScrollStep::LineDown => at.saturating_add(1),
+        ScrollStep::LineUp => at.saturating_sub(1),
+        ScrollStep::HalfDown => at.saturating_add(half),
+        ScrollStep::HalfUp => at.saturating_sub(half),
+        ScrollStep::PageDown => at.saturating_add(window),
+        ScrollStep::PageUp => at.saturating_sub(window),
+        ScrollStep::Top => 0,
+        ScrollStep::Bottom => total.saturating_sub(1),
+    };
+    clamp_cursor(Some(moved), total)
 }
 
 /// The viewport follows the focus: the smallest adjustment of the
@@ -11348,6 +11532,48 @@ mod tests {
     }
 
     #[test]
+    fn cursor_step_moves_by_the_windows_own_meanings_and_clamps_to_the_last_line() {
+        // Twenty lines in a fourteen-row window — the numbers the
+        // frame-scroll fixture uses, so this test and the pty arm talk
+        // about the same board. A half is half a window and a page is a
+        // window, so `d` moves the mark exactly as far as it would have
+        // moved the view.
+        let table: &[(usize, ScrollStep, usize, usize, Option<usize>)] = &[
+            (0, ScrollStep::LineDown, 20, 14, Some(1)),
+            (0, ScrollStep::LineUp, 20, 14, Some(0)),
+            // The bottom holds at the last LINE, not at the last offset
+            // that still fills the window — which here would be 6, and
+            // would make thirteen rows of this pane unselectable.
+            (19, ScrollStep::LineDown, 20, 14, Some(19)),
+            (5, ScrollStep::HalfDown, 20, 14, Some(12)),
+            (5, ScrollStep::HalfUp, 20, 14, Some(0)),
+            (5, ScrollStep::PageDown, 20, 14, Some(19)),
+            (18, ScrollStep::PageUp, 20, 14, Some(4)),
+            (7, ScrollStep::Top, 20, 14, Some(0)),
+            // The one step whose meaning genuinely differs between a
+            // window and a cursor.
+            (7, ScrollStep::Bottom, 20, 14, Some(19)),
+            // A body that emptied between the tick and the keypress has
+            // no line to hold. A locally-written `total - 1` would
+            // answer `Some(0)` here — a mark on line 1 of a pane with
+            // no lines.
+            (7, ScrollStep::Bottom, 0, 14, None),
+            // A zero window counts as one, the same treatment the window
+            // stepper gives it.
+            (3, ScrollStep::LineDown, 20, 0, Some(4)),
+            // An index the body has already outgrown clamps on the way.
+            (25, ScrollStep::LineUp, 20, 14, Some(19)),
+        ];
+        for (at, step, total, window, want) in table {
+            assert_eq!(
+                cursor_step(*at, *step, *total, *window),
+                *want,
+                "{step:?} from {at} over {total} lines in a {window}-row window"
+            );
+        }
+    }
+
+    #[test]
     fn cursor_target_is_the_focus_or_the_first_focusable_pane() {
         // Pane 0 is deliberately absent from the order — a board's first
         // declared pane may opt out of navigation, and a target picked
@@ -13621,6 +13847,286 @@ mod tests {
         scrolled.scroll[0] = LiveScroll::at(3, 30, 10);
         for panes in [PaneView::new(2), focused, zoomed, scrolled] {
             for mode in FRAME_MODES {
+                assert_eq!(
+                    chain(Key::Char('r'), mode, &panes),
+                    resolve_binding(WatchAction::Ignore, mode, Key::Char('r'), &bindings),
+                    "{mode:?} panes={:?}",
+                    panes.key()
+                );
+            }
+        }
+    }
+
+    /// A pane view with a cursor up on the focused pane — the only
+    /// state the cursor resolver reads. A fixture that set anything else
+    /// would keep passing if the resolver started reading it.
+    fn with_cursor(focus: SourceId, at: usize) -> PaneView {
+        let mut panes = PaneView::new(2);
+        panes.focus = Some(focus);
+        panes.cursor[focus.0] = Some(at);
+        panes
+    }
+
+    /// Every spelling of a movement key, paired with the step the table
+    /// answers for it. The arrows and page/home/end keys share the
+    /// table's rows with the letters, and a retarget written against the
+    /// KEY rather than the action would cover `j` and miss `Down`.
+    const MOVEMENT_SPELLINGS: [(Key, ScrollStep); 14] = [
+        (Key::Char('j'), ScrollStep::LineDown),
+        (Key::Down, ScrollStep::LineDown),
+        (Key::Char('k'), ScrollStep::LineUp),
+        (Key::Up, ScrollStep::LineUp),
+        (Key::Char('d'), ScrollStep::HalfDown),
+        (Key::Char('u'), ScrollStep::HalfUp),
+        (Key::Char('f'), ScrollStep::PageDown),
+        (Key::PageDown, ScrollStep::PageDown),
+        (Key::Char('b'), ScrollStep::PageUp),
+        (Key::PageUp, ScrollStep::PageUp),
+        (Key::Char('g'), ScrollStep::Top),
+        (Key::Home, ScrollStep::Top),
+        (Key::Char('G'), ScrollStep::Bottom),
+        (Key::End, ScrollStep::Bottom),
+    ];
+
+    #[test]
+    fn a_cursor_takes_every_movement_key_from_the_pane_window() {
+        let panes = with_cursor(SourceId(1), 4);
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            for (key, step) in MOVEMENT_SPELLINGS {
+                assert_eq!(
+                    resolve_cursor(action_for(key, mode), mode, &panes),
+                    WatchAction::CursorMove(step),
+                    "{key:?} mode={mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn without_a_cursor_the_resolver_is_the_identity() {
+        // The structural half of inertness, total: a board on which
+        // nobody has raised a cursor takes exactly the dispatch it took
+        // before cursors existed, for every key it is possible to press.
+        let mut focused = PaneView::new(2);
+        focused.focus = Some(SourceId(1));
+        for panes in [PaneView::new(2), focused] {
+            for key in crate::core::key_spelling::ascii_spellable() {
+                for mode in FRAME_MODES {
+                    assert_eq!(
+                        resolve_cursor(action_for(key, mode), mode, &panes),
+                        action_for(key, mode),
+                        "{key:?} mode={mode:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_paused_frame_never_retargets() {
+        // A frozen frame is a composed string with no pane identity left
+        // in it, so the frame's own window is the only thing on screen
+        // with lines to move. The cursor STATE survives a freeze —
+        // nothing clears it — it simply stops answering the keys.
+        let panes = with_cursor(SourceId(1), 4);
+        assert_eq!(
+            resolve_cursor(
+                action_for(Key::Char('j'), FrameMode::Paused),
+                FrameMode::Paused,
+                &panes
+            ),
+            WatchAction::Scroll(ScrollStep::LineDown)
+        );
+        assert_eq!(
+            resolve_cursor(
+                action_for(Key::Char('G'), FrameMode::Paused),
+                FrameMode::Paused,
+                &panes
+            ),
+            WatchAction::Scroll(ScrollStep::Bottom)
+        );
+    }
+
+    #[test]
+    fn a_scrolled_live_frame_still_moves_the_cursor() {
+        // The sibling trap as its own named test: a live pass once
+        // caught `mode == Live` gating in the field — every fixture had
+        // pressed its key at live rest. `LiveScrolled` is on the firing
+        // side; `Paused` is not.
+        let panes = with_cursor(SourceId(1), 4);
+        assert_eq!(
+            resolve_cursor(
+                action_for(Key::Char('j'), FrameMode::LiveScrolled),
+                FrameMode::LiveScrolled,
+                &panes
+            ),
+            WatchAction::CursorMove(ScrollStep::LineDown)
+        );
+        assert_eq!(
+            resolve_cursor(
+                action_for(Key::Char('j'), FrameMode::Paused),
+                FrameMode::Paused,
+                &panes
+            ),
+            WatchAction::Scroll(ScrollStep::LineDown)
+        );
+    }
+
+    #[test]
+    fn a_cursor_on_an_unfocused_pane_is_inert() {
+        // Cursors are per-pane and persist, so a board can hold several.
+        // Only the focused pane's answers the keys.
+        let mut panes = PaneView::new(2);
+        panes.cursor[0] = Some(3);
+        panes.focus = Some(SourceId(1));
+        for mode in FRAME_MODES {
+            assert_eq!(
+                resolve_cursor(action_for(Key::Char('j'), mode), mode, &panes),
+                WatchAction::Scroll(ScrollStep::LineDown),
+                "{mode:?}"
+            );
+        }
+        // The cursor was there all along; only the focus moved. That is
+        // what makes the half above a test of the predicate rather than
+        // of an empty vector.
+        panes.focus = Some(SourceId(0));
+        assert_eq!(
+            resolve_cursor(
+                action_for(Key::Char('j'), FrameMode::Live),
+                FrameMode::Live,
+                &panes
+            ),
+            WatchAction::CursorMove(ScrollStep::LineDown)
+        );
+    }
+
+    #[test]
+    fn every_other_action_passes_through_the_cursor_resolver_untouched() {
+        let panes = with_cursor(SourceId(1), 4);
+        let actions = [
+            WatchAction::Quit,
+            WatchAction::Abort,
+            WatchAction::Page,
+            WatchAction::PageOrZoom,
+            WatchAction::Help,
+            WatchAction::Snapshot,
+            WatchAction::Resume,
+            WatchAction::Freeze,
+            WatchAction::ScrubBack,
+            WatchAction::ScrubForward,
+            WatchAction::ToggleWrap,
+            WatchAction::ShiftLeft,
+            WatchAction::ShiftRight,
+            WatchAction::ToggleGutter,
+            WatchAction::ToggleHighlight,
+            WatchAction::ToggleTime,
+            WatchAction::ToggleMouse,
+            WatchAction::FocusNext,
+            WatchAction::FocusPrev,
+            WatchAction::FocusJump(2),
+            WatchAction::FocusMove(FocusDir::Left),
+            WatchAction::ToggleZoom,
+            WatchAction::ToggleCollapse,
+            WatchAction::ToggleCursor,
+            WatchAction::RunBinding(0),
+            WatchAction::Ignore,
+            // The load-bearing row: a wheel notch arrives as this from a
+            // sibling arm of the event match that calls no resolver, and
+            // it is meant to stay a WINDOW gesture — a reader spinning
+            // the wheel is moving what they can see, not choosing a row.
+            // The day wheel events do enter this chain, this line is
+            // what makes the question visible.
+            WatchAction::ScrollN(ScrollStep::LineDown, 3),
+        ];
+        for action in actions {
+            for mode in FRAME_MODES {
+                assert_eq!(
+                    resolve_cursor(action, mode, &panes),
+                    action,
+                    "{action:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pane_with_a_hidden_body_moves_nothing_and_never_hands_the_keys_back_to_the_frame() {
+        // The property, stated independently of where the decline
+        // lives: a movement key moves the mark exactly when the frame is
+        // live, the pane is focused, it holds a cursor, and its body is
+        // on screen. Written this way, moving the decline out of the arm
+        // and into the resolver would leave this green.
+        let moves = |panes: &PaneView, id: SourceId, mode: FrameMode| {
+            matches!(
+                resolve_cursor(action_for(Key::Char('j'), mode), mode, panes),
+                WatchAction::CursorMove(_)
+            ) && !panes.body_hidden(id)
+        };
+        let mut panes = with_cursor(SourceId(1), 4);
+        assert!(
+            moves(&panes, SourceId(1), FrameMode::Live),
+            "the ordinary case"
+        );
+
+        panes.collapsed[1] = true;
+        assert!(!moves(&panes, SourceId(1), FrameMode::Live), "dormant");
+
+        // The zoom put the body back on screen without clearing the bit,
+        // so the mark is visible and must move. A guard on the raw bit
+        // would freeze a mark the reader is looking straight at.
+        panes.zoomed = Some(SourceId(1));
+        assert!(moves(&panes, SourceId(1), FrameMode::Live));
+
+        // Another pane's zoom overrules nothing — zoom hides the rest of
+        // the frame, so this is exactly backwards from "is anything
+        // zoomed".
+        panes.zoomed = Some(SourceId(0));
+        assert!(!moves(&panes, SourceId(1), FrameMode::Live));
+    }
+
+    #[test]
+    fn the_cursor_seat_leaves_the_rest_of_the_chain_answering_the_same_thing() {
+        // The composed chain over a PaneView matrix that is NOT only
+        // rest: neither resolver around the new seat can eat or alter a
+        // retarget, and the binding seam below it is undisturbed.
+        let bindings = [declared_binding(Key::Char('r'))];
+        let chain = |key: Key, mode: FrameMode, panes: &PaneView| {
+            let action = resolve_page_or_zoom(action_for(key, mode), mode, panes);
+            let action = resolve_cursor(action, mode, panes);
+            let action = resolve_esc(action, panes);
+            resolve_binding(action, mode, key, &bindings)
+        };
+        let mut focused = PaneView::new(2);
+        focused.focus = Some(SourceId(1));
+        let mut zoomed = PaneView::new(2);
+        zoomed.focus = Some(SourceId(1));
+        zoomed.zoomed = Some(SourceId(1));
+        let mut scrolled = PaneView::new(2);
+        scrolled.focus = Some(SourceId(1));
+        scrolled.scroll[0] = LiveScroll::at(3, 30, 10);
+        let mut zoomed_cursor = with_cursor(SourceId(1), 4);
+        zoomed_cursor.zoomed = Some(SourceId(1));
+        let states = [
+            PaneView::new(2),
+            focused,
+            zoomed,
+            scrolled,
+            with_cursor(SourceId(1), 4),
+            zoomed_cursor,
+        ];
+        for panes in states {
+            for mode in FRAME_MODES {
+                for (key, _) in MOVEMENT_SPELLINGS {
+                    assert_eq!(
+                        chain(key, mode, &panes),
+                        resolve_cursor(action_for(key, mode), mode, &panes),
+                        "{key:?} {mode:?} panes={:?}",
+                        panes.key()
+                    );
+                }
+                // A declared, unclaimed key still reaches exactly the
+                // binding answer it reached before — inserting a seat
+                // into the chain did not disturb the one below it.
                 assert_eq!(
                     chain(Key::Char('r'), mode, &panes),
                     resolve_binding(WatchAction::Ignore, mode, Key::Char('r'), &bindings),

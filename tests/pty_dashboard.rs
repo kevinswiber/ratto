@@ -2787,6 +2787,106 @@ pane "b" {
     );
 }
 
+/// With a cursor up, the movement keys drive the MARK and leave the
+/// pane's own window where it is. Everything here happens off live rest
+/// — the frame is scrolled before the first gesture — because a key
+/// that only works at rest is the failure this fixture shape was built
+/// to catch.
+///
+/// Step 5 has to be a negative: nothing paints a mark yet, so a
+/// retargeted `j` recomposes to the same bytes and an identical frame
+/// writes nothing. There is no needle to wait for, by construction. The
+/// needle it waits *against* is sound because the pane's scroll badge
+/// does not exist at all while the pane is at rest — it appears if and
+/// only if this pane's window offset moved, which is exactly the claim.
+///
+/// Step 7 is the control, not a bonus. A pty assertion of the form
+/// "this never appeared" is worthless if the session stalled; the same
+/// key on the same channel produces the same needle once the cursor is
+/// dropped, so the session was alive and decoding keystrokes throughout.
+#[test]
+fn a_cursor_takes_the_scroll_keys_away_from_the_panes_own_window() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    session.write_bytes(b"j");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 2-23 of 30"],
+        Duration::from_secs(3),
+    );
+    session.write_bytes(b"\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"A01", b"focus a"],
+        Duration::from_secs(3),
+    );
+
+    // The mark starts at the top of pane a's window and moves one row
+    // down — still inside a fourteen-row window, so the window has no
+    // reason to follow it, now or once it learns how.
+    session.write_bytes(b"s");
+    session.write_bytes(b"j");
+    assert!(
+        !wait_for(
+            &session,
+            &mut terminal,
+            b"lines 2-15 of 20",
+            Duration::from_millis(800)
+        ),
+        "the pane's own window moved under a cursor"
+    );
+
+    session.write_bytes(b"s");
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"lines 2-15 of 20",
+            Duration::from_secs(3)
+        ),
+        "the same key on the same channel never arrived: the session was dead, \
+         not the retarget working"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// Focusing a pane below the fold scrolls the frame window down to it
 /// — the scroll keys must never drive a pane the reader cannot see —
 /// and the scrolled status row carries the focus segment.
