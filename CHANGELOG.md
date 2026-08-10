@@ -2,6 +2,49 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.19.0](https://github.com/kevinswiber/ratto/compare/26ad3ed1599f04fe47c7ea0b941e10bad99bdd72..v0.19.0) - 2026-08-10
+#### Features
+- ship a worked key-actions example and arm the review console - ([6234b95](https://github.com/kevinswiber/ratto/commit/6234b95299c5870e3534e2d7a9be8953b069e8f3)) - [@kevinswiber](https://github.com/kevinswiber)
+- report action activity in the status row - ([ee29b60](https://github.com/kevinswiber/ratto/commit/ee29b60e0f54dcd0247015ce011769044387cc93)) - [@kevinswiber](https://github.com/kevinswiber)
+- list a board's own keys in the help reference - ([357bc72](https://github.com/kevinswiber/ratto/commit/357bc72afeb03d747e82168585957171c545a666)) - [@kevinswiber](https://github.com/kevinswiber)
+- gate a binding behind its when, in the one order the ladder allows - ([cb7bc4d](https://github.com/kevinswiber/ratto/commit/cb7bc4db4daa98cf231add7f917fdc8681ba5fa9)) - [@kevinswiber](https://github.com/kevinswiber)
+- gate a binding's spawn behind its declared confirm - ([80f5233](https://github.com/kevinswiber/ratto/commit/80f5233a30db50d94e5473704d2fa0ff86d15d03)) - [@kevinswiber](https://github.com/kevinswiber)
+- report an action's end through the board's own notice row - ([f13eafe](https://github.com/kevinswiber/ratto/commit/f13eafe93f7bc7fb7297b50facfe8e8a664097d3)) - [@kevinswiber](https://github.com/kevinswiber)
+- run a key-action off the loop thread and drain its completion - ([a683fef](https://github.com/kevinswiber/ratto/commit/a683fef3e8716dc206ee437fa3762a7b8e2c6150)) - [@kevinswiber](https://github.com/kevinswiber)
+- build a key-action's child through the pane path's own seams - ([0fc6e6a](https://github.com/kevinswiber/ratto/commit/0fc6e6a51c52f1930b35cd8e12b5d25245d3b3f5)) - [@kevinswiber](https://github.com/kevinswiber)
+- resolve a declined key against the board's declared bindings - ([73dfdba](https://github.com/kevinswiber/ratto/commit/73dfdbaf79e62ae1a33b5209aec2d69046b52863)) - [@kevinswiber](https://github.com/kevinswiber)
+- give the dispatch vocabulary a binding action the table never answers - ([2f7ac59](https://github.com/kevinswiber/ratto/commit/2f7ac5968b11ed9da3a81935a3ce3e82618c6395)) - [@kevinswiber](https://github.com/kevinswiber)
+- refuse a binding on one of rat's own keys, naming what it does - ([d8ca20e](https://github.com/kevinswiber/ratto/commit/d8ca20e109deb2d55fc4487ed9bd0795a4e90fba)) - [@kevinswiber](https://github.com/kevinswiber)
+- let a board declare keybindings as top-level key nodes - ([57931c3](https://github.com/kevinswiber/ratto/commit/57931c34aaa54f55ca21e092ee53ba7162895fee)) - [@kevinswiber](https://github.com/kevinswiber)
+- spell a binding's key as the two-wire intersection - ([0823d77](https://github.com/kevinswiber/ratto/commit/0823d77b5235c7571335917b808c7e208ca68c6e)) - [@kevinswiber](https://github.com/kevinswiber)
+- add rat dashboard init — the examples ship with the binary - ([6bab286](https://github.com/kevinswiber/ratto/commit/6bab2863726395dce1d7c5f6216ae0408c07a21a)) - [@kevinswiber](https://github.com/kevinswiber)
+- add rat dashboard check — validate without executing - ([f26b8f7](https://github.com/kevinswiber/ratto/commit/f26b8f7ad47c2cc3ed0341b1b14f5495eb4747ae)) - [@kevinswiber](https://github.com/kevinswiber)
+- resolve load-time sites at load and close the linked-worktree gap - ([49030ce](https://github.com/kevinswiber/ratto/commit/49030ce32aec371e226d3a477aabfa9d19d49919)) - [@kevinswiber](https://github.com/kevinswiber)
+- expand pane programs at spawn time - ([a175b15](https://github.com/kevinswiber/ratto/commit/a175b15947a1e3d220fe9c380bcc41a8886aa7c1)) - [@kevinswiber](https://github.com/kevinswiber)
+- refuse a deferred reference at every load-time site - ([fb6adff](https://github.com/kevinswiber/ratto/commit/fb6adfffe2a4b8ffc8d630ddfed913185fa81e89)) - [@kevinswiber](https://github.com/kevinswiber)
+- re-derive deferred variables at each consuming spawn - ([a658a17](https://github.com/kevinswiber/ratto/commit/a658a17c2c60a61d45ed29c7645705d352cc1719)) - [@kevinswiber](https://github.com/kevinswiber)
+- word every derivation failure as a teaching load error - ([a848c8a](https://github.com/kevinswiber/ratto/commit/a848c8a8133c3f1f8183cecddc48b5e6b5c4c556)) - [@kevinswiber](https://github.com/kevinswiber)
+- derive shell command variables once at load - ([ef4aa3d](https://github.com/kevinswiber/ratto/commit/ef4aa3dbd98e31f93557ce06f2c7e81d2871e346)) - [@kevinswiber](https://github.com/kevinswiber)
+- add -v/--variable overrides for board variables - ([7ca7c72](https://github.com/kevinswiber/ratto/commit/7ca7c72af646884a2ff287ce30436b1336a337ab)) - [@kevinswiber](https://github.com/kevinswiber)
+- raw strings never interpolate - ([28e8838](https://github.com/kevinswiber/ratto/commit/28e88386f540e22d29ef9c5435b5da03d730331a)) - [@kevinswiber](https://github.com/kevinswiber)
+- validate template references at every string site at load - ([a2c64d5](https://github.com/kevinswiber/ratto/commit/a2c64d51d0e375f6d090d9fcf716ba4d6ce57218)) - [@kevinswiber](https://github.com/kevinswiber)
+- parse the variables block into a checked, ordered map - ([034a635](https://github.com/kevinswiber/ratto/commit/034a635ab02393dbbaf9a4043f54e167393dc463)) - [@kevinswiber](https://github.com/kevinswiber)
+- add the {{name}} template layer - ([13712ac](https://github.com/kevinswiber/ratto/commit/13712ac44c757ed90b294eaedd79ba9e4d50270a)) - [@kevinswiber](https://github.com/kevinswiber)
+- add non-focusable dashboard panes - ([a1184df](https://github.com/kevinswiber/ratto/commit/a1184df6f203cc2b6664aa10fdaa669482b90484)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- keep dashboard help within pane width - ([eaacb16](https://github.com/kevinswiber/ratto/commit/eaacb16d759f86286b56e677dc20c2adcb7a6fa6)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- spell out the properties the test comments name - ([5a0e6df](https://github.com/kevinswiber/ratto/commit/5a0e6df8e87568c218c7396d50a0bd294da01494)) - [@kevinswiber](https://github.com/kevinswiber)
+- name the handoff file and its guard, latency, and badge exemption - ([3555208](https://github.com/kevinswiber/ratto/commit/3555208a6a63449728cfe92cfd8fdfe71ef6880b)) - [@kevinswiber](https://github.com/kevinswiber)
+- teach the README where a side effect belongs - ([9b4c657](https://github.com/kevinswiber/ratto/commit/9b4c6579772680d64220bc08ee3eaf2394d809f5)) - [@kevinswiber](https://github.com/kevinswiber)
+- teach the variables layer where readers already are - ([cd55879](https://github.com/kevinswiber/ratto/commit/cd558797487b32fc4b20930e9f1f5d48a57cf68a)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Refactoring
+- rename the status-row tail parameter for what it carries - ([1615226](https://github.com/kevinswiber/ratto/commit/1615226da77d59e2e6abef34145e43f31c32207b)) - [@kevinswiber](https://github.com/kevinswiber)
+- free the walk's Key name for the key vocabulary - ([a95b8a9](https://github.com/kevinswiber/ratto/commit/a95b8a9c91619b533106a11409a9638a84321d54)) - [@kevinswiber](https://github.com/kevinswiber)
+- put Template's record behind accessors - ([c7e1d70](https://github.com/kevinswiber/ratto/commit/c7e1d706cbd3e26eb0e9aca47f3af7780827ddb9)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.18.0](https://github.com/kevinswiber/ratto/compare/3da69fd4da3c86237b1c068682d31aaf671f261b..v0.18.0) - 2026-08-06
 #### Features
 - the numbers keep counting past the jump keys - ([4c83a55](https://github.com/kevinswiber/ratto/commit/4c83a55407ab8cab2dc98b229e36b68b55aea75b)) - [@kevinswiber](https://github.com/kevinswiber)
