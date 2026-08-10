@@ -2594,6 +2594,95 @@ pub(crate) fn run_registry(
                                 &history,
                             )?);
                         }
+                        WatchAction::ToggleCursor => {
+                            if live.is_none() {
+                                continue;
+                            }
+                            // The gesture needs a boxed registry to have
+                            // a reading order at all; plain watch has no
+                            // pane to address.
+                            let Composition::Panes { layout, .. } = registry.composition() else {
+                                continue;
+                            };
+                            let order = focus_order(&registry, layout);
+                            let Some(id) = cursor_target(&panes, &order) else {
+                                continue;
+                            };
+                            let total = runtime[id.0].output.as_ref().map_or(0, Vec::len);
+                            let next = pane_cursor_toggle(&panes, id, total);
+                            if next == panes.cursor[id.0] {
+                                // Nothing to raise and nothing to drop —
+                                // an empty pane, or one whose body is
+                                // off screen. The gesture changes a
+                                // cursor or it changes nothing, and that
+                                // includes the focus it would otherwise
+                                // have implied: pressing the select key
+                                // on a pane with no line in it must not
+                                // quietly move the focus instead. No
+                                // repaint either, so the gate is
+                                // undisturbed.
+                                continue;
+                            }
+                            let moved_focus = panes.focus != Some(id);
+                            panes.cursor[id.0] = next;
+                            panes.focus = Some(id);
+                            recompose_live(
+                                &mut live,
+                                &registry,
+                                &runtime,
+                                &geom,
+                                &panes,
+                                view.alt_time,
+                                &palette,
+                                profile,
+                            );
+                            let Some(live) = live.as_ref() else { continue };
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            if moved_focus {
+                                // The other half of a focus landing:
+                                // bring the pane into view. A pane below
+                                // the fold would otherwise hold the keys
+                                // while off screen. Nothing about a
+                                // cursor changes a block's shape, so a
+                                // gesture that moved no focus leaves the
+                                // frame window exactly where it was.
+                                let window = usize::from(window_rows(session.max_height, size.1));
+                                live_scroll = refollow(
+                                    &registry,
+                                    &geom,
+                                    &panes,
+                                    live_scroll,
+                                    live.lines.len(),
+                                    window,
+                                );
+                            }
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &live_tail,
+                                &palette,
+                                view,
+                                panes.key(),
+                                &status_tail(
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    gate.as_ref(),
+                                    &running,
+                                    &session.bindings,
+                                ),
+                                None,
+                                size,
+                                session.max_height,
+                                fullscreen,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
                         WatchAction::ToggleZoom => {
                             if live.is_none() {
                                 continue;
@@ -3526,6 +3615,12 @@ enum WatchAction {
     ClearFocus,
     ToggleZoom,
     ToggleCollapse,
+    /// Raise or drop the focused pane's line cursor. With nothing
+    /// focused the gesture focuses the first pane in reading order and
+    /// raises a cursor there, the way every pane gesture already lands
+    /// from rest — a cursor that is not on the focused pane is a mark
+    /// nothing can act on.
+    ToggleCursor,
     /// Run the board's declared binding at this index.
     ///
     /// The table above NEVER produces this: it is context-blind by
@@ -3682,6 +3777,7 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         }
         Key::Char('z') if mode != FrameMode::Paused => WatchAction::ToggleZoom,
         Key::Space if mode != FrameMode::Paused => WatchAction::ToggleCollapse,
+        Key::Char('s') if mode != FrameMode::Paused => WatchAction::ToggleCursor,
         Key::Esc if mode != FrameMode::Paused => WatchAction::ClearFocus,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
@@ -3764,6 +3860,7 @@ fn describes(action: WatchAction) -> &'static str {
         WatchAction::ClearFocus => "drops the pane focus",
         WatchAction::ToggleZoom => "zooms the focused pane",
         WatchAction::ToggleCollapse => "collapses or restores the focused pane",
+        WatchAction::ToggleCursor => "raises or drops the pane's line cursor",
         // Never reached through the claimed-key lookup — the key table
         // cannot answer with a binding, so this action never comes back
         // from it. The match is total on purpose, so give it the honest
@@ -4622,6 +4719,54 @@ fn pane_scroll_badge(
 fn scroll_target(mode: FrameMode, panes: &PaneView) -> Option<SourceId> {
     let id = panes.focus?;
     matches!(mode, FrameMode::Live | FrameMode::LiveScrolled).then_some(id)
+}
+
+/// Which pane the cursor gesture addresses: the focused one, or — from
+/// rest — the first pane in reading order, which the gesture then
+/// focuses. `order` is the focusABLE reading order, so a board whose
+/// first declared pane opts out of navigation never receives a cursor
+/// no gesture could reach. An empty order declines, the same silent
+/// no-op every focus gesture already takes there.
+fn cursor_target(panes: &PaneView, order: &[SourceId]) -> Option<SourceId> {
+    panes.focus.or_else(|| order.first().copied())
+}
+
+/// The toggle's answer for one pane. A second press drops the cursor
+/// wherever it is; a first press raises it at the top of the pane's own
+/// window, which is where the reader is looking.
+///
+/// An empty body answers `None` rather than raising: there is no row to
+/// point at, and the tick's clamp would erase a cursor raised here
+/// anyway — raising and silently losing it is worse than declining.
+///
+/// The window's pin bit is deliberately not consulted. A pinned window
+/// rides its tail; a cursor never does, so it reads the offset the pin
+/// produced and then holds its own index.
+fn toggled_cursor(current: Option<usize>, scroll: LiveScroll, total: usize) -> Option<usize> {
+    match current {
+        Some(_) => None,
+        // The bound is the shared one, not a second copy of it: the
+        // same function that holds a cursor inside a body every tick
+        // decides whether a new one has a line to sit on at all.
+        None => clamp_cursor(Some(scroll.offset()), total),
+    }
+}
+
+/// What the cursor gesture leaves on one pane. A pane whose body is off
+/// screen answers "unchanged" — there is no line to mark, and the mark
+/// would be invisible anyway — which the caller reads as a complete
+/// no-op rather than as a cursor to clear.
+///
+/// The visibility question goes through the one predicate that reads
+/// the collapse bit and the zoom together: a zoom puts a collapsed
+/// pane's whole body back on screen without clearing the bit, so a
+/// gesture gated on the bit alone would refuse a pane the reader is
+/// looking straight at.
+fn pane_cursor_toggle(panes: &PaneView, id: SourceId, total: usize) -> Option<usize> {
+    if panes.body_hidden(id) {
+        return panes.cursor[id.0];
+    }
+    toggled_cursor(panes.cursor[id.0], panes.scroll[id.0], total)
 }
 
 /// The viewport follows the focus: the smallest adjustment of the
@@ -8463,11 +8608,30 @@ mod tests {
     }
 
     #[test]
-    fn s_is_the_snapshot_key() {
+    fn s_raises_the_cursor_and_uppercase_s_still_snapshots() {
         for mode in FRAME_MODES {
+            // `S` is untouched. The two spellings now BOTH do something,
+            // so the case distinction stops being cosmetic — this
+            // pairing is what catches a table row that matched the
+            // wrong one.
             assert_eq!(action_for(Key::Char('S'), mode), WatchAction::Snapshot);
-            assert_eq!(action_for(Key::Char('s'), mode), WatchAction::Ignore);
         }
+        // `LiveScrolled` is on the FIRING side, and that row is the one
+        // worth its own line: a board scrolled off its live rest is the
+        // state a fixture forgets to test, and a `mode == Live` guard
+        // passes every other assertion here.
+        assert_eq!(
+            action_for(Key::Char('s'), FrameMode::Live),
+            WatchAction::ToggleCursor
+        );
+        assert_eq!(
+            action_for(Key::Char('s'), FrameMode::LiveScrolled),
+            WatchAction::ToggleCursor
+        );
+        assert_eq!(
+            action_for(Key::Char('s'), FrameMode::Paused),
+            WatchAction::Ignore
+        );
     }
 
     #[test]
@@ -11147,6 +11311,96 @@ mod tests {
     }
 
     #[test]
+    fn toggled_cursor_raises_at_the_top_visible_line_and_drops_on_the_second_press() {
+        // Where a raised cursor LANDS is the worst failure this gesture
+        // can have — a reader acting on a line they are not looking at —
+        // so it is a table rather than a sample.
+        //
+        // The pinned row is not decoration: the window carries a pin bit
+        // and a tail pane rides its own bottom, but a cursor reads the
+        // offset that pin produced and then holds its own index. It
+        // never inherits the pin.
+        let at = |offset, total, window| LiveScroll::at(offset, total, window);
+        let pinned = LiveScroll::start(ScrollStep::Bottom, 20, 14);
+        assert_eq!((pinned.offset(), pinned.pinned()), (6, true), "premise");
+
+        let table: &[(Option<usize>, LiveScroll, usize, Option<usize>)] = &[
+            (None, at(0, 20, 14), 20, Some(0)),
+            // A scrolled pane raises at ITS top, not the body's.
+            (None, at(6, 20, 14), 20, Some(6)),
+            (None, pinned, 20, Some(6)),
+            (None, at(0, 0, 14), 0, None),
+            // A body that shrank between the tick and the keypress.
+            (None, at(8, 20, 14), 3, Some(2)),
+            (Some(0), at(0, 20, 14), 20, None),
+            // The second press drops it wherever it is.
+            (Some(11), at(6, 20, 14), 20, None),
+            (Some(4), at(0, 0, 14), 0, None),
+        ];
+        for (current, scroll, total, want) in table {
+            assert_eq!(
+                toggled_cursor(*current, *scroll, *total),
+                *want,
+                "cursor {current:?} at offset {} over {total} lines",
+                scroll.offset()
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_target_is_the_focus_or_the_first_focusable_pane() {
+        // Pane 0 is deliberately absent from the order — a board's first
+        // declared pane may opt out of navigation, and a target picked
+        // from the declaration order would drop a cursor into a pane no
+        // focus gesture can ever reach.
+        let order = [SourceId(1), SourceId(2)];
+        let mut panes = PaneView::new(3);
+        assert_eq!(cursor_target(&panes, &order), Some(SourceId(1)));
+        panes.focus = Some(SourceId(2));
+        assert_eq!(cursor_target(&panes, &order), Some(SourceId(2)));
+        // No focusable pane at all: the same silent no-op every focus
+        // gesture already takes there.
+        assert_eq!(cursor_target(&PaneView::new(3), &[]), None);
+    }
+
+    #[test]
+    fn the_toggle_declines_on_a_hidden_body_and_a_zoom_un_hides_it() {
+        // `collapsed[0]` is `true` in EVERY row here, including the one
+        // that raises — the raw bit is not the test. Zoom puts a
+        // collapsed pane's whole body back on screen without clearing
+        // the bit, so a cursor gated on the bit alone would be visible
+        // and unmovable. The predicate that reads both is pinned
+        // elsewhere; what this asserts is that the gesture asks it.
+        let mut panes = PaneView::new(2);
+        panes.collapsed[0] = true;
+
+        panes.zoomed = Some(SourceId(0));
+        assert_eq!(
+            pane_cursor_toggle(&panes, SourceId(0), 20),
+            Some(0),
+            "the zoom put the body on screen, so the gesture raises"
+        );
+
+        panes.zoomed = None;
+        assert_eq!(
+            pane_cursor_toggle(&panes, SourceId(0), 20),
+            None,
+            "a hidden body has no line to mark"
+        );
+
+        // Another pane's zoom overrules nothing — zoom hides the rest of
+        // the frame, so this is exactly backwards from "is anything
+        // zoomed".
+        panes.zoomed = Some(SourceId(1));
+        assert_eq!(pane_cursor_toggle(&panes, SourceId(0), 20), None);
+
+        // And the decline is "unchanged", not "cleared": a pane that
+        // already holds a cursor keeps it when its body goes off screen.
+        panes.cursor[0] = Some(4);
+        assert_eq!(pane_cursor_toggle(&panes, SourceId(0), 20), Some(4));
+    }
+
+    #[test]
     fn a_reanchor_holds_a_panes_offset_across_a_body_replacement() {
         // D4: a batch pane's body is REPLACED wholesale every run
         // (`record_output`), and the reader's place is positional. Holding
@@ -13018,9 +13272,12 @@ mod tests {
                         .any(|mode| action_for(*key, mode) == WatchAction::Ignore)
             })
             .collect();
-        assert_eq!(blind_somewhere.len(), 21);
+        assert_eq!(blind_somewhere.len(), 22);
         assert!(blind_somewhere.contains(&Key::Char('F')));
         assert!(blind_somewhere.contains(&Key::Alt('9')));
+        // Named, not just counted: the total alone would still pass if a
+        // DIFFERENT key silently gained a guard in the same change.
+        assert!(blind_somewhere.contains(&Key::Char('s')));
         assert!(!blind_somewhere.contains(&Key::Esc));
     }
 
@@ -13037,6 +13294,10 @@ mod tests {
             Some("jumps the focus to a numbered pane")
         );
         assert_eq!(builtin_key(Key::CtrlC), Some("aborts"));
+        assert_eq!(
+            builtin_key(Key::Char('s')),
+            Some("raises or drops the pane's line cursor")
+        );
         assert_eq!(builtin_key(Key::Char('a')), None);
     }
 
@@ -13064,8 +13325,8 @@ mod tests {
         );
         expected.extend(
             [
-                "b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "p", "q", "t", "u", "v", "w",
-                "z", "D", "F", "G", "S", "?", "<", ",", ">", ".",
+                "b", "c", "d", "f", "g", "h", "j", "k", "l", "m", "p", "q", "s", "t", "u", "v",
+                "w", "z", "D", "F", "G", "S", "?", "<", ",", ">", ".",
             ]
             .map(str::to_string),
         );
@@ -13078,14 +13339,14 @@ mod tests {
     }
 
     #[test]
-    fn the_free_lowercase_range_is_nine_letters() {
-        // The ceiling, as an assertion rather than a paragraph. The
-        // cursor work takes `s` and this becomes eight; that edit is the
-        // record of the spend, and it belongs in a diff.
+    fn the_free_lowercase_range_is_eight_letters() {
+        // The ceiling, as an assertion rather than a paragraph. `s` was
+        // the ninth and the line cursor spent it; this edit is the
+        // record of that spend, and it belongs in a diff.
         let free: String = ('a'..='z')
             .filter(|c| builtin_key(Key::Char(*c)).is_none())
             .collect();
-        assert_eq!(free, "aeinorsxy");
+        assert_eq!(free, "aeinorxy");
         // Bare digits are all free — only ALT-digits are bound.
         assert!(('0'..='9').all(|c| builtin_key(Key::Char(c)).is_none()));
         // Every spellable NAMED key is claimed — the two that were free,

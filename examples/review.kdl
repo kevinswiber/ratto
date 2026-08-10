@@ -6,7 +6,7 @@
 //   rat dashboard examples/review.kdl
 //
 // The board reads its selection from a handoff file: a small file the
-// `s` binding below writes and these panes trigger on. The state lives
+// `x` binding below writes and these panes trigger on. The state lives
 // in that file, in the filesystem — the panes only read it, which is
 // also why it can still be driven by hand from another terminal:
 //
@@ -71,17 +71,19 @@ pane "diff" {
 // file, and the panes above find out through their own triggers — the
 // dashboard itself keeps nothing. `hide` is the right disposition for
 // a write whose effect is already visible in the frame.
-key "s" {
+// `s` raises the line cursor in the focused pane, so the write half of
+// this console answers to `x`, and clearing moves up to `X`.
+key "x" {
     description "select the first changed file"
     shell #true
     output "hide"
     command "git diff --name-only HEAD | head -n 1 > \"{{sel}}\""
 }
 
-key "x" {
+key "X" {
     description "clear the selection"
     // The guard half: a `when` on the same handoff file, so pressing
-    // `x` with nothing selected declines instead of running.
+    // `X` with nothing selected declines instead of running.
     when "test -s \"{{sel}}\""
     shell #true
     output "hide"

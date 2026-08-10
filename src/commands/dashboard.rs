@@ -1043,6 +1043,13 @@ mod tests {
         for template in TEMPLATES {
             let file = crate::core::dashboard_kdl::parse_styled(template.body, false)
                 .unwrap_or_else(|err| panic!("{} parses: {err:#}", template.name));
+            // A template binding one of rat's own keys is a board `init`
+            // hands the reader pre-broken. Until this line, the only
+            // thing standing between that and a shipped release was a
+            // pair of integration tests that happen to shell out to
+            // `check` — this is the whole registry, in a unit test.
+            refuse_claimed_bindings(&file.bindings)
+                .unwrap_or_else(|err| panic!("{} binds a claimed key: {err:#}", template.name));
             // No commands run: a template's shell=#true variables are
             // Opaque here, exactly as under `rat dashboard check`.
             let partial = resolve_partial(&file.variables, &Bindings::default());
@@ -1337,6 +1344,21 @@ mod tests {
             "key \"j\": `j` is one of rat's own keys — it scrolls down one line. \
              Press `?` on any board for the full list, then pick a key it does not name"
         );
+    }
+
+    #[test]
+    fn a_board_can_no_longer_bind_the_cursor_key() {
+        // The load-time half of the collision, through the surface a
+        // board actually hits. The derivation and the refusal are
+        // already proved to agree over the whole spellable space; what
+        // this pins is the SENTENCE the author reads.
+        use crate::ui::key::Key;
+        let err = format!(
+            "{:#}",
+            refuse_claimed_bindings(&[binding(Key::Char('s'))]).unwrap_err()
+        );
+        assert!(err.starts_with("key \"s\":"), "{err}");
+        assert!(err.contains("line cursor"), "{err}");
     }
 
     #[test]

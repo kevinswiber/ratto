@@ -551,15 +551,15 @@ fn constant_row(interval: &str) -> String {
 /// The interactive route's witness, and the only test in this file's
 /// selection work that presses a key: nothing sends a keystroke down a
 /// pipe, so the piped witnesses would pass just as happily against a
-/// build that had already given `s` a meaning.
+/// build in which `s` already did something.
 ///
-/// `s` is inert today — the dispatch table answers `Ignore` for it in
-/// every frame mode — and this is the byte-level companion to that
-/// unit fact. It is also the BEFORE measurement for the toggle: when
-/// `s` gains a meaning, this test's silence assertion is expected to
-/// invert, and the commit that inverts it says so.
+/// Both halves matter. The silence BEFORE the keypress is the property
+/// the piped witnesses rest on, measured here on a board that keeps
+/// completing. The frame moving after it is the gesture landing at
+/// rest — from rest `s` has no focus to act on, so it lands one, and
+/// the status row says whose.
 #[test]
-fn a_settled_board_stays_silent_and_s_does_nothing() {
+fn a_settled_board_stays_silent_until_s_raises_a_cursor() {
     let dir = tempfile::tempdir().expect("tempdir");
     let decl = write_dashboard(dir.path(), &constant_row("200ms"));
     let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
@@ -577,15 +577,27 @@ fn a_settled_board_stays_silent_and_s_does_nothing() {
     // Drain the tail of the first composition, then require silence.
     // `drain_for`, not a single `read_available`: the latter returns
     // after its FIRST read, and a first-composition tail larger than
-    // one read would land in the silence window as a false repaint.
+    // one read would land in the window and read as a repaint — which
+    // would make the positive assertion below false in exactly the same
+    // way it would have made a negative one false.
     let _ = drain_for(&session, Duration::from_millis(500));
-    session.write_bytes(b"s");
     let quiet = session.read_available(Duration::from_millis(800));
     assert!(
         quiet.is_empty(),
-        "the board painted {} bytes after s: {:?}",
+        "a settled board repainted {} bytes on its own: {:?}",
         quiet.len(),
         String::from_utf8_lossy(&quiet)
+    );
+
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"focus left",
+            Duration::from_secs(3)
+        ),
+        "s did not reach the first pane"
     );
     session.write_bytes(b"q");
     assert!(
@@ -2699,6 +2711,73 @@ pane "b" {
         !contains(&seen, "live ·".as_bytes()),
         "a focused scroll step must not re-enter the frame scroll: {:?}",
         String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The same trap, re-armed for a new gesture: a board taller than the
+/// window, already scrolled, with nothing focused. `s` must reach the
+/// dispatch there — a gesture gated on the unscrolled live frame would
+/// be silently inert — land the focus on the first pane in reading
+/// order, and bring that pane back into view.
+///
+/// The focus is what makes this observable at all: nothing paints a
+/// cursor yet, so the mark is invisible. The landing is not.
+#[test]
+fn s_from_rest_focuses_the_first_pane_and_brings_it_into_view() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // 30 composed rows in a 22-row window: pane b's head is the last
+    // thing visible at rest.
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    // No focus: `j` scrolls the whole frame.
+    session.write_bytes(b"j");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 2-23 of 30"],
+        Duration::from_secs(3),
+    );
+
+    session.write_bytes(b"s");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"A01", b"focus a"],
+        Duration::from_secs(3),
     );
 
     session.write_bytes(b"q");
