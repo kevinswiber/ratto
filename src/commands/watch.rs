@@ -1404,10 +1404,14 @@ pub(crate) fn run_registry(
                 if !gate_claims(&gate, prepared.activation) {
                     continue;
                 }
-                let Some(Gate::Preparing { binding: index, .. }) = gate else {
+                let Some(Gate::Preparing {
+                    binding: index,
+                    selection,
+                    ..
+                }) = gate.take()
+                else {
                     continue;
                 };
-                gate = None;
                 gate_moved = true;
                 let binding = &session.bindings[index];
                 let width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
@@ -1437,6 +1441,7 @@ pub(crate) fn run_registry(
                             id: prepared.activation,
                             binding: index,
                             vars,
+                            selection,
                         };
                         // A rung that needs the reader's attention may
                         // only be armed on a live frame: the paused
@@ -3429,6 +3434,11 @@ pub(crate) fn run_registry(
                                     &mut ids,
                                     &tx,
                                     width,
+                                    // Read HERE, on the keypress, and
+                                    // nowhere else: this is the frame
+                                    // the reader was looking at when
+                                    // they pressed the key.
+                                    selection_snapshot(&panes, &registry, &runtime),
                                     crate::core::child::spawn_preparation,
                                 ) {
                                     ActivationStart::Pending(pending) => {
@@ -4411,6 +4421,69 @@ struct ViewState {
     /// Presentation only — each row keeps its meaning, and both rows
     /// always share one style.
     alt_time: bool,
+}
+
+/// The line the reader was looking at when they pressed a bound key.
+///
+/// Captured ONCE per activation, at the keypress, and carried through
+/// every asynchronous rung. Owned strings on purpose: a pane-and-index
+/// coordinate resolved at the spawn would read whatever the pane's body
+/// says THEN, and a pane re-runs its child on a timer with no keypress
+/// involved — so the reader would act on a line they never saw. That is
+/// the worst failure this feature can have, and it is silent.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Selection {
+    /// The DECLARED pane id (`pane "id"`), never an index.
+    pane: String,
+    /// 1-based, into the pane's RETAINED body — never a viewport row.
+    line: usize,
+    /// The selected line's text, as the pane retained it.
+    text: String,
+}
+
+/// The focused pane's cursor line, as three exportable values — the ONE
+/// reader of cursor state for export, called from the ONE place an
+/// activation opens.
+///
+/// "Active" means PRESENT AND VISIBLE: a cursor whose pane's body is
+/// off screen is dormant and exports nothing, because handing a command
+/// a line the reader cannot see is the worst failure this feature can
+/// have. Visible is `body_hidden`'s question, not the collapse bit's —
+/// zoom overrules collapse, so a collapsed-but-zoomed pane is showing
+/// its whole body and DOES export.
+///
+/// Dormant, not cleared — the index survives the collapse and is
+/// exported again on expand; the status row is what tells the reader it
+/// is still there.
+///
+/// Every other arm is a real "no selection" too, answered with `None`
+/// rather than a panic or an empty string: no focus, no cursor in the
+/// focused pane, a pane that has not produced output yet, an index past
+/// the body. That last one belongs to the reanchor helper, not this
+/// function — the cursor is clamped there every tick, and a SECOND
+/// clamp here would be a second reconcile drifting from the first. What
+/// this owes is totality, so a clamp bug is a missing variable rather
+/// than a panic on the loop thread.
+fn selection_snapshot(
+    panes: &PaneView,
+    registry: &Registry,
+    runtime: &[SourceRuntime],
+) -> Option<Selection> {
+    let id = panes.focus?;
+    // Dormant while the body is off screen — the ONE predicate the
+    // renderer uses, never a second reading of the collapse bit, which
+    // zoom overrules. Gated HERE rather than by clearing the cursor on
+    // collapse, so expanding restores exactly what the reader had.
+    if panes.body_hidden(id) {
+        return None;
+    }
+    let index = (*panes.cursor.get(id.0)?)?;
+    let text = runtime.get(id.0)?.output.as_ref()?.get(index)?.clone();
+    Some(Selection {
+        pane: registry.spec(id).id.clone(),
+        line: index + 1,
+        text,
+    })
 }
 
 /// Per-pane view state: what the pane gestures move and the composer
@@ -5868,6 +5941,7 @@ fn launch_guard(
         shell,
         ActionScript::None,
         appearance,
+        ctx.selection.as_ref(),
     );
     spawn_action(
         spawn,
@@ -5988,9 +6062,18 @@ fn expand_action(
         &binding.shell,
         script,
         appearance,
+        ctx.selection.as_ref(),
     ))
 }
 
+/// Deliberately NOT parameterized by the cursor selection its
+/// key-action sibling takes, and the absence is a decision rather than
+/// an oversight. A pane child's environment is fixed at its spawn and
+/// reused for the pane's whole life, so making it depend on where the
+/// cursor is would mean respawning every pane on every cursor movement,
+/// or handing the child a value that was true once. A selection reaches
+/// a pane the way any other action result does: the action writes a
+/// file and the pane triggers on it.
 fn build_source_command(
     program: &ResolvedProgram,
     shell: &ShellMode,
@@ -6068,6 +6151,12 @@ fn build_action_command(
     shell: &ShellMode,
     script: ActionScript,
     appearance: Appearance,
+    // The activation's snapshot, or `None` when the focused pane had
+    // no live cursor. REQUIRED rather than a setter: both routes into
+    // this function — the command and its `when` — must answer, and a
+    // caller that could forget is a `when` that judges a different line
+    // from the command it guards.
+    selection: Option<&Selection>,
 ) -> ActionSpawn {
     // The command and the file's owner are produced TOGETHER, because
     // they leave together: `ActionSpawn` is one value precisely so the
@@ -6115,6 +6204,15 @@ fn build_action_command(
     };
     command.stdin(std::process::Stdio::null());
     command.env("RAT_APPEARANCE", appearance.as_str());
+    // The selection joins the environment the same way the appearance
+    // does — a value handed to a NEW process. Nothing here goes near
+    // stdin: no key is ever forwarded to a child, and a selection is
+    // not a keystroke.
+    if let Some(sel) = selection {
+        command.env("RAT_SELECTION", &sel.text);
+        command.env("RAT_SELECTION_PANE", &sel.pane);
+        command.env("RAT_SELECTION_LINE", sel.line.to_string());
+    }
     // All three fields from the ONE construction point — no caller
     // attaches anything afterwards, because a caller that forgets is a
     // shutdown race nobody sees.
@@ -6714,6 +6812,12 @@ struct Activation {
     /// be a time-of-check/time-of-use split inside one activation,
     /// precisely what a guard exists to prevent.
     vars: Bindings,
+    /// The line the reader was looking at when they pressed the key,
+    /// or `None` when the focused pane had no live cursor. Snapshotted
+    /// at the keypress and owned from there, so the guard and the
+    /// command judge the same line however long the rungs between them
+    /// take — and a pane's child re-running on its timer cannot move it.
+    selection: Option<Selection>,
 }
 
 /// The ONE activation currently in its gate — see the loop-local
@@ -6724,7 +6828,17 @@ enum Gate {
     /// Preparation is on a worker. The identity and the binding, but
     /// no map — and that honesty is the point: the type cannot
     /// represent a prepared-but-unprepared activation.
-    Preparing { id: ActivationId, binding: usize },
+    Preparing {
+        id: ActivationId,
+        binding: usize,
+        /// Unlike the map, this EXISTS at the keypress — it is the line
+        /// the reader was looking at — so it is carried rather than
+        /// deferred. Dropping it here would lose the snapshot on
+        /// exactly the boards with a deferred variable: the slowest
+        /// path, and the one where the cursor is likeliest to have
+        /// moved.
+        selection: Option<Selection>,
+    },
     /// `when` is running.
     Guarding(Activation),
     /// The question is on the status row; the next KEY decides.
@@ -6893,6 +7007,12 @@ enum ActivationStart {
 /// `ids` is the loop's allocator and minting happens HERE, inside the
 /// seam production also calls — otherwise a test can only compare ids
 /// it supplied itself, which proves nothing about allocation.
+///
+/// Wide on purpose: this is the ONE door an activation opens through,
+/// so everything that is true of a keypress and of nothing later is
+/// decided in one statement. Narrowing it by letting a caller attach a
+/// field afterwards is the shape that lets a caller forget.
+#[allow(clippy::too_many_arguments)]
 fn begin_activation<S>(
     binding: usize,
     decl: &KeyBinding,
@@ -6900,6 +7020,13 @@ fn begin_activation<S>(
     ids: &mut ActivationIds,
     tx: &std::sync::mpsc::Sender<TickEvent>,
     width: usize,
+    // The line the reader was looking at when they pressed the key,
+    // snapshotted by the CALLER at the dispatch arm and moved in here.
+    // A parameter rather than something this function reads, because
+    // the view and the runtime vector are the loop's and this seam is
+    // unit-tested without either. Required and owned: every path that
+    // opens an activation must answer, and the compiler asks.
+    selection: Option<Selection>,
     spawn: S,
 ) -> ActivationStart
 where
@@ -6934,6 +7061,7 @@ where
                 id,
                 binding,
                 vars: map,
+                selection,
             }),
             Err(err) => ActivationStart::Declined(declined(&err)),
         };
@@ -6949,7 +7077,11 @@ where
     // ActionPrepared that is never coming — a keyboard wedged until
     // the reader quits.
     match spawn(id, binding, prepare, tx.clone()) {
-        Ok(()) => ActivationStart::Pending(Gate::Preparing { id, binding }),
+        Ok(()) => ActivationStart::Pending(Gate::Preparing {
+            id,
+            binding,
+            selection,
+        }),
         Err(err) => ActivationStart::Declined(declined(&err)),
     }
 }
@@ -14863,6 +14995,273 @@ mod tests {
             .collect()
     }
 
+    /// A two-pane registry with a body under each pane and the focus on
+    /// `right`, which is the shape every selection test starts from.
+    fn selection_fixture() -> (Registry, Vec<SourceRuntime>, PaneView) {
+        let registry = two_weighted_panes();
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        runtime[1].output = Some(vec![
+            "r0".to_string(),
+            "r1".to_string(),
+            "r2".to_string(),
+            "r3".to_string(),
+        ]);
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(1));
+        panes.cursor[1] = Some(2);
+        (registry, runtime, panes)
+    }
+
+    #[test]
+    fn a_focused_panes_cursor_becomes_three_values() {
+        // The declared id rather than an index, a 1-based line over a
+        // 0-based index, and the text at that index — all three in one
+        // assertion, so an off-by-one cannot hide behind a right-looking
+        // neighbour.
+        let (registry, runtime, panes) = selection_fixture();
+        assert_eq!(
+            selection_snapshot(&panes, &registry, &runtime),
+            Some(Selection {
+                pane: "right".to_string(),
+                line: 3,
+                text: "r2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn every_way_of_having_no_selection_answers_none() {
+        let (registry, runtime, base) = selection_fixture();
+        assert!(
+            selection_snapshot(&base, &registry, &runtime).is_some(),
+            "the fixture itself must have a selection, or every arm below is vacuous"
+        );
+
+        drop(base);
+        drop(runtime);
+        // A pane that has never run, and one that ran and printed
+        // nothing: different values in the tree, one answer here.
+        let never_ran = || vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let with_body = || {
+            let mut r = never_ran();
+            r[1].output = Some(
+                ["r0", "r1", "r2", "r3"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            );
+            r
+        };
+        let printed_nothing = || {
+            let mut r = never_ran();
+            r[1].output = Some(Vec::new());
+            r
+        };
+        let focused_with_cursor = || {
+            let mut panes = PaneView::new(registry.len());
+            panes.focus = Some(SourceId(1));
+            panes.cursor[1] = Some(2);
+            panes
+        };
+        let unfocused = || {
+            let mut panes = PaneView::new(registry.len());
+            panes.cursor[1] = Some(2);
+            panes
+        };
+        let no_cursor = || {
+            let mut panes = PaneView::new(registry.len());
+            panes.focus = Some(SourceId(1));
+            panes
+        };
+        let past_the_end = || {
+            let mut panes = focused_with_cursor();
+            panes.cursor[1] = Some(4);
+            panes
+        };
+
+        for (why, panes, runtime) in [
+            ("no focus", unfocused(), with_body()),
+            ("no cursor in the focused pane", no_cursor(), with_body()),
+            ("a pane that never ran", focused_with_cursor(), never_ran()),
+            (
+                "a pane that printed nothing",
+                focused_with_cursor(),
+                printed_nothing(),
+            ),
+            // Answered, never clamped: the reconcile clamps this every
+            // tick, and a second clamp here would drift from the first
+            // the day a call site is added. What this owes is totality,
+            // so a clamp bug is a missing variable and not a panic on
+            // the loop thread.
+            ("an index past the body's end", past_the_end(), with_body()),
+        ] {
+            assert_eq!(
+                selection_snapshot(&panes, &registry, &runtime),
+                None,
+                "{why}"
+            );
+        }
+
+        // A pane whose body is off screen holds a DORMANT cursor: it
+        // exports nothing, and the index survives untouched so
+        // expanding restores exactly what the reader had.
+        let runtime = with_body();
+        let mut hidden = focused_with_cursor();
+        hidden.collapsed[1] = true;
+        assert_eq!(selection_snapshot(&hidden, &registry, &runtime), None);
+        assert_eq!(hidden.cursor[1], Some(2), "dormant, never cleared");
+
+        // And the arm a raw collapse-bit reading gets backwards: a zoom
+        // overrules a collapse, so this pane's body fills the screen and
+        // its cursor is anything but dormant.
+        hidden.zoomed = Some(SourceId(1));
+        assert!(
+            selection_snapshot(&hidden, &registry, &runtime).is_some(),
+            "a zoomed pane is showing its whole body"
+        );
+    }
+
+    #[test]
+    fn a_selection_reaches_the_built_command_as_three_variables() {
+        let sel = Selection {
+            pane: "diff".to_string(),
+            line: 7,
+            text: "+ let x = 42;".to_string(),
+        };
+        let spawn = build_action_command(
+            &ResolvedProgram::Argv(vec!["true".into()]),
+            &ShellMode::Direct,
+            ActionScript::None,
+            Appearance::Dark,
+            Some(&sel),
+        );
+        let envs = action_envs(&spawn.command);
+        assert_eq!(
+            envs.get("RAT_SELECTION_PANE").map(String::as_str),
+            Some("diff")
+        );
+        assert_eq!(
+            envs.get("RAT_SELECTION_LINE").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            envs.get("RAT_SELECTION").map(String::as_str),
+            Some("+ let x = 42;")
+        );
+        // The guard against a tail that REPLACED the shipped
+        // environment instead of joining it.
+        assert!(envs.contains_key("RAT_APPEARANCE"));
+    }
+
+    #[test]
+    fn a_command_built_without_a_selection_carries_none_of_the_three() {
+        // The presence assertion is not decoration: three absences are
+        // satisfied perfectly by a builder that sets no environment at
+        // all, or by a command that was never built.
+        let spawn = build_action_command(
+            &ResolvedProgram::Argv(vec!["true".into()]),
+            &ShellMode::Direct,
+            ActionScript::None,
+            Appearance::Dark,
+            None,
+        );
+        let envs = action_envs(&spawn.command);
+        assert!(!envs.contains_key("RAT_SELECTION"));
+        assert!(!envs.contains_key("RAT_SELECTION_PANE"));
+        assert!(!envs.contains_key("RAT_SELECTION_LINE"));
+        assert!(envs.contains_key("RAT_APPEARANCE"));
+    }
+
+    #[test]
+    fn an_activation_carries_the_selection_it_was_opened_with() {
+        // Both storage shapes, because they are different sites: the
+        // fast path writes it straight onto the activation, and the
+        // deferred path parks it on the gate and moves it out when
+        // preparation lands. A test covering only the fast path passes
+        // against a gate that dropped the snapshot — the "works, except
+        // on boards with a deferred variable" regression.
+        let sel = |n: usize| Selection {
+            pane: "left".to_string(),
+            line: n,
+            text: format!("L{n}"),
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ids = ActivationIds::default();
+        let plain = declared_binding(Key::Char('r'));
+        let start = begin_activation(
+            0,
+            &plain,
+            &SpawnVariables::default(),
+            &mut ids,
+            &tx,
+            80,
+            Some(sel(3)),
+            crate::core::child::spawn_preparation,
+        );
+        let ActivationStart::Prepared(ctx) = start else {
+            panic!("a template-free binding prepares inline");
+        };
+        assert_eq!(ctx.selection, Some(sel(3)));
+
+        let mut deferred = declared_binding(Key::Char('e'));
+        deferred.program =
+            crate::core::dashboard_file::BindingProgram::Argv(vec![Template::extract(
+                "tool {{head}}",
+            )]);
+        let start = begin_activation(
+            1,
+            &deferred,
+            &deferred_vars("head"),
+            &mut ids,
+            &tx,
+            80,
+            Some(sel(9)),
+            crate::core::child::spawn_preparation,
+        );
+        let ActivationStart::Pending(Gate::Preparing { selection, .. }) = start else {
+            panic!("a deferred reference takes the worker");
+        };
+        assert_eq!(selection, Some(sel(9)));
+    }
+
+    #[test]
+    fn the_guard_and_the_command_are_built_from_the_same_selection() {
+        // Compared to each other rather than to a literal, so the test
+        // cannot drift from the fixture — the claim is that one
+        // activation yields one selection down both routes.
+        let sel = Selection {
+            pane: "right".to_string(),
+            line: 4,
+            text: "r3".to_string(),
+        };
+        let ctx = Activation {
+            id: ActivationId(1),
+            binding: 0,
+            vars: Bindings::new(),
+            selection: Some(sel),
+        };
+        let mut binding = declared_binding(Key::Char('r'));
+        binding.when = Some(Template::extract("true"));
+        binding.when_shell = Some(ShellMode::Platform);
+        let registry = two_weighted_panes();
+        let scripts = ScriptFiles::materialize(&registry, std::slice::from_ref(&binding))
+            .expect("no shebang bodies to write");
+        let command = expand_action(&binding, 0, &ctx, &scripts, Appearance::Dark)
+            .expect("the command builds");
+        let guard = build_action_command(
+            &ResolvedProgram::Script("true".to_string()),
+            binding.when_shell.as_ref().expect("a resolved when shell"),
+            ActionScript::None,
+            Appearance::Dark,
+            ctx.selection.as_ref(),
+        );
+        let (a, b) = (action_envs(&command.command), action_envs(&guard.command));
+        for name in ["RAT_SELECTION", "RAT_SELECTION_PANE", "RAT_SELECTION_LINE"] {
+            assert_eq!(a.get(name), b.get(name), "{name}");
+            assert!(a.contains_key(name), "{name} reached neither route");
+        }
+    }
+
     #[test]
     fn an_action_command_runs_the_declared_argv_verbatim() {
         let program =
@@ -14872,6 +15271,7 @@ mod tests {
             &ShellMode::Direct,
             ActionScript::None,
             Appearance::Dark,
+            None,
         );
         assert_eq!(program_of(&spawn.command), "some-tool");
         assert_eq!(argv_of(&spawn.command), ["--flag", "value"]);
@@ -14888,6 +15288,7 @@ mod tests {
             &ShellMode::Named("fish".to_string()),
             ActionScript::None,
             Appearance::Dark,
+            None,
         );
         assert_eq!(program_of(&spawn.command), "fish");
         assert_eq!(argv_of(&spawn.command), ["-c", "echo hi"]);
@@ -14914,13 +15315,19 @@ mod tests {
             &inherited.shell,
             ActionScript::None,
             Appearance::Dark,
+            None,
         );
         assert_eq!(program_of(&spawn.command), "fish");
         let own = resolve(
             "defaults { shell \"fish\"\nheight 3 }\nkey \"r\" { description \"x\"\ncommand \"echo hi\"\nshell \"sh\" }\npane \"a\" { command \"true\"\nheight 3 }\n",
         );
-        let spawn =
-            build_action_command(&program, &own.shell, ActionScript::None, Appearance::Dark);
+        let spawn = build_action_command(
+            &program,
+            &own.shell,
+            ActionScript::None,
+            Appearance::Dark,
+            None,
+        );
         assert_eq!(program_of(&spawn.command), "sh");
     }
 
@@ -14932,6 +15339,7 @@ mod tests {
             &ShellMode::Named("sh".to_string()),
             ActionScript::None,
             Appearance::Dark,
+            None,
         );
         assert_eq!(program_of(&spawn.command), "sh");
         assert_eq!(argv_of(&spawn.command), ["-c", "echo hi"]);
@@ -14950,6 +15358,7 @@ mod tests {
                 dir: std::sync::Arc::clone(&dir),
             },
             Appearance::Dark,
+            None,
         );
         match SHEBANG_ARM {
             ShebangArm::Kernel => assert_eq!(spawn.command.get_program(), path.as_os_str()),
@@ -14981,6 +15390,7 @@ mod tests {
             &ShellMode::Platform,
             script,
             Appearance::Dark,
+            None,
         );
         let out = spawn.command.output().expect("the child spawns");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
@@ -15036,6 +15446,7 @@ mod tests {
                 dir: std::sync::Arc::clone(&dir),
             },
             Appearance::Dark,
+            None,
         );
         let owned_script =
             activation_script(&dir, "key-0-7", "#!/bin/sh\necho owned-ran").expect("write");
@@ -15044,6 +15455,7 @@ mod tests {
             &ShellMode::Platform,
             owned_script,
             Appearance::Dark,
+            None,
         );
         drop(scripts);
         drop(dir);
@@ -15089,6 +15501,7 @@ mod tests {
             &ShellMode::Platform,
             first,
             Appearance::Dark,
+            None,
         );
         let child_one = first
             .command
@@ -15101,6 +15514,7 @@ mod tests {
             &ShellMode::Platform,
             second,
             Appearance::Dark,
+            None,
         );
         let child_two = second
             .command
@@ -15150,6 +15564,7 @@ mod tests {
             &ShellMode::Direct,
             ActionScript::None,
             Appearance::Light,
+            None,
         );
         let envs = action_envs(&spawn.command);
         assert_eq!(
@@ -15183,6 +15598,7 @@ mod tests {
             &ShellMode::Direct,
             ActionScript::None,
             Appearance::Dark,
+            None,
         );
         let out = spawn.command.output().expect("the child spawns");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "eof");
@@ -15461,6 +15877,7 @@ mod tests {
                 id: ActivationId(1),
                 binding: 0,
                 vars: crate::core::template::Bindings::new(),
+                selection: None,
             },
             question: "confirm `e`: Really? [y/N]".to_string(),
         };
@@ -15613,6 +16030,7 @@ mod tests {
             id: ActivationId(id),
             binding,
             vars: crate::core::template::Bindings::new(),
+            selection: None,
         };
         let arrived = ActivationId(9);
         assert!(!gate_claims(&None, arrived), "no gate claims nothing");
@@ -15634,7 +16052,8 @@ mod tests {
         assert!(gate_claims(
             &Some(Gate::Preparing {
                 id: ActivationId(9),
-                binding: 0
+                binding: 0,
+                selection: None,
             }),
             arrived
         ));
@@ -15674,6 +16093,7 @@ mod tests {
             &mut ids,
             &tx,
             80,
+            None,
             crate::core::child::spawn_preparation,
         );
         assert!(
@@ -15697,6 +16117,7 @@ mod tests {
             &mut ids,
             &tx,
             80,
+            None,
             crate::core::child::spawn_preparation,
         );
         assert!(
@@ -15727,14 +16148,16 @@ mod tests {
                 "tool {{head}}",
             )]);
         let vars = deferred_vars("head");
-        let start = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, |_, _, _, _| {
+        let start = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, None, |_, _, _, _| {
             Err(std::io::Error::other("no threads"))
         });
         let ActivationStart::Declined(line) = start else {
             panic!("an OS refusal declines instead of wedging");
         };
         assert!(line.contains("`r`"), "{line}");
-        let start = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, |_, _, _, _| Ok(()));
+        let start = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, None, |_, _, _, _| {
+            Ok(())
+        });
         assert!(
             matches!(start, ActivationStart::Pending(_)),
             "the next activation still starts — the gate was never taken"
@@ -15756,8 +16179,12 @@ mod tests {
                 "tool {{head}}",
             )]);
         let vars = deferred_vars("head");
-        let first = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, |_, _, _, _| Ok(()));
-        let second = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, |_, _, _, _| Ok(()));
+        let first = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, None, |_, _, _, _| {
+            Ok(())
+        });
+        let second = begin_activation(0, &binding, &vars, &mut ids, &tx, 80, None, |_, _, _, _| {
+            Ok(())
+        });
         let (
             ActivationStart::Pending(Gate::Preparing { id: a, .. }),
             ActivationStart::Pending(Gate::Preparing { id: b, .. }),

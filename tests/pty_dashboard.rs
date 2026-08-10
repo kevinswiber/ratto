@@ -1347,6 +1347,533 @@ fn raising_a_cursor_never_restarts_a_child() {
     );
 }
 
+/// A binding body that writes the selection environment to a file.
+///
+/// Written from Rust rather than spelled inside the board, because a
+/// shell-quoted body has to survive TWO escaping layers — Rust's
+/// `format!` and KDL's string escapes — and a board that fails to load
+/// reports itself as "the first frame never painted".
+const DUMP_SH: &str = "\
+{
+  echo \"PANE=${RAT_SELECTION_PANE-}\"
+  echo \"LINE=${RAT_SELECTION_LINE-}\"
+  echo \"TEXT=${RAT_SELECTION-}\"
+} > @OUT@
+";
+
+fn write_script(path: &std::path::Path, body: &str, out: &std::path::Path) {
+    std::fs::write(path, body.replace("@OUT@", &out.display().to_string())).expect("write script");
+}
+
+/// Read the dumper's output as (pane, line, text), once it exists.
+fn read_dump(out: &std::path::Path) -> Option<(String, String, String)> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(out) {
+            let field = |key: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(key))
+                    .map(str::to_string)
+            };
+            if let (Some(p), Some(l), Some(t)) = (field("PANE="), field("LINE="), field("TEXT=")) {
+                return Some((p, l, t));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
+/// One numbered pane and a binding that dumps its environment. The body
+/// is `L01`…`L30`, so the exported text encodes the line it came from
+/// and the test can check the pair against each other.
+fn numbered_pane_board(dir: &std::path::Path, height: u16) -> (std::path::PathBuf, String) {
+    let out = dir.join("dump.txt");
+    let script = dir.join("dump.sh");
+    write_script(&script, DUMP_SH, &out);
+    let board = format!(
+        "row-gap 0\n\n\
+         key \"x\" {{\n    description \"dump\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+         pane \"numbered\" {{\n    height {height}\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
+         command \"for i in $(seq -w 1 30); do echo L$i; done\"\n}}\n",
+        script = script.display(),
+    );
+    (out, board)
+}
+
+/// The presence anchor for the whole export: a binding's command sees
+/// the line the cursor is on, as three variables.
+///
+/// Self-checking on purpose. WHERE the toggle first places a cursor is
+/// a separate decision that may change; the coordinate's MEANING is the
+/// contract. A test asserting a literal line number couples this to
+/// that decision and gets "fixed" in the wrong file.
+#[test]
+fn a_binding_sees_the_line_under_the_cursor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (out, board) = numbered_pane_board(dir.path(), 10);
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"L05", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"s");
+    session.write_bytes(b"j");
+    session.write_bytes(b"j");
+    // Wait on bytes the fixture guarantees before firing: the status
+    // row naming the cursor is proof the gestures landed, and firing
+    // into an unsettled loop is how a fixture reports a contract
+    // failure it did not have.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 3/30",
+            Duration::from_secs(3)
+        ),
+        "the cursor never reached the third line"
+    );
+    session.write_bytes(b"x");
+    let (pane, line, text) = read_dump(&out).expect("the binding never dumped its environment");
+    assert_eq!(pane, "numbered");
+    let n: usize = line.parse().expect("a numeric line");
+    assert_eq!(text, format!("L{n:02}"), "line {n} carried the wrong text");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The exported index is into the pane's retained body, not into what
+/// the reader can currently see. Driving the pane's own window to the
+/// tail and marking a row there must produce an index larger than the
+/// window could ever address.
+#[test]
+fn the_exported_line_is_a_body_index_not_a_viewport_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Nine content rows under a chrome row: any index past nine can
+    // only be a body coordinate.
+    let (out, board) = numbered_pane_board(dir.path(), 10);
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"L05", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"focus numbered",
+            Duration::from_secs(3)
+        ),
+        "the focus never landed"
+    );
+    session.write_bytes(b"G");
+    assert!(
+        wait_for(&session, &mut terminal, b"L30", Duration::from_secs(3)),
+        "the pane's window never reached its tail"
+    );
+    session.write_bytes(b"s");
+    session.write_bytes(b"x");
+    let (_, line, text) = read_dump(&out).expect("the binding never dumped its environment");
+    let n: usize = line.parse().expect("a numeric line");
+    assert_eq!(text, format!("L{n:02}"));
+    assert!(n > 9, "a viewport row could never exceed the window: {n}");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The both-routes property, end to end: a `when` reads the same
+/// selection its command does.
+///
+/// The passing arm is what makes the declining arm mean anything — a
+/// guard that declines because it never saw the variable is
+/// indistinguishable from one that declined correctly, until the same
+/// guard passes once the cursor moves.
+#[test]
+fn a_when_reads_the_selection_and_declines_on_the_wrong_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let guard = dir.path().join("guard.sh");
+    // Written from Rust for the same reason the dumper is: the body is
+    // shell-quoted and would otherwise cross two escaping layers.
+    std::fs::write(&guard, "[ \"${RAT_SELECTION_LINE:-0}\" -ge 3 ]\n").expect("write the guard");
+    let board = format!(
+        "row-gap 0\n\n\
+         key \"r\" {{\n    description \"act\"\n    shell #true\n    output \"hide\"\n    \
+         when \"sh {guard}\"\n    command \"{counter_cmd}\"\n}}\n\n\
+         pane \"numbered\" {{\n    height 10\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
+         command \"for i in $(seq -w 1 30); do echo L$i; done\"\n}}\n",
+        guard = guard.display(),
+        counter_cmd = counter_cmd(&counter),
+    );
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"L05", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    // Cursor on line 1: the guard must decline. Presence first — a
+    // report naming the binding — then the absence.
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 1/30",
+            Duration::from_secs(3)
+        ),
+        "the cursor never landed"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(&session, &mut terminal, b"declined", Duration::from_secs(5)),
+        "the guard never reported"
+    );
+    assert_counter_settled_at(&counter, 0);
+
+    // Move to line 3 and the same guard passes, which is the only way
+    // to know it read a live selection.
+    session.write_bytes(b"j");
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 3/30",
+            Duration::from_secs(3)
+        ),
+        "the cursor never reached the third line"
+    );
+    session.write_bytes(b"r");
+    wait_for_counter(&counter, 1);
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A frame scroll moves the frame, not any pane's body — so the
+/// exported index is the same off live rest as at it.
+#[test]
+fn a_binding_from_a_frame_scrolled_board_still_exports_the_selection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("dump.txt");
+    let script = dir.path().join("dump.sh");
+    write_script(&script, DUMP_SH, &out);
+    let board = format!(
+        "row-gap 0\n\n\
+         defaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n}}\n\n\
+         key \"x\" {{\n    description \"dump\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+         pane \"a\" {{\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n\
+         pane \"b\" {{\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}}\n",
+        script = script.display(),
+    );
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    // Off live rest BEFORE the gesture: without this wait the test
+    // silently presses at rest and proves nothing about a scrolled
+    // board.
+    session.write_bytes(b"j");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 2-23 of 30"],
+        Duration::from_secs(3),
+    );
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "the focus never landed"
+    );
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 1/20",
+            Duration::from_secs(3)
+        ),
+        "the cursor never landed"
+    );
+    session.write_bytes(b"x");
+    let (pane, line, text) = read_dump(&out).expect("the binding never dumped its environment");
+    assert_eq!(pane, "a");
+    assert_eq!(line, "1", "a frame scroll moves the frame, not the body");
+    assert_eq!(text, "A01");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A zoomed pane's cursor is the one exported, by its declared id.
+#[test]
+fn a_zoomed_panes_cursor_is_the_one_exported() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("dump.txt");
+    let script = dir.path().join("dump.sh");
+    write_script(&script, DUMP_SH, &out);
+    let board = format!(
+        "row-gap 0\n\n\
+         defaults {{\n    height 5\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n}}\n\n\
+         key \"x\" {{\n    description \"dump\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+         pane \"first\" {{\n    command \"printf 'A%s\\n' 01 02 03\"\n}}\n\
+         pane \"second\" {{\n    command \"printf 'B%s\\n' 01 02 03\"\n}}\n",
+        script = script.display(),
+    );
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B03", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"focus second",
+            Duration::from_secs(3)
+        ),
+        "the focus never reached the second pane"
+    );
+    session.write_bytes(b"z");
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 1/3",
+            Duration::from_secs(3)
+        ),
+        "the cursor never landed on the zoomed pane"
+    );
+    session.write_bytes(b"x");
+    let (pane, line, text) = read_dump(&out).expect("the binding never dumped its environment");
+    assert_eq!(pane, "second");
+    assert_eq!(line, "1");
+    assert_eq!(text, "B01");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A cursor left behind in a pane the focus has moved away from is a
+/// bookmark, not a selection: nothing exports it. The anchor is the
+/// second half — focusing back and firing again does export it, so the
+/// absence is the focus rule and not a broken fixture.
+#[test]
+fn a_cursor_left_in_an_unfocused_pane_is_not_exported() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("dump.txt");
+    let script = dir.path().join("dump.sh");
+    write_script(&script, DUMP_SH, &out);
+    let board = format!(
+        "row-gap 0\n\n\
+         defaults {{\n    height 5\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n}}\n\n\
+         key \"x\" {{\n    description \"dump\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+         pane \"first\" {{\n    command \"printf 'A%s\\n' 01 02 03\"\n}}\n\
+         pane \"second\" {{\n    command \"printf 'B%s\\n' 01 02 03\"\n}}\n",
+        script = script.display(),
+    );
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B03", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 1/3",
+            Duration::from_secs(3)
+        ),
+        "the cursor never landed on the first pane"
+    );
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"focus second",
+            Duration::from_secs(3)
+        ),
+        "the focus never moved on"
+    );
+    session.write_bytes(b"x");
+    let (pane, line, text) = read_dump(&out).expect("the binding never dumped its environment");
+    assert_eq!(
+        (pane.as_str(), line.as_str(), text.as_str()),
+        ("", "", ""),
+        "an unfocused pane's cursor must not be exported"
+    );
+
+    std::fs::remove_file(&out).expect("clear the dump");
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 1/3",
+            Duration::from_secs(3)
+        ),
+        "the focus never returned"
+    );
+    session.write_bytes(b"x");
+    let (pane, line, text) = read_dump(&out).expect("the binding never dumped its environment");
+    assert_eq!(
+        (pane.as_str(), line.as_str(), text.as_str()),
+        ("first", "1", "A01")
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The highest `Vnnn` value in a byte stream — the ticking fixture
+/// below prints one such line per run, monotonic and fixed-width, so
+/// "which body was on screen" is an exact question.
+fn highest_tick(bytes: &[u8]) -> Option<u32> {
+    let mut best: Option<u32> = None;
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if bytes[i] == b'V' && bytes[i + 1..i + 4].iter().all(u8::is_ascii_digit) {
+            let n: u32 = std::str::from_utf8(&bytes[i + 1..i + 4])
+                .expect("digits")
+                .parse()
+                .expect("three digits");
+            best = Some(best.map_or(n, |b| b.max(n)));
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+/// THE capture-point test: the reader acts on the line they were
+/// looking at when they pressed the key, not on whatever occupies that
+/// index by the time the command finally spawns.
+///
+/// The window between the two is not a microsecond race to be chased —
+/// a `confirm` is modal and waits for a human, so the test OWNS the
+/// window. It presses the key, waits for the pane's child to re-run and
+/// replace the body on screen, and only then answers. No keypress is
+/// involved in that replacement; a timer is enough, which is what makes
+/// a spawn-time read wrong for boards nobody would call unusual.
+#[test]
+fn a_confirmed_action_sees_the_line_the_reader_pressed_on() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("dump.txt");
+    let script = dir.path().join("dump.sh");
+    write_script(&script, DUMP_SH, &out);
+    let ticks = dir.path().join("ticks");
+    let board = format!(
+        "row-gap 0\n\n\
+         key \"a\" {{\n    description \"act\"\n    shell #true\n    output \"hide\"\n    \
+         confirm \"Really?\"\n    command \"sh {script}\"\n}}\n\n\
+         pane \"ticking\" {{\n    height 4\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1s\"\n    \
+         command \"echo x >> {ticks}; printf 'V%03d\\n' $(wc -l < {ticks})\"\n}}\n",
+        script = script.display(),
+        ticks = ticks.display(),
+    );
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"V001", Duration::from_secs(5)),
+        "the ticking pane never painted"
+    );
+    session.write_bytes(b"s");
+    // Read the body that is on screen AT the keypress out of the
+    // stream rather than assuming one: the fixture's lines are
+    // time-derived, so a literal would be a guess about scheduling.
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"cursor 1/1",
+        Duration::from_secs(5),
+    )
+    .expect("the cursor never landed");
+    let at_press = highest_tick(&seen).expect("a tick value was on screen");
+
+    session.write_bytes(b"a");
+    assert!(
+        wait_for(&session, &mut terminal, b"[y/N]", Duration::from_secs(5)),
+        "the confirm never armed"
+    );
+    // Order matters: wait for the body to move BEFORE answering, or a
+    // fast machine confirms before the pane ticks and the test passes
+    // against a spawn-time read — green, and proving nothing.
+    let after = format!("V{:03}", at_press + 1);
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            after.as_bytes(),
+            Duration::from_secs(10)
+        ),
+        "the pane never re-ran while the confirm was open"
+    );
+    session.write_bytes(b"y");
+
+    let (_, line, text) = read_dump(&out).expect("the confirmed command never ran");
+    assert_eq!(line, "1");
+    assert_eq!(
+        text,
+        format!("V{at_press:03}"),
+        "the command must see the line the reader pressed on, not the one at that index now"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// Accumulate everything the session writes within `total` — unlike
 /// `read_available`, which returns at the first chunk. Duplicated from
 /// the watch suite's local helper, never lifted.
