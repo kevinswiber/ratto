@@ -372,6 +372,10 @@ row count constant and repaints cheap. Longer output is cut by
 `width` takes cells (`"40"`), a weight (`"2fr"`), or `"auto"`.
 `focusable #false` leaves a pane visible and running but removes it from
 pane navigation; use it for headings and other presentational panes.
+`selectable #false` says a pane's body is a composed picture rather than
+a list of lines, so it takes no line cursor while staying fully
+navigable; use it for a nested dashboard, a rendered table, or a chart.
+Both default to `#true`.
 
 Every pane's last inner row is a faint `{cadence} · {stamp}` line the
 loop owns. The stamp is when that pane's output last *changed*, not
@@ -512,6 +516,17 @@ and goes nowhere until the pane is expanded, which the footer says as
 `cursor 7/40 (collapsed)`. `Esc` drops the cursor first, before the
 zoom. What a key action does with the marked line is under Key actions
 below.
+
+A line only means something where the pane's body is a list of lines.
+A pane running a nested dashboard, a rendered table, or a chart holds a
+composed picture, and a mark across one row of it hands a command a
+horizontal slice — which parses, so a script written for a list gets a
+plausible-looking token instead of an error. `selectable #false` on such
+a pane says so: `s` declines there, silently and from every route,
+including from rest, where it leaves the focus where it was rather than
+moving on to a pane you did not point it at. Everything else about the
+pane is untouched — Tab, the number jump, zoom, collapse, and its own
+scroll all keep working.
 
 **The mark is a visual channel.** A board repaints in place, and in
 our testing with VoiceOver in macOS Terminal an in-place mark was not
