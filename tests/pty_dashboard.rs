@@ -880,6 +880,62 @@ fn a_board_with_no_cursor_may_bind_the_cursor_key_and_it_fires() {
     );
 }
 
+/// The same handback, on the board that asks the two surfaces to
+/// disagree: its only markable pane is one no focus gesture can reach.
+///
+/// A cursor needs BOTH — reachable to receive one, markable to hold one
+/// — so this board takes no cursor and the letter is its own. The load
+/// refusal answers that way, and the sibling above proves the loop
+/// answers that way for a board with nothing markable at all. Neither
+/// covers this board, and it is exactly where the two answers were
+/// derived from different predicates: a load that accepts a binding the
+/// loop then swallows is the failure the refusal exists to prevent,
+/// arriving from the other side.
+#[test]
+fn a_board_whose_only_markable_pane_is_unreachable_still_fires_its_own_s_binding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("ran.txt");
+    let script = dir.path().join("ran.sh");
+    write_script(&script, "printf 'the board ran it' > @OUT@\n", &out);
+    let board = format!(
+        "row-gap 0\n\n\
+         key \"s\" {{\n    description \"the board's own key\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+         pane \"a\" {{\n    height 4\n    border \"none\"\n    chrome #false\n    shell #true\n    interval \"1h\"\n    \
+         focusable #false\n    selectable #true\n    \
+         command \"printf 'A%s\\n' 01 02 03\"\n}}\n",
+        script = script.display(),
+    );
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"A03", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"s");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let ran = loop {
+        if std::fs::read_to_string(&out).is_ok_and(|text| text.contains("ran it")) {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+    };
+    assert!(
+        ran,
+        "the load accepted this binding, so the loop must run it: a pane that cannot be \
+         focused can never receive a cursor, so `s` is this board's key"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// The focused route, and the reason the FOCUS is not filtered the way
 /// the from-rest candidates are: a reader standing in a pane that asked
 /// for nothing gets a decline, not a jump somewhere else. Moving the

@@ -590,11 +590,9 @@ pub(crate) fn run_registry(
     let mut panes = PaneView::new(registry.len());
     // Whether the cursor key means anything on this board. Read once:
     // it is a declaration, so it cannot change while the loop runs, and
-    // a board where no pane asked for a cursor hands the letter back to
+    // a board where no pane can take a cursor hands the letter back to
     // its own bindings.
-    let takes_a_cursor = registry
-        .ids()
-        .any(|id| registry.pane(id).is_some_and(|pane| pane.selectable));
+    let takes_a_cursor = takes_a_cursor(&registry);
     // Loop-persistent geometry state: the one size/geometry pair the
     // spawn step, the composer, and the (future) resize arm consume. It
     // outlives the spawn branch — a completion can arrive in an
@@ -4280,6 +4278,27 @@ fn cursor_order(registry: &Registry, layout: &LayoutNode) -> Vec<SourceId> {
         .collect()
 }
 
+/// Whether the cursor key means anything on this board at all: is there
+/// any pane a cursor could ever land on.
+///
+/// Asked of `cursor_order` itself rather than re-derived from the pane
+/// flags, because this answer and that list must be the same fact. A
+/// board with a markable pane no focus gesture can reach has an empty
+/// target list, so its cursor key is a permanent no-op and the letter
+/// belongs to the board — which is exactly what the load-time refusal
+/// concludes from its own reading of the declarations. Two agreeing
+/// derivations were tried first and drifted apart within a day: the
+/// load surface asked for reachable-AND-markable while the loop asked
+/// only markable, so a board could load a binding the loop then
+/// swallowed. One list, one question of it.
+fn takes_a_cursor(registry: &Registry) -> bool {
+    match registry.composition() {
+        Composition::Panes { layout, .. } => !cursor_order(registry, layout).is_empty(),
+        // A plain watch has no panes to mark a line in.
+        Composition::Plain { .. } => false,
+    }
+}
+
 /// The next or previous focusable pane in reading order, wrapping. With no
 /// focus any focus gesture lands on the first eligible pane.
 fn focus_cycle(from: Option<SourceId>, order: &[SourceId], forward: bool) -> Option<SourceId> {
@@ -4395,6 +4414,33 @@ fn the_cursor_order_is_the_panes_that_asked_for_a_cursor_and_can_be_reached() {
         vec![SourceId(0), SourceId(1)]
     );
     assert_eq!(cursor_order(&registry, layout), vec![SourceId(1)]);
+    assert!(
+        takes_a_cursor(&registry),
+        "one reachable markable pane is what makes the key rat's"
+    );
+
+    // Drop that one pane and neither survivor can hold a cursor: one is
+    // reachable but not markable, the other markable but not reachable.
+    // The board's key is its own, and the loop must agree with the load
+    // refusal about that — this is the arm where deriving the answer
+    // from `selectable` alone said the opposite.
+    let neither = Registry::panes(
+        vec![spec("title"), spec("legend")],
+        vec![pane(true, false), pane(false, true)],
+        LayoutNode::Column(vec![
+            LayoutNode::Pane(SourceId(0)),
+            LayoutNode::Pane(SourceId(1)),
+        ]),
+        0,
+        0,
+    )
+    .expect("a valid registry");
+    let neither_layout = match neither.composition() {
+        Composition::Panes { layout, .. } => layout,
+        Composition::Plain { .. } => panic!("expected panes"),
+    };
+    assert!(cursor_order(&neither, neither_layout).is_empty());
+    assert!(!takes_a_cursor(&neither));
 }
 
 /// The pane a directional move lands on, or None at the edge of the
