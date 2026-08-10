@@ -4718,17 +4718,38 @@ fn pager_target(mode: FrameMode, panes: &PaneView) -> Option<SourceId> {
     scroll_target(mode, panes)
 }
 
+/// A pane's selected line, reconciled against the body it points into.
+/// Lower it or drop it; never raise one.
+///
+/// The limit is the last LINE, not the last offset that still fills the
+/// window: a window is what the reader can see, a selection is what
+/// they picked, and the window follows the cursor rather than fencing
+/// it. Sixty lines in a nineteen-row window offer line 59 while the
+/// window stops at offset 41.
+///
+/// `max_offset(total, 1)` is the same number by arithmetic and the
+/// wrong sentence by meaning — that function is about filling a window,
+/// and reusing it here would tie a selection's rule to a definition
+/// that is not about selections. The window does not appear in this
+/// signature, so the two cannot be confused by accident.
+fn clamp_cursor(cursor: Option<usize>, total: usize) -> Option<usize> {
+    Some(cursor?.min(total.checked_sub(1)?))
+}
+
 /// THE reanchor. Every site that changes a pane's body or its window
-/// clamps every pane's window back into the new shape here — the collect
-/// step, the resize reflow, and (as consumers) the zoom and collapse arms.
+/// reconciles every pane's reader position here — the collect step, the
+/// resize reflow, and (as consumers) the zoom and collapse arms.
 /// A pinned window rides its tail; an unpinned one HOLDS its offset,
-/// clamped (D4). Nothing here resets on a hash change or a failure: the
-/// clamp is the only thing allowed to move a reader's place.
+/// clamped (D4). A cursor always holds and clamps: it has no pin, and a
+/// body that empties drops it. Nothing here resets on a hash change or
+/// a failure: the clamp is the only thing allowed to move a reader's
+/// place.
 fn reanchor_pane_scrolls(panes: &mut PaneView, runtime: &[SourceRuntime], geom: &[PaneGeometry]) {
-    for (i, scroll) in panes.scroll.iter_mut().enumerate() {
+    for (i, (scroll, cursor)) in panes.scroll.iter_mut().zip(&mut panes.cursor).enumerate() {
         let total = runtime[i].output.as_ref().map_or(0, Vec::len);
         let window = geom[i].inner_rows as usize;
         *scroll = scroll.reanchor(total, window);
+        *cursor = clamp_cursor(*cursor, total);
     }
 }
 
@@ -10601,6 +10622,78 @@ mod tests {
         assert_eq!(panes.scroll[1], neighbour, "a pane at rest is unmoved");
     }
 
+    #[test]
+    fn a_reanchor_carries_the_cursor_through_a_body_replacement() {
+        // The wiring, not the arithmetic: a clamp over a line count
+        // cannot tell "the body was replaced" from "the body is the
+        // same length", so this drives the real helper over a runtime
+        // whose bodies actually change.
+        let registry = zoom_row_registry();
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let body: Vec<String> = (1..=60).map(|i| format!("r{i}")).collect();
+        runtime[0].output = Some(body.clone());
+        runtime[1].output = Some(body);
+        let mut panes = view_zooming(&registry, None);
+        let geom = derive_geometry(&registry, (80, 24), None, false, &panes);
+        let neighbour = panes.scroll[1];
+
+        panes.cursor[0] = Some(58);
+        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        assert_eq!(panes.cursor[0], Some(58), "same shape, same line");
+
+        // Sixty different lines: the index is positional, and the text
+        // under it changed. Agreement with the body is the guarantee;
+        // stability of what the line says is not one.
+        runtime[0].output = Some((1..=60).map(|i| format!("q{i}")).collect());
+        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        assert_eq!(panes.cursor[0], Some(58), "a replacement holds it");
+
+        runtime[0].output = Some((1..=10).map(|i| format!("s{i}")).collect());
+        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        assert_eq!(panes.cursor[0], Some(9), "a shorter body clamps it");
+
+        runtime[0].output = Some(Vec::new());
+        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        assert_eq!(panes.cursor[0], None, "an empty body has no line to hold");
+
+        // A pane that has never completed reports zero lines the same
+        // way, and a cursor put there by hand does not survive it.
+        runtime[0].output = None;
+        panes.cursor[0] = Some(3);
+        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        assert_eq!(panes.cursor[0], None, "nor does a pane with no body at all");
+
+        assert_eq!(panes.cursor[1], None, "the neighbour never grew one");
+        assert_eq!(panes.scroll[1], neighbour, "a pane at rest is unmoved");
+    }
+
+    #[test]
+    fn a_cursor_is_bounded_by_the_body_while_a_window_is_bounded_by_the_window() {
+        // Sixty lines in a nineteen-row window. The window's last useful
+        // offset is 41 — the shipped reanchor test pins that number. The
+        // body's last LINE is 59. A cursor that borrowed the window's
+        // limit would make the last eighteen lines of this pane
+        // unselectable, and nothing on screen would say why.
+        let registry = zoom_row_registry();
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let body: Vec<String> = (1..=60).map(|i| format!("r{i}")).collect();
+        runtime[0].output = Some(body.clone());
+        runtime[1].output = Some(body);
+        let mut panes = view_zooming(&registry, Some(SourceId(0)));
+        let geom = derive_geometry(&registry, (80, 24), None, false, &panes);
+        assert_eq!(geom[0].inner_rows, 19, "fixture premise");
+
+        panes.scroll[0] = LiveScroll::at(58, 60, 2);
+        panes.cursor[0] = Some(59);
+        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        assert_eq!(
+            panes.scroll[0].offset(),
+            41,
+            "the window clamps to the window"
+        );
+        assert_eq!(panes.cursor[0], Some(59), "the cursor clamps to the body");
+    }
+
     // The engine itself never names these two types (they live behind
     // the registry contract), so the test module imports them
     // explicitly — `use super::*` cannot supply them.
@@ -11005,6 +11098,43 @@ mod tests {
         // replacement: that is today's behavior, unchanged.
         let tail = initial_pane_scroll(Overflow::KeepBottom, 40, 5);
         assert_eq!(tail.reanchor(400, 5).offset(), max_offset(400, 5));
+    }
+
+    #[test]
+    fn a_cursor_holds_its_line_and_clamps_to_the_body() {
+        // A ten-line body (indices 0..=9), and every shape the next one
+        // can take. Each cell is the index the cursor MUST hold — the
+        // assertion this table exists to be stronger than is "it did
+        // not panic", which every wrong answer here also satisfies.
+        //
+        //                    replaced  grew    shrank  shrank hard  emptied
+        //                      (10)     (40)     (6)       (1)        (0)
+        let table: &[(Option<usize>, [Option<usize>; 5])] = &[
+            (Some(0), [Some(0), Some(0), Some(0), Some(0), None]),
+            (Some(4), [Some(4), Some(4), Some(4), Some(0), None]),
+            (Some(9), [Some(9), Some(9), Some(5), Some(0), None]),
+            (None, [None, None, None, None, None]),
+        ];
+        for (cursor, wants) in table {
+            for (total, want) in [10usize, 40, 6, 1, 0].into_iter().zip(wants) {
+                assert_eq!(
+                    clamp_cursor(*cursor, total),
+                    *want,
+                    "cursor {cursor:?} over a body of {total} lines"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reanchor_never_raises_a_cursor() {
+        // Absence is absorbing, totally: a tick that produced a
+        // selection out of nothing would be a keypress nobody pressed.
+        // The state's whole inertness claim rests on this one line, so
+        // it is asserted over the shape space rather than sampled.
+        for total in [0usize, 1, 3, 10, 4096] {
+            assert_eq!(clamp_cursor(None, total), None, "{total} lines");
+        }
     }
 
     #[test]
