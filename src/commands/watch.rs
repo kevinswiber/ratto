@@ -6279,6 +6279,21 @@ fn build_source_command(
     // own appearance would query a terminal this process is reading from.
     // Hand it the verdict instead.
     command.env("RAT_APPEARANCE", appearance.as_str());
+    // A pane's command never sees a selection — REMOVED, not merely
+    // unset, because a child inherits this process's environment and
+    // this process may itself have been spawned BY a key action that
+    // exported one. A board nested inside another board would otherwise
+    // read the outer board's marked line as its own, which is the
+    // "acting on a line you are not looking at" failure arriving
+    // through the environment instead of through timing.
+    //
+    // The rule this enforces is stated once, beside the action builder
+    // that DOES set them: a pane's spawn environment cannot depend on
+    // cursor state without either respawning every pane on every cursor
+    // move or handing a child a value that was true once.
+    command.env_remove("RAT_SELECTION");
+    command.env_remove("RAT_SELECTION_PANE");
+    command.env_remove("RAT_SELECTION_LINE");
     command
 }
 

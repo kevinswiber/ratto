@@ -2999,6 +2999,53 @@ fn a_panes_board_renders_byte_identically_with_the_view_state_in_place() {
     assert_eq!(stdout, expected, "the frame's exact bytes moved");
 }
 
+/// A pane's command never sees a selection, and the hazard is a value
+/// already in rat's OWN environment rather than one this process sets:
+/// a child inherits it, and rat may itself have been spawned by a key
+/// action that exported one. A board nested inside another board would
+/// then read the outer board's marked line as local state — the "acting
+/// on a line you are not looking at" failure arriving through the
+/// environment instead of through timing.
+///
+/// The action-side twin lives in the pty suite. This is the pane side,
+/// and it is the cheaper route: no keypress is involved, because the
+/// leak needs no gesture at all.
+///
+/// The needles are deliberately unlovely and appear nowhere else in the
+/// fixture: a test must not contain the string whose absence it asserts.
+#[test]
+fn a_panes_command_never_inherits_a_selection_from_rats_own_environment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "row-gap 0\n\npane \"probe\" {\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n    interval \"1h\"\n    \
+         command \"echo SEL=[${RAT_SELECTION-unset}] PANE=[${RAT_SELECTION_PANE-unset}] LINE=[${RAT_SELECTION_LINE-unset}]\"\n}\n",
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "80")
+        .env("RAT_HEIGHT", "12")
+        .env("RAT_SELECTION", "XYZZY-LEAKED-LINE")
+        .env("RAT_SELECTION_PANE", "XYZZY-LEAKED-PANE")
+        .env("RAT_SELECTION_LINE", "99")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    // Removed, not blanked: a child must be able to tell "no selection"
+    // from "the selected line is empty", which is the distinction the
+    // export contract makes everywhere else.
+    assert!(
+        stdout.contains("SEL=[unset] PANE=[unset] LINE=[unset]"),
+        "a pane inherited a selection: {stdout}"
+    );
+    assert!(
+        !stdout.contains("XYZZY"),
+        "an inherited value leaked into a pane: {stdout}"
+    );
+}
+
 /// The same board twice, differing only in one pane declaration: the
 /// one that asks for a line cursor. The helper asserts that the pair
 /// differs in nothing else, so the comparison below is about the

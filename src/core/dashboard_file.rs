@@ -271,9 +271,17 @@ impl DashboardFile {
     /// expands, so that ordering is preserved. The inheritance rule is
     /// the resolver's own, shared rather than restated.
     pub fn takes_a_cursor(&self) -> bool {
-        self.panes
-            .iter()
-            .any(|decl| selectable(decl, &self.defaults))
+        self.panes.iter().any(|decl| {
+            // BOTH, and the conjunction is the point: the runtime's
+            // from-rest target list is the focusABLE reading order
+            // filtered by `selectable`, so a pane that asked for a
+            // cursor but opted out of navigation can never be reached
+            // to receive one. Answering on `selectable` alone would
+            // claim the cursor key, and advertise it in the reference,
+            // for a board where pressing it is a permanent no-op.
+            decl.focusable.or(self.defaults.focusable).unwrap_or(true)
+                && selectable(decl, &self.defaults)
+        })
     }
 
     /// The ONE validation path: resolve defaults, parse every token,
@@ -1904,6 +1912,49 @@ mod tests {
         }]);
         opted_out.defaults.selectable = Some(true);
         assert!(!opted_out.takes_a_cursor(), "the only pane opted back out");
+    }
+
+    /// A pane that asks for a cursor but opts out of navigation can
+    /// never be reached to receive one, so it does not make the board
+    /// one that takes a cursor.
+    ///
+    /// Answering on `selectable` alone would claim the cursor key and
+    /// advertise it in the reference for a board where pressing it is a
+    /// permanent no-op — and would cost that board a binding it could
+    /// otherwise have declared.
+    #[test]
+    fn a_pane_that_cannot_be_focused_does_not_make_a_board_take_a_cursor() {
+        let unreachable = file(vec![PaneDecl {
+            focusable: Some(false),
+            selectable: Some(true),
+            ..pane("banner", &["date"])
+        }]);
+        assert!(
+            !unreachable.takes_a_cursor(),
+            "no gesture can reach this pane, so the key stays the board's"
+        );
+
+        // The anti-vacuity half: the same pane reachable IS a board that
+        // takes a cursor, so the assertion above is about the focus
+        // filter and not about the declaration being ignored.
+        let reachable = file(vec![PaneDecl {
+            focusable: Some(true),
+            selectable: Some(true),
+            ..pane("changed", &["date"])
+        }]);
+        assert!(reachable.takes_a_cursor());
+
+        // And the inherited form, since `defaults` is how a board most
+        // easily reaches this state by accident.
+        let mut inherited = file(vec![PaneDecl {
+            selectable: Some(true),
+            ..pane("banner", &["date"])
+        }]);
+        inherited.defaults.focusable = Some(false);
+        assert!(
+            !inherited.takes_a_cursor(),
+            "a defaults-level opt-out of focus reaches this too"
+        );
     }
 
     #[test]
