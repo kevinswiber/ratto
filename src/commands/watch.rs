@@ -2760,7 +2760,7 @@ pub(crate) fn run_registry(
                             let Composition::Panes { layout, .. } = registry.composition() else {
                                 continue;
                             };
-                            let order = focus_order(&registry, layout);
+                            let order = cursor_order(&registry, layout);
                             let Some(id) = cursor_target(&panes, &order) else {
                                 continue;
                             };
@@ -4228,6 +4228,24 @@ fn focus_order(registry: &Registry, layout: &LayoutNode) -> Vec<SourceId> {
         .collect()
 }
 
+/// The panes a cursor gesture may land on FROM REST: reachable and
+/// markable both, in the same reading order.
+///
+/// The two filters answer different questions and a target needs both.
+/// Reachable alone would drop a cursor into a pane whose body the board
+/// says is not a list of lines; markable alone would drop one where no
+/// focus gesture can follow it afterwards.
+///
+/// This narrows only the from-rest pick. A pane that already holds the
+/// focus is the target whatever it declared — the gesture then declines
+/// there rather than moving the reader somewhere they were not looking.
+fn cursor_order(registry: &Registry, layout: &LayoutNode) -> Vec<SourceId> {
+    focus_order(registry, layout)
+        .into_iter()
+        .filter(|id| registry.pane(*id).is_some_and(|pane| pane.selectable))
+        .collect()
+}
+
 /// The next or previous focusable pane in reading order, wrapping. With no
 /// focus any focus gesture lands on the first eligible pane.
 fn focus_cycle(from: Option<SourceId>, order: &[SourceId], forward: bool) -> Option<SourceId> {
@@ -4289,6 +4307,60 @@ fn focus_order_excludes_non_focusable_panes_from_every_navigation_target() {
         focus_cycle(Some(SourceId(2)), &order, true),
         Some(SourceId(1))
     );
+}
+
+/// The cursor gesture's from-rest candidates are the panes that are
+/// BOTH reachable and markable, and filtering by one alone gets it
+/// wrong in two different directions: by focus alone it lands a cursor
+/// in a pane whose body the board says is not a list, and by selection
+/// alone it lands one where no focus gesture can follow.
+#[cfg(test)]
+#[test]
+fn the_cursor_order_is_the_panes_that_asked_for_a_cursor_and_can_be_reached() {
+    use crate::core::box_model::{BorderPreset, Sides};
+    use crate::core::registry::{PaneBox, PaneWidth};
+
+    let spec = |id: &str| SourceSpec {
+        id: id.to_string(),
+        program: SourceProgram::Argv(vec!["true".into()]),
+        shell: ShellMode::Direct,
+        interval: Some(Duration::from_secs(3600)),
+        triggers: Vec::new(),
+        debounce: Duration::from_millis(250),
+        live: false,
+    };
+    let pane = |focusable, selectable| PaneBox {
+        height: 4,
+        width: PaneWidth::Weight(1),
+        overflow: Overflow::KeepTop,
+        border: BorderPreset::Rounded,
+        padding: Sides::default(),
+        title: None,
+        chrome: false,
+        focusable,
+        selectable,
+    };
+    let registry = Registry::panes(
+        vec![spec("title"), spec("changed"), spec("legend")],
+        vec![pane(true, false), pane(true, true), pane(false, true)],
+        LayoutNode::Column(vec![
+            LayoutNode::Pane(SourceId(0)),
+            LayoutNode::Pane(SourceId(1)),
+            LayoutNode::Pane(SourceId(2)),
+        ]),
+        0,
+        0,
+    )
+    .expect("a valid registry");
+    let layout = match registry.composition() {
+        Composition::Panes { layout, .. } => layout,
+        Composition::Plain { .. } => panic!("expected panes"),
+    };
+    assert_eq!(
+        focus_order(&registry, layout),
+        vec![SourceId(0), SourceId(1)]
+    );
+    assert_eq!(cursor_order(&registry, layout), vec![SourceId(1)]);
 }
 
 /// The pane a directional move lands on, or None at the edge of the
@@ -5051,10 +5123,16 @@ fn scroll_target(mode: FrameMode, panes: &PaneView) -> Option<SourceId> {
 
 /// Which pane the cursor gesture addresses: the focused one, or — from
 /// rest — the first pane in reading order, which the gesture then
-/// focuses. `order` is the focusABLE reading order, so a board whose
-/// first declared pane opts out of navigation never receives a cursor
-/// no gesture could reach. An empty order declines, the same silent
-/// no-op every focus gesture already takes there.
+/// focuses. `order` is the CURSOR order (`cursor_order`): reachable and
+/// markable both, so a board whose first declared pane opts out of
+/// either never receives a cursor the reader could not then use. An
+/// empty order declines, the same silent no-op every focus gesture
+/// already takes there.
+///
+/// The focus is deliberately NOT filtered against that order. Standing
+/// in a pane that asked for no cursor and pressing the key is a decline
+/// the reader can see the reason for; jumping the mark to some other
+/// pane would act on a line they are not looking at.
 fn cursor_target(panes: &PaneView, order: &[SourceId]) -> Option<SourceId> {
     panes.focus.or_else(|| order.first().copied())
 }
@@ -12270,17 +12348,22 @@ mod tests {
     }
 
     #[test]
-    fn cursor_target_is_the_focus_or_the_first_focusable_pane() {
+    fn cursor_target_is_the_focus_or_the_first_pane_that_can_hold_a_cursor() {
         // Pane 0 is deliberately absent from the order — a board's first
-        // declared pane may opt out of navigation, and a target picked
-        // from the declaration order would drop a cursor into a pane no
-        // focus gesture can ever reach.
+        // declared pane may opt out of navigation OR decline a cursor,
+        // and a target picked from the declaration order would drop a
+        // cursor into a pane the gesture can never act on.
         let order = [SourceId(1), SourceId(2)];
         let mut panes = PaneView::new(3);
         assert_eq!(cursor_target(&panes, &order), Some(SourceId(1)));
+        // The FOCUS is not filtered, and must not be: standing in a
+        // pane that takes no cursor and pressing the key is a decline
+        // the reader can see the reason for, not a jump somewhere else.
+        panes.focus = Some(SourceId(0));
+        assert_eq!(cursor_target(&panes, &order), Some(SourceId(0)));
         panes.focus = Some(SourceId(2));
         assert_eq!(cursor_target(&panes, &order), Some(SourceId(2)));
-        // No focusable pane at all: the same silent no-op every focus
+        // No eligible pane at all: the same silent no-op every focus
         // gesture already takes there.
         assert_eq!(cursor_target(&PaneView::new(3), &[]), None);
     }

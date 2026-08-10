@@ -3000,9 +3000,9 @@ fn a_panes_board_renders_byte_identically_with_the_view_state_in_place() {
 }
 
 /// The same board twice, differing only in one pane declaration: the
-/// one that says the pane's body is a picture rather than a list. The
-/// helper asserts that the pair differs in nothing else, so the
-/// comparison below is about the declaration and not about a fixture.
+/// one that asks for a line cursor. The helper asserts that the pair
+/// differs in nothing else, so the comparison below is about the
+/// declaration and not about a fixture.
 fn selectability_pair(dir: &std::path::Path) -> (String, String) {
     let seeded = dir.join("seed.txt");
     std::fs::write(&seeded, "inert-needle\n").expect("seed");
@@ -3017,7 +3017,7 @@ fn selectability_pair(dir: &std::path::Path) -> (String, String) {
             seed = seeded.display().to_string().escape_default(),
         )
     };
-    const DECLARED: &str = "    selectable #false\n";
+    const DECLARED: &str = "    selectable #true\n";
     let (plain, declaring) = (body(""), body(DECLARED));
     assert_eq!(
         declaring.replace(DECLARED, ""),
@@ -3032,11 +3032,11 @@ fn selectability_pair(dir: &std::path::Path) -> (String, String) {
 
 /// A load-time declaration that changes rendered bytes is a bug, and
 /// this is the cheapest place to catch one: two complete runs, compared
-/// byte for byte. Opting a pane out of the cursor is a statement about
-/// a gesture nothing on this route can make, so the frame it composes
+/// byte for byte. Asking a pane for a cursor is a statement about a
+/// gesture nothing on this route can make, so the frame it composes
 /// must be the frame it composed before the property existed.
 #[test]
-fn declining_the_cursor_changes_none_of_a_boards_rendered_bytes() {
+fn asking_for_a_cursor_changes_none_of_a_boards_rendered_bytes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (plain, declaring) = selectability_pair(dir.path());
     let run = |decl: &str| {

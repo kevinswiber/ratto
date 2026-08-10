@@ -161,7 +161,7 @@ fn panes_row(
     // spelling gets its coverage through a real pty, not just a parse.
     format!(
         "gap 1\n\n\
-         defaults {{\n    height 5\n    border \"rounded\"\n    width \"1fr\"\n    shell #true\n}}\n\n\
+         defaults {{\n    height 5\n    border \"rounded\"\n    width \"1fr\"\n    shell #true\n    selectable #true\n}}\n\n\
          row {{\n    \
          pane \"{a_name}\" interval=\"{a_interval}\" {{\n        command \"{a_cmd}\"\n    }}\n    \
          pane \"{b_name}\" interval=\"{b_interval}\" {{\n        command \"{b_cmd}\"\n    }}\n\
@@ -541,7 +541,7 @@ fn constant_row(interval: &str) -> String {
     };
     format!(
         "gap 1\n\n\
-         defaults {{\n    height 5\n    border \"rounded\"\n    width \"1fr\"\n    shell #true\n}}\n\n\
+         defaults {{\n    height 5\n    border \"rounded\"\n    width \"1fr\"\n    shell #true\n    selectable #true\n}}\n\n\
          row {{\n    {}    {}}}\n",
         pane("left"),
         pane("right"),
@@ -646,7 +646,7 @@ fn a_once_board_on_a_terminal_paints_its_frame_with_s_pressed() {
 fn stacked_bodies(height: u16) -> String {
     format!(
         "row-gap 0\n\n\
-         defaults {{\n    height {height}\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+         defaults {{\n    height {height}\n    border \"none\"\n    chrome #false\n    shell #true\n    selectable #true\n}}\n\n\
          pane \"a\" {{\n    interval \"1h\"\n    command \"printf 'A%s\\n' 01 02 03\"\n}}\n\
          pane \"b\" {{\n    interval \"1h\"\n    command \"printf 'B%s\\n' 01 02 03\"\n}}\n"
     )
@@ -726,16 +726,16 @@ fn a_cursor_marks_the_focused_panes_row_and_leaves_the_others_alone() {
     );
 }
 
-/// The same two stacked panes, with the first declaring that its body
-/// is not a list of lines. Pane `b` is left alone on purpose: a decline
-/// proves nothing on a board where the gesture works nowhere, so every
-/// arm below ends on a pane the mark still reaches.
-fn stacked_bodies_with_an_unmarkable_first(height: u16) -> String {
+/// The same two stacked panes, with only the SECOND asking for a
+/// cursor. Pane `a` declares nothing, which is how the overwhelming
+/// majority of panes are written — a board points the gesture at the
+/// one pane whose lines a key action is going to read.
+fn stacked_bodies_with_a_markable_second(height: u16) -> String {
     format!(
         "row-gap 0\n\n\
          defaults {{\n    height {height}\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
-         pane \"a\" {{\n    interval \"1h\"\n    selectable #false\n    command \"printf 'A%s\\n' 01 02 03\"\n}}\n\
-         pane \"b\" {{\n    interval \"1h\"\n    command \"printf 'B%s\\n' 01 02 03\"\n}}\n"
+         pane \"a\" {{\n    interval \"1h\"\n    command \"printf 'A%s\\n' 01 02 03\"\n}}\n\
+         pane \"b\" {{\n    interval \"1h\"\n    selectable #true\n    command \"printf 'B%s\\n' 01 02 03\"\n}}\n"
     )
 }
 
@@ -761,18 +761,14 @@ fn settle_and_require_silence(session: &PtySession, terminal: &mut FakeTerminal)
     );
 }
 
-/// The control both declining arms end on: the neighbour holds lines,
-/// so the mark lands there. Silence is also what a dead pty produces,
-/// and this is what says the decline was the declaration's doing.
-fn the_mark_still_lands_next_door(session: &PtySession, terminal: &mut FakeTerminal) {
-    session.write_bytes(b"\t");
-    assert!(
-        wait_for(session, terminal, b"focus b", Duration::from_secs(3)),
-        "the focus never reached the second pane"
-    );
+/// The mark landing on pane `b`, wherever the arm above left the focus.
+/// Silence is also what a dead pty produces, so every declining arm
+/// ends here: this is what says the decline was the declaration's doing
+/// and not a broken toggle.
+fn the_mark_lands_on_the_pane_that_asked(session: &PtySession, terminal: &mut FakeTerminal) {
     session.write_bytes(b"s");
     let marked = wait_for_bytes(session, terminal, b"cursor 1/3", Duration::from_secs(3))
-        .expect("the mark never reached a pane that holds lines");
+        .expect("the mark never reached the pane that asked for a cursor");
     let row = row_containing(&marked, b"B01").expect("pane b's first row");
     assert!(
         contains(row, b"> "),
@@ -781,42 +777,53 @@ fn the_mark_still_lands_next_door(session: &PtySession, terminal: &mut FakeTermi
     );
 }
 
-/// From rest, with the first pane in reading order declaring that it
-/// holds no lines: the gesture declines rather than hunting for the
-/// first pane that would accept it. Skipping would make this the one
-/// key on the board that moves the focus somewhere the reader did not
-/// point it; a reader who wants a cursor further down presses `Tab` and
-/// then the key, which is one deliberate keystroke instead of one
-/// surprising one.
+/// From rest the gesture goes to the pane that asked for a cursor, even
+/// though another pane reads first. That is not the key hunting for a
+/// target — it is the same rule every from-rest pane gesture already
+/// follows, "the first pane in reading order this gesture can act on",
+/// applied to a candidate list the board itself declared. A cursor is
+/// opt-in, so on nearly every board that list has exactly one entry and
+/// the alternative would be a key that does nothing from rest.
 ///
-/// The decline is total and silent — no mark, no footer segment, no
-/// repaint of any kind. And the focus it would otherwise have implied
-/// does not move either, which the `Tab` after it measures: from rest
-/// the first `Tab` lands on pane `a`, and it could only land on `b` if
-/// the declined gesture had quietly focused `a` on its way out.
+/// Pane `a` reads first and declares nothing, so a build that took the
+/// declaration order would land the focus there and mark nothing.
 #[test]
-fn from_rest_the_cursor_gesture_declines_on_a_pane_that_declared_no_lines() {
+fn from_rest_the_cursor_gesture_finds_the_pane_that_asked_for_it() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let decl = write_dashboard(dir.path(), &stacked_bodies_with_an_unmarkable_first(4));
+    let decl = write_dashboard(dir.path(), &stacked_bodies_with_a_markable_second(4));
     let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
         .expect("spawn rat dashboard under a pty");
     let mut terminal = FakeTerminal::dark();
     settle_and_require_silence(&session, &mut terminal);
 
     session.write_bytes(b"s");
-    let after = session.read_available(Duration::from_millis(800));
+    let marked = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"cursor 1/3",
+        Duration::from_secs(3),
+    )
+    .expect("the gesture never reached the pane that asked for a cursor");
     assert!(
-        after.is_empty(),
-        "the gesture must change nothing — not a mark, not the focus: {:?}",
-        String::from_utf8_lossy(&after)
+        contains(&marked, b"focus b"),
+        "the cursor implies focus, and it must be pane b's: {:?}",
+        String::from_utf8_lossy(&marked)
     );
-
-    session.write_bytes(b"\t");
+    let row = row_containing(&marked, b"B01").expect("pane b's first row");
     assert!(
-        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
-        "the declined gesture moved the focus it would have implied"
+        contains(row, b"> "),
+        "the marked row must carry the marker: {:?}",
+        String::from_utf8_lossy(row)
     );
-    the_mark_still_lands_next_door(&session, &mut terminal);
+    // And pane `a` is untouched — the gesture passed over it rather
+    // than marking its first line on the way.
+    if let Some(other) = row_containing(&marked, b"A01") {
+        assert!(
+            !contains(other, b"> "),
+            "a pane that asked for nothing must carry no mark: {:?}",
+            String::from_utf8_lossy(other)
+        );
+    }
 
     session.write_bytes(b"q");
     assert!(
@@ -825,14 +832,20 @@ fn from_rest_the_cursor_gesture_declines_on_a_pane_that_declared_no_lines() {
     );
 }
 
-/// The focused route through the same decline, and the whole point of
-/// the declaration being its own answer: this pane is reachable by
-/// number, so a reader can be standing in it when they press the key.
-/// Opting out of the mark cost it nothing else.
+/// The focused route, and the reason the FOCUS is not filtered the way
+/// the from-rest candidates are: a reader standing in a pane that asked
+/// for nothing gets a decline, not a jump somewhere else. Moving the
+/// cursor to another pane under them would act on a line they are not
+/// looking at, which is the one failure this whole gesture exists to
+/// avoid.
+///
+/// The decline is total and silent — no mark, no footer segment, no
+/// repaint of any kind — and pane `a` is focusable throughout, which is
+/// the whole point of selection being its own answer.
 #[test]
-fn a_focused_pane_that_declared_no_lines_declines_the_cursor_too() {
+fn a_focused_pane_that_asked_for_no_cursor_declines_rather_than_jumping() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let decl = write_dashboard(dir.path(), &stacked_bodies_with_an_unmarkable_first(4));
+    let decl = write_dashboard(dir.path(), &stacked_bodies_with_a_markable_second(4));
     let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
         .expect("spawn rat dashboard under a pty");
     let mut terminal = FakeTerminal::dark();
@@ -849,10 +862,16 @@ fn a_focused_pane_that_declared_no_lines_declines_the_cursor_too() {
     let after = session.read_available(Duration::from_millis(800));
     assert!(
         after.is_empty(),
-        "a focused pane that declared no lines must answer the same way: {:?}",
+        "a focused pane that asked for no cursor must decline in place: {:?}",
         String::from_utf8_lossy(&after)
     );
-    the_mark_still_lands_next_door(&session, &mut terminal);
+
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus b", Duration::from_secs(3)),
+        "the focus never reached the second pane"
+    );
+    the_mark_lands_on_the_pane_that_asked(&session, &mut terminal);
 
     session.write_bytes(b"q");
     assert!(
@@ -873,6 +892,7 @@ fn the_mark_survives_a_frame_scrolled_board() {
 row-gap 0
 
 defaults {
+    selectable #true
     height 15
     border "none"
     chrome #true
@@ -1035,7 +1055,7 @@ fn a_collapsed_pane_shows_no_mark_until_a_zoom_puts_its_body_back() {
 /// only thing that can move the window.
 fn a_deep_pane_and_a_neighbour() -> String {
     "row-gap 0\n\n\
-     defaults {\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n}\n\n\
+     defaults {\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    selectable #true\n}\n\n\
      pane \"a\" {\n    height 5\n    command \"printf 'A%s\\n' 01 02 03 04 05 06 07 08 09 10\"\n}\n\
      pane \"b\" {\n    height 4\n    command \"printf 'B%s\\n' 01 02 03\"\n}\n"
         .to_string()
@@ -1328,6 +1348,7 @@ fn the_scrolled_row_carries_the_segment_too() {
 row-gap 0
 
 defaults {
+    selectable #true
     height 15
     border "none"
     chrome #true
@@ -1389,6 +1410,7 @@ fn a_quiet_board_with_a_parked_cursor_stops_writing() {
 row-gap 0
 
 defaults {
+    selectable #true
     height 5
     border "none"
     chrome #true
@@ -1530,7 +1552,7 @@ fn numbered_pane_board(dir: &std::path::Path, height: u16) -> (std::path::PathBu
     let board = format!(
         "row-gap 0\n\n\
          key \"x\" {{\n    description \"dump\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
-         pane \"numbered\" {{\n    height {height}\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
+         pane \"numbered\" {{\n    height {height}\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    selectable #true\n    \
          command \"for i in $(seq -w 1 30); do echo L$i; done\"\n}}\n",
         script = script.display(),
     );
@@ -1651,7 +1673,7 @@ fn a_when_reads_the_selection_and_declines_on_the_wrong_line() {
         "row-gap 0\n\n\
          key \"r\" {{\n    description \"act\"\n    shell #true\n    output \"hide\"\n    \
          when \"sh {guard}\"\n    command \"{counter_cmd}\"\n}}\n\n\
-         pane \"numbered\" {{\n    height 10\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
+         pane \"numbered\" {{\n    selectable #true\n    height 10\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
          command \"for i in $(seq -w 1 30); do echo L$i; done\"\n}}\n",
         guard = guard.display(),
         counter_cmd = counter_cmd(&counter),
@@ -1716,7 +1738,7 @@ fn a_binding_from_a_frame_scrolled_board_still_exports_the_selection() {
     write_script(&script, DUMP_SH, &out);
     let board = format!(
         "row-gap 0\n\n\
-         defaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n}}\n\n\
+         defaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    selectable #true\n}}\n\n\
          key \"x\" {{\n    description \"dump\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
          pane \"a\" {{\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n\
          pane \"b\" {{\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}}\n",
@@ -1777,7 +1799,7 @@ fn a_zoomed_panes_cursor_is_the_one_exported() {
     write_script(&script, DUMP_SH, &out);
     let board = format!(
         "row-gap 0\n\n\
-         defaults {{\n    height 5\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n}}\n\n\
+         defaults {{\n    height 5\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    selectable #true\n}}\n\n\
          key \"x\" {{\n    description \"dump\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
          pane \"first\" {{\n    command \"printf 'A%s\\n' 01 02 03\"\n}}\n\
          pane \"second\" {{\n    command \"printf 'B%s\\n' 01 02 03\"\n}}\n",
@@ -1838,7 +1860,7 @@ fn a_cursor_left_in_an_unfocused_pane_is_not_exported() {
     write_script(&script, DUMP_SH, &out);
     let board = format!(
         "row-gap 0\n\n\
-         defaults {{\n    height 5\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n}}\n\n\
+         defaults {{\n    height 5\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    selectable #true\n}}\n\n\
          key \"x\" {{\n    description \"dump\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
          pane \"first\" {{\n    command \"printf 'A%s\\n' 01 02 03\"\n}}\n\
          pane \"second\" {{\n    command \"printf 'B%s\\n' 01 02 03\"\n}}\n",
@@ -1948,7 +1970,7 @@ fn a_confirmed_action_sees_the_line_the_reader_pressed_on() {
         "row-gap 0\n\n\
          key \"a\" {{\n    description \"act\"\n    shell #true\n    output \"hide\"\n    \
          confirm \"Really?\"\n    command \"sh {script}\"\n}}\n\n\
-         pane \"ticking\" {{\n    height 4\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1s\"\n    \
+         pane \"ticking\" {{\n    selectable #true\n    height 4\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1s\"\n    \
          command \"echo x >> {ticks}; printf 'V%03d\\n' $(wc -l < {ticks})\"\n}}\n",
         script = script.display(),
         ticks = ticks.display(),
@@ -2038,15 +2060,17 @@ fn read_probe(out: &std::path::Path) -> Option<String> {
     }
 }
 
-/// A numbered pane and a binding that probes its environment.
+/// A numbered pane that asks for a cursor, and a binding that probes
+/// its environment.
 fn probe_board(dir: &std::path::Path, body: &str) -> (std::path::PathBuf, String) {
-    probe_board_declaring(dir, body, "")
+    probe_board_declaring(dir, body, "    selectable #true\n")
 }
 
 /// The same board with one more line inside the pane block, so an arm
 /// that needs a differently-declared pane does not need a second
 /// fixture family beside this one. `declaration` carries its own
-/// indentation and newline, or is empty.
+/// indentation and newline, or is empty — and empty means a pane that
+/// asked for nothing, which is the ordinary way a pane is written.
 fn probe_board_declaring(
     dir: &std::path::Path,
     body: &str,
@@ -2124,20 +2148,21 @@ fn no_cursor_leaves_the_three_variables_unset() {
     );
 }
 
-/// A pane that declared it holds no lines exports nothing, because no
-/// cursor can be standing in it to export. One arm rather than three:
-/// the absence machinery is pinned in full above, and what this adds is
+/// A pane that asked for no cursor exports nothing, because no cursor
+/// can be standing in it to export. One arm rather than three: the
+/// absence machinery is pinned in full above, and what this adds is
 /// that the declaration reaches it — by never letting the state exist
 /// in the first place, from the focused pane, after a press of the very
 /// key that would have raised one.
+///
+/// The board declares nothing, which is the ordinary way a pane is
+/// written and the reason this arm covers the common case rather than
+/// an exotic one.
 #[test]
-fn a_pane_that_declared_no_lines_exports_no_selection() {
+fn a_pane_that_asked_for_no_cursor_exports_no_selection() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (out, board) = probe_board_declaring(
-        dir.path(),
-        "for i in $(seq -w 1 20); do echo L$i; done",
-        "    selectable #false\n",
-    );
+    let (out, board) =
+        probe_board_declaring(dir.path(), "for i in $(seq -w 1 20); do echo L$i; done", "");
     let decl = write_dashboard(dir.path(), &board);
     let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
         .expect("spawn rat dashboard under a pty");
@@ -2431,7 +2456,7 @@ fn a_styled_selection_reaches_a_when_clean_too() {
         "row-gap 0\n\n\
          key \"r\" {{\n    description \"act\"\n    shell #true\n    output \"hide\"\n    \
          when \"sh {guard}\"\n    command \"{counter_cmd}\"\n}}\n\n\
-         pane \"styled\" {{\n    height 6\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
+         pane \"styled\" {{\n    selectable #true\n    height 6\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
          command \"sh {body}\"\n}}\n",
         guard = guard.display(),
         counter_cmd = counter_cmd(&counter),
@@ -4622,6 +4647,7 @@ fn s_from_rest_focuses_the_first_pane_and_brings_it_into_view() {
 row-gap 0
 
 defaults {
+    selectable #true
     height 15
     border "none"
     chrome #true
@@ -4698,6 +4724,7 @@ fn a_cursor_takes_the_scroll_keys_away_from_the_panes_own_window() {
 row-gap 0
 
 defaults {
+    selectable #true
     height 15
     border "none"
     chrome #true
@@ -5126,6 +5153,7 @@ fn esc_peels_the_cursor_before_the_focus() {
 row-gap 0
 
 defaults {
+    selectable #true
     height 15
     border "none"
     chrome #true
@@ -5243,6 +5271,7 @@ fn a_cursor_survives_a_zoom_round_trip_and_a_collapse() {
 row-gap 0
 
 defaults {
+    selectable #true
     height 15
     border "none"
     chrome #true

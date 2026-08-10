@@ -1198,6 +1198,21 @@ fn resolve_binding(
     })
 }
 
+/// Whether a pane asked for a line cursor — the ONE place the rule is
+/// written, so the box resolver and the claimed-key check can never
+/// disagree about which panes take one.
+///
+/// **Opt-in, unlike every other pane flag here.** A cursor has no
+/// built-in consumer: nothing in rat reads a marked line, and its whole
+/// value flows out through a key action's environment. `chrome` and
+/// `focusable` are subtractions from something a board already gets;
+/// this is an addition, and defaulting it on would give the great
+/// majority of panes a gesture that can never lead anywhere. `live` is
+/// the sibling it follows.
+pub(crate) fn selectable(decl: &PaneDecl, defaults: &PaneDecl) -> bool {
+    decl.selectable.or(defaults.selectable).unwrap_or(false)
+}
+
 fn resolve_box(
     decl: &PaneDecl,
     defaults: &PaneDecl,
@@ -1298,7 +1313,7 @@ fn resolve_box(
         },
         chrome: decl.chrome.or(defaults.chrome).unwrap_or(true),
         focusable: decl.focusable.or(defaults.focusable).unwrap_or(true),
-        selectable: decl.selectable.or(defaults.selectable).unwrap_or(true),
+        selectable: selectable(decl, defaults),
     })
 }
 
@@ -1794,33 +1809,40 @@ mod tests {
         );
     }
 
-    /// Selectability travels the same road focusability does, and is a
-    /// different answer from it: a board says a pane's body is a
-    /// picture rather than a list without giving up the navigation
-    /// gestures that reach it.
+    /// Selectability travels the same road focusability does and is a
+    /// different answer from it — but it travels it in the opposite
+    /// DIRECTION, and that is the point of this test.
+    ///
+    /// `focusable` is a subtraction from something every board already
+    /// wants. A line cursor has no built-in consumer at all: nothing in
+    /// rat reads a marked line, and its whole value flows out through a
+    /// key action's environment. A pane that nobody wired a key action
+    /// to therefore gains a gesture that can never lead anywhere, which
+    /// is why the answer here is `live`'s and not `focusable`'s.
     #[test]
-    fn selectability_defaults_true_and_inherits_with_an_override() {
+    fn selectability_is_opt_in_and_inherits_with_an_override() {
         let mut decl = file(vec![
-            pane("nested", &["date"]),
+            pane("changed", &["date"]),
             PaneDecl {
-                selectable: Some(true),
-                ..pane("log", &["date"])
+                selectable: Some(false),
+                ..pane("diff", &["date"])
             },
         ]);
-        decl.defaults.selectable = Some(false);
+        decl.defaults.selectable = Some(true);
         let registry = decl.into_registry(&Bindings::new()).expect("registry");
         assert!(
-            !registry.pane(SourceId(0)).expect("nested box").selectable,
-            "the nested board inherits the default"
+            registry.pane(SourceId(0)).expect("changed box").selectable,
+            "the pane inherits the default"
         );
         assert!(
-            registry.pane(SourceId(1)).expect("log box").selectable,
-            "a pane can opt back in"
+            !registry.pane(SourceId(1)).expect("diff box").selectable,
+            "a pane can opt back out"
         );
-        // Independent answers: declining a cursor must not quietly cost
-        // a pane its place in the focus order.
+        // Independent answers: asking for a cursor must not quietly
+        // change a pane's place in the focus order, and declining one
+        // must not cost it that place either.
         assert!(
-            registry.pane(SourceId(0)).expect("nested box").focusable,
+            registry.pane(SourceId(1)).expect("diff box").focusable,
             "opting out of selection is not opting out of focus"
         );
 
@@ -1828,8 +1850,8 @@ mod tests {
             .into_registry(&Bindings::new())
             .expect("registry");
         assert!(
-            ordinary.pane(SourceId(0)).expect("ordinary box").selectable,
-            "omission leaves every board written before this selectable"
+            !ordinary.pane(SourceId(0)).expect("ordinary box").selectable,
+            "a pane that asked for nothing takes no cursor"
         );
     }
 
