@@ -639,6 +639,299 @@ fn a_once_board_on_a_terminal_paints_its_frame_with_s_pressed() {
     );
 }
 
+/// Two stacked panes over fixed bodies, each on its own rows so a
+/// located row belongs to exactly one pane. Side-by-side panes share
+/// terminal rows, which would make "the row carrying A01" also the row
+/// carrying B01.
+fn stacked_bodies(height: u16) -> String {
+    format!(
+        "row-gap 0\n\n\
+         defaults {{\n    height {height}\n    border \"none\"\n    chrome #false\n    shell #true\n}}\n\n\
+         pane \"a\" {{\n    interval \"1h\"\n    command \"printf 'A%s\\n' 01 02 03\"\n}}\n\
+         pane \"b\" {{\n    interval \"1h\"\n    command \"printf 'B%s\\n' 01 02 03\"\n}}\n"
+    )
+}
+
+/// The mark is the focused pane's alone. A second mark on screen would
+/// be pixel-identical to the live one while being inert — the reader
+/// glances at the wrong pane's `>` and acts on a line they are not
+/// looking at.
+///
+/// The first capture is also the end-to-end inertness half: a board
+/// nobody has pressed `s` on carries no marker anywhere, anchored by
+/// both panes' text so it cannot pass on a board that failed to load.
+#[test]
+fn a_cursor_marks_the_focused_panes_row_and_leaves_the_others_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(dir.path(), &stacked_bodies(4));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let first = wait_for_bytes(&session, &mut terminal, b"B03", Duration::from_secs(5))
+        .expect("the first composition never painted");
+    assert!(contains(&first, b"A01"), "both panes must have rendered");
+    assert!(
+        !contains(&first, b"> "),
+        "a board nobody has marked carries no marker: {:?}",
+        String::from_utf8_lossy(&first)
+    );
+
+    session.write_bytes(b"\t");
+    session.write_bytes(b"s");
+    let marked = wait_for_bytes(&session, &mut terminal, b"A01", Duration::from_secs(5))
+        .expect("the mark never painted");
+    let row = row_containing(&marked, b"A01").expect("pane a's first row");
+    assert!(
+        contains(row, b"> "),
+        "the focused pane's cursor row must carry the marker: {:?}",
+        String::from_utf8_lossy(row)
+    );
+    if let Some(other) = row_containing(&marked, b"B01") {
+        assert!(
+            !contains(other, b"> "),
+            "only the focused pane draws a mark: {:?}",
+            String::from_utf8_lossy(other)
+        );
+    }
+
+    // Tab away: the index persists on pane a, but the mark does not
+    // draw. This is the arm that fails against a render with no
+    // focus filter — an inert second mark, pixel-identical to a live
+    // one.
+    session.write_bytes(b"\t");
+    let moved = wait_for_bytes(&session, &mut terminal, b"A01", Duration::from_secs(5))
+        .expect("pane a never repainted after the focus left it");
+    let row = row_containing(&moved, b"A01").expect("pane a's first row");
+    assert!(
+        !contains(row, b"> "),
+        "an unfocused pane must draw no mark: {:?}",
+        String::from_utf8_lossy(row)
+    );
+
+    // And it comes back with the focus, at the index it held.
+    session.write_bytes(b"\t");
+    let back = wait_for_bytes(&session, &mut terminal, b"A01", Duration::from_secs(5))
+        .expect("pane a never repainted when the focus returned");
+    let row = row_containing(&back, b"A01").expect("pane a's first row");
+    assert!(
+        contains(row, b"> "),
+        "the cursor persisted per pane: {:?}",
+        String::from_utf8_lossy(row)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The non-rest arm. A board taller than the window, scrolled before
+/// the first gesture: a mark that only appears at live rest is the
+/// failure this fixture shape exists to catch.
+#[test]
+fn the_mark_survives_a_frame_scrolled_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"j");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 2-23 of 30"],
+        Duration::from_secs(3),
+    );
+    // Tab first, and wait for it to land: the focus brings the viewport
+    // back to pane a, which repaints A01 on its own. Waiting for that
+    // row after both keys would return on the Tab's repaint and judge a
+    // frame the toggle had not reached yet.
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "the focus never landed"
+    );
+    session.write_bytes(b"s");
+    let marked = wait_for_bytes(&session, &mut terminal, b"A01", Duration::from_secs(5))
+        .expect("the mark never painted on a scrolled frame");
+    let row = row_containing(&marked, b"A01").expect("pane a's first row");
+    assert!(
+        contains(row, b"> "),
+        "a mark that only appears at live rest is not a mark: {:?}",
+        String::from_utf8_lossy(row)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A zoomed pane composes alone through the same renderer at a very
+/// different geometry, so the reserve has to be derived per composition
+/// rather than captured once. The mark survives the zoom AND the unzoom.
+#[test]
+fn a_zoomed_pane_marks_its_cursor_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(dir.path(), &stacked_bodies(4));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B03", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(&session, &mut terminal, b"A01", Duration::from_secs(5)),
+        "the mark never painted"
+    );
+
+    session.write_bytes(b"z");
+    let zoomed = wait_for_bytes(&session, &mut terminal, b"A03", Duration::from_secs(5))
+        .expect("the zoom never painted");
+    let row = row_containing(&zoomed, b"A01").expect("pane a's first row, zoomed");
+    assert!(
+        contains(row, b"> "),
+        "the mark must survive the zoom: {:?}",
+        String::from_utf8_lossy(row)
+    );
+
+    session.write_bytes(b"z");
+    let back = wait_for_bytes(&session, &mut terminal, b"B01", Duration::from_secs(5))
+        .expect("the unzoom never painted");
+    let row = row_containing(&back, b"A01").expect("pane a's first row, unzoomed");
+    assert!(
+        contains(row, b"> "),
+        "the mark must survive the unzoom: {:?}",
+        String::from_utf8_lossy(row)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A collapsed pane has no body to mark; a zoom overrules the collapse
+/// and puts the body — and its mark — back on screen without clearing
+/// the bit. Keyed on the raw bit this would paint a visible cursor that
+/// cannot move, toggle, or export.
+#[test]
+fn a_collapsed_pane_shows_no_mark_until_a_zoom_puts_its_body_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(dir.path(), &stacked_bodies(4));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B03", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(&session, &mut terminal, b"A01", Duration::from_secs(5)),
+        "the mark never painted"
+    );
+
+    session.write_bytes(b" ");
+    let collapsed = wait_for_bytes(&session, &mut terminal, b"B01", Duration::from_secs(5))
+        .expect("the collapse never painted");
+    assert!(
+        row_containing(&collapsed, b"A01").is_none(),
+        "a collapsed pane composes no body: {:?}",
+        String::from_utf8_lossy(&collapsed)
+    );
+
+    session.write_bytes(b"z");
+    let woken = wait_for_bytes(&session, &mut terminal, b"A03", Duration::from_secs(5))
+        .expect("a zoomed pane must show its body regardless of collapse");
+    let row = row_containing(&woken, b"A01").expect("pane a's first row");
+    assert!(
+        contains(row, b"> "),
+        "the zoom put the body on screen, so the mark draws: {:?}",
+        String::from_utf8_lossy(row)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The mark takes two columns from the pane's content and `RAT_WIDTH`
+/// deliberately does not move with it: a view gesture that changed the
+/// exported width would read as a resize and restart every child on the
+/// board.
+#[test]
+fn raising_a_cursor_never_restarts_a_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\n\
+             defaults {{\n    height 3\n    border \"rounded\"\n    chrome #false\n    shell #true\n    interval \"10s\"\n}}\n\n\
+             pane \"a\" {{\n    command \"{counter}\"\n}}\n\
+             pane \"b\" {{\n    command \"printf 'zzz'\"\n}}\n",
+            counter = labeled_counter_cmd(&count, "a"),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"a-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    session.write_bytes(b"s");
+    // Past the resize debounce: a geometry drift would have respawned
+    // every child and the counter would read 2.
+    let _ = drain_for(&session, Duration::from_millis(700));
+    let runs = std::fs::read_to_string(&count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    assert_eq!(runs, 1, "raising a cursor must never restart children");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// Accumulate everything the session writes within `total` — unlike
 /// `read_available`, which returns at the first chunk. Duplicated from
 /// the watch suite's local helper, never lifted.

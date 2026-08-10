@@ -7559,6 +7559,13 @@ fn compose_sources(
                 // `overflow_clip(pane.overflow, body.len(), inner_rows)`
                 // — brief seam 5, pinned by the at-rest equality test.
                 view.scroll[id.0].offset(),
+                // The mark is the focused pane's alone: the footer
+                // segment and a key-action's environment both read this
+                // pane and no other, so a second mark on screen would be
+                // indistinguishable from the live one while being inert.
+                // The index itself persists per-pane — Tab away and back
+                // and the cursor is where it was left.
+                view.cursor[id.0].filter(|_| view.focus == Some(id)),
                 &chrome,
                 palette,
                 profile,

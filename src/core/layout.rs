@@ -7,7 +7,8 @@
 use crate::color::ColorProfile;
 use crate::core::box_model::{BoxSpec, render_box};
 use crate::core::measure::{
-    Align, Chunk, ELLIPSIS, chunks, display_width, kept_chars, pad_display, truncate_display,
+    Align, Chunk, ELLIPSIS, SgrState, chunks, display_width, kept_chars, pad_display,
+    truncate_display,
 };
 #[cfg(test)]
 use crate::core::registry::Overflow;
@@ -17,6 +18,17 @@ use crate::term::marks::LineMark;
 #[cfg(test)]
 use crate::term::scroll::max_offset;
 use crate::theme::Palette;
+
+/// Display columns the cursor mark takes from a pane's content while
+/// that pane's cursor is up: the marker cell and a gap. Its own
+/// constant, never a reuse of the change gutter's: that one is a FRAME
+/// region and this is a PANE region, and a future change to either must
+/// not silently move the other.
+///
+/// The gap is load-bearing, not padding. A marker abutting the text
+/// reads as part of the child's first token — and the first token of a
+/// diff row is `+`, `-`, or a space.
+pub const CURSOR_COLS: usize = 2;
 
 /// A rendered block and its marks in the block's own line coordinates.
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -104,6 +116,16 @@ pub fn scroll_badge(offset: usize, window: usize, total: usize) -> String {
 /// uses, which is why a moving viewport carries its highlights for free.
 /// Callers derive it from `overflow_clip` (at rest) or a pane's
 /// `LiveScroll` (scrolled); `render_pane` no longer knows `Overflow`.
+///
+/// `cursor` is the pane's selected line in OUTPUT-line coordinates —
+/// the same space as `dropped` and as `marks`' index, so the marked box
+/// row is `cursor - dropped`. `Some` reserves `CURSOR_COLS` cells at
+/// the left of every BODY row (the chrome row and the border keep the
+/// full width); the row the cursor is on gets the marker and every
+/// other body row gets the same two spaces, so nothing shifts as the
+/// cursor moves. A cursor outside the window marks nothing and still
+/// reserves — the reserve follows the cursor's EXISTENCE, the mark
+/// follows its VISIBILITY.
 #[allow(clippy::too_many_arguments)]
 pub fn render_pane(
     output: &[String],
@@ -111,6 +133,7 @@ pub fn render_pane(
     pane: &PaneBox,
     geom: PaneGeometry,
     dropped: usize,
+    cursor: Option<usize>,
     chrome: &PaneChrome<'_>,
     palette: &Palette,
     profile: ColorProfile,
@@ -121,6 +144,40 @@ pub fn render_pane(
     let mut content: Vec<String> = output.iter().skip(dropped).take(rows).cloned().collect();
     // Short output pads: the height is declared, never measured.
     content.resize(rows, String::new());
+    let reserve = if cursor.is_some() { CURSOR_COLS } else { 0 };
+    if reserve > 0 {
+        // The marker and its two cells are ours; the row's own bytes
+        // are the child's and are never restyled. Reverse video is the
+        // change highlight's, and a foreground laid over child text is
+        // overridden at the child's first colour change — a row that is
+        // pink up to the first hunk marker and green after.
+        let marker = StyleSpec {
+            bold: true,
+            foreground: Some(palette.selection),
+            ..StyleSpec::default()
+        }
+        .render("> ", profile);
+        // What each row inherits from the one above it. The box seals
+        // its content and REPLAYS that state onto the front of the next
+        // row, so a marker ending in a reset would swallow the replay
+        // and strip the rest of the row of a colour the child was still
+        // painting. Re-assert it after the cell — patch, never replace.
+        let mut carried = SgrState::default();
+        for (i, row) in content.iter_mut().enumerate() {
+            let replay = carried.prefix();
+            for chunk in chunks(row) {
+                if let Chunk::Escape(e) = chunk {
+                    carried.apply(e);
+                }
+            }
+            let cell = if cursor == Some(dropped + i) {
+                marker.as_str()
+            } else {
+                "  "
+            };
+            *row = format!("{cell}{replay}{row}");
+        }
+    }
     if pane.chrome {
         content.push(chrome_row(chrome, cols, profile));
     }
@@ -149,7 +206,9 @@ pub fn render_pane(
     let lines = render_box(&content, &spec, profile);
 
     let row_shift = pane.edge_cells() as usize + pane.padding.top;
-    let char_shift = pane.edge_cells() as usize + pane.padding.left;
+    // `reserve` is in cells and this shift is in chars; they are the
+    // same number only because the marker is two ASCII characters.
+    let char_shift = pane.edge_cells() as usize + pane.padding.left + reserve;
     let mut shifted = vec![LineMark::default(); lines.len()];
     for (i, mark) in marks.iter().enumerate().skip(dropped).take(rows) {
         if !mark.changed {
@@ -168,9 +227,15 @@ pub fn render_pane(
         // `…` ("continues past the edge" — a decision, pinned by test).
         // `changed` stays true even when every run clips away: the
         // line DID change, and the gutter must still say so.
-        let limit = output
-            .get(i)
-            .map_or(0, |line| kept_chars(line, cols, ELLIPSIS));
+        // The content's own budget, which the reserve narrowed.
+        // `char_shift` and this limit move as a pair or a run addresses
+        // the neighbour. SATURATING: `inner_cols` is itself a
+        // `saturating_sub` in the registry and can be 0 or 1, so a
+        // plain subtraction underflows on a pane narrower than the
+        // region.
+        let limit = output.get(i).map_or(0, |line| {
+            kept_chars(line, cols.saturating_sub(reserve), ELLIPSIS)
+        });
         slot.cells = mark
             .cells
             .iter()
@@ -577,7 +642,9 @@ mod tests {
         profile: ColorProfile,
     ) -> PaneBlock {
         let dropped = overflow_clip(pane.overflow, output.len(), geom.inner_rows as usize);
-        render_pane(output, marks, pane, geom, dropped, chrome, palette, profile)
+        render_pane(
+            output, marks, pane, geom, dropped, None, chrome, palette, profile,
+        )
     }
 
     fn sides(top: usize, right: usize, bottom: usize, left: usize) -> Sides {
@@ -1451,6 +1518,7 @@ mod tests {
             &pane,
             geom(&pane, 5),
             2,
+            None,
             &chrome(None),
             &palette(),
             ColorProfile::Ascii,
@@ -1468,11 +1536,395 @@ mod tests {
             &pane,
             geom(&pane, 5),
             5,
+            None,
             &chrome(None),
             &palette(),
             ColorProfile::Ascii,
         );
         assert_eq!(block.lines, lines(&["L6   ", "     ", "     "]));
+    }
+
+    /// `render_pane` with a cursor, at the declared viewport. The
+    /// shipped `render_at_rest` deliberately does NOT grow a parameter:
+    /// every test that is not about the cursor stays textually
+    /// unchanged, which is stronger inertness evidence than threading
+    /// `None` through twenty call sites.
+    #[allow(clippy::too_many_arguments)]
+    fn render_with_cursor(
+        output: &[String],
+        marks: &[LineMark],
+        pane: &PaneBox,
+        geom: PaneGeometry,
+        dropped: usize,
+        cursor: Option<usize>,
+        palette: &Palette,
+        profile: ColorProfile,
+    ) -> PaneBlock {
+        render_pane(
+            output,
+            marks,
+            pane,
+            geom,
+            dropped,
+            cursor,
+            &chrome(None),
+            palette,
+            profile,
+        )
+    }
+
+    #[test]
+    fn a_cursor_marks_its_row_and_pads_the_others() {
+        // The unmarked rows pay the same two cells the marker does, so
+        // the pane's text holds one column as the mark moves. Without
+        // it every `j` jitters the whole body sideways.
+        let pane = pane(4, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["L1", "L2", "L3", "L4"]);
+        let block = render_with_cursor(
+            &body,
+            &vec![LineMark::default(); 4],
+            &pane,
+            geom(&pane, 8),
+            0,
+            Some(1),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(
+            block.lines,
+            lines(&["  L1    ", "> L2    ", "  L3    ", "  L4    "])
+        );
+        for line in &block.lines {
+            assert_eq!(display_width(line), 8, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_pane_with_no_cursor_renders_byte_for_byte_what_it_always_did() {
+        // Against literals, never against a recomputation: an
+        // implementation that reserved the region unconditionally would
+        // pass a comparison of the render against itself.
+        let bare = pane(3, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["L1", "L2", "L3"]);
+        let block = render_with_cursor(
+            &body,
+            &vec![LineMark::default(); 3],
+            &bare,
+            geom(&bare, 5),
+            0,
+            None,
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(block.lines, lines(&["L1   ", "L2   ", "L3   "]));
+
+        // A bordered, padded pane too: the reserve rides the same term
+        // the border and the padding do, so it is the one shape where a
+        // half-applied change hides.
+        let boxed = pane(5, BorderPreset::Rounded, sides(0, 1, 0, 1), false);
+        let boxed_block = render_with_cursor(
+            &body,
+            &vec![LineMark::default(); 3],
+            &boxed,
+            geom(&boxed, 10),
+            0,
+            None,
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(
+            boxed_block.lines,
+            render_at_rest(
+                &body,
+                &vec![LineMark::default(); 3],
+                &boxed,
+                geom(&boxed, 10),
+                &chrome(None),
+                &palette(),
+                ColorProfile::Ascii,
+            )
+            .lines
+        );
+        assert_eq!(
+            boxed_block.lines,
+            lines(&[
+                "╭─ plan ─╮",
+                "│ L1     │",
+                "│ L2     │",
+                "│ L3     │",
+                "╰────────╯",
+            ])
+        );
+    }
+
+    #[test]
+    fn the_cursor_mark_reads_the_selection_token_not_the_accent() {
+        // Sentinel: selection and accent share a value by construction,
+        // so every appearance test below passes for a mark painted from
+        // `accent`. Only a diverging palette tells them apart.
+        let diverged = Palette {
+            selection: ratatui::style::Color::Indexed(99),
+            ..Palette::builtin(Appearance::Dark, AppearanceSource::Default)
+        };
+        let pane = pane(2, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["L1", "L2"]);
+        let block = render_with_cursor(
+            &body,
+            &vec![LineMark::default(); 2],
+            &pane,
+            geom(&pane, 8),
+            0,
+            Some(0),
+            &diverged,
+            ColorProfile::Ansi256,
+        );
+        assert!(block.lines[0].contains("38;5;99"), "{:?}", block.lines[0]);
+        assert!(!block.lines[0].contains("38;5;212"), "{:?}", block.lines[0]);
+    }
+
+    #[test]
+    fn the_mark_carries_both_appearances() {
+        let pane = pane(2, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["L1", "L2"]);
+        let render = |appearance| {
+            render_with_cursor(
+                &body,
+                &vec![LineMark::default(); 2],
+                &pane,
+                geom(&pane, 8),
+                0,
+                Some(0),
+                &Palette::builtin(appearance, AppearanceSource::Default),
+                ColorProfile::Ansi256,
+            )
+            .lines[0]
+                .clone()
+        };
+        assert!(render(Appearance::Dark).contains("38;5;212"));
+        assert!(render(Appearance::Light).contains("38;5;129"));
+    }
+
+    #[test]
+    fn under_ascii_the_glyph_stays_and_the_ink_goes() {
+        // The pair in one test: "no escapes" alone is also true of a
+        // render that dropped the mark entirely, and a NO_COLOR board
+        // with no visible cursor is a missing feature, not a
+        // degradation.
+        let pane = pane(2, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["L1", "L2"]);
+        let block = render_with_cursor(
+            &body,
+            &vec![LineMark::default(); 2],
+            &pane,
+            geom(&pane, 8),
+            0,
+            Some(0),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert!(block.lines[0].starts_with("> "), "{:?}", block.lines[0]);
+        assert!(!block.lines[0].contains('\u{1b}'), "{:?}", block.lines[0]);
+        assert!(block.lines[1].starts_with("  "), "{:?}", block.lines[1]);
+    }
+
+    #[test]
+    fn a_marker_never_strips_a_childs_multi_line_span() {
+        // The box seals its content and replays whatever the previous
+        // row left open onto the front of the next one. A marker ending
+        // in a reset would swallow that replay and strip the rest of
+        // the row of a colour the child was still painting — an
+        // intermittent, child-dependent bug that no width or glyph
+        // assertion sees.
+        let pane = pane(2, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["\u{1b}[31mfirst", "second"]);
+        for at in [0usize, 1] {
+            let block = render_with_cursor(
+                &body,
+                &vec![LineMark::default(); 2],
+                &pane,
+                geom(&pane, 10),
+                0,
+                Some(at),
+                &palette(),
+                ColorProfile::Ansi256,
+            );
+            let second = &block.lines[1];
+            let text = second.find("second").expect("the row's text");
+            assert!(
+                second[..text].contains("\u{1b}[31m"),
+                "cursor on row {at}: the child's span died at {second:?}"
+            );
+        }
+        // And the same body with no cursor is byte-identical to today —
+        // the one input where the reserve does more than prefix spaces.
+        let plain = render_with_cursor(
+            &body,
+            &vec![LineMark::default(); 2],
+            &pane,
+            geom(&pane, 10),
+            0,
+            None,
+            &palette(),
+            ColorProfile::Ansi256,
+        );
+        assert_eq!(
+            plain.lines,
+            render_at_rest(
+                &body,
+                &vec![LineMark::default(); 2],
+                &pane,
+                geom(&pane, 10),
+                &chrome(None),
+                &palette(),
+                ColorProfile::Ansi256,
+            )
+            .lines
+        );
+    }
+
+    #[test]
+    fn the_reserved_region_never_changes_the_pane_size() {
+        // The wide-rune arm is not optional: the reserve is measured in
+        // display cells and the marker in chars, and the two agree only
+        // because the marker is ASCII. A future glyph breaks this first.
+        let pane = pane(6, BorderPreset::Rounded, sides(0, 1, 0, 1), true);
+        let body = lines(&[
+            "a very long line that will certainly be cut by the box",
+            "",
+            "日本語のテキストです",
+            "x",
+        ]);
+        for cursor in [None, Some(0), Some(2)] {
+            let block = render_with_cursor(
+                &body,
+                &vec![LineMark::default(); 4],
+                &pane,
+                geom(&pane, 20),
+                0,
+                cursor,
+                &palette(),
+                ColorProfile::Ascii,
+            );
+            assert_eq!(block.lines.len(), 6, "cursor {cursor:?}");
+            for line in &block.lines {
+                assert_eq!(display_width(line), 20, "cursor {cursor:?}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pane_narrower_than_the_region_does_not_panic() {
+        // `inner_cols` is `cells.saturating_sub(frame_cols)` in the
+        // registry, so a three-cell bordered pane IS the one-inner-column
+        // case: these widths come from a plain board, not a struct
+        // literal. Run in debug, where the underflow would actually fire
+        // — in release it wraps and clips nothing.
+        let pane = pane(3, BorderPreset::Rounded, Sides::default(), false);
+        let body = lines(&["hello", "日本語"]);
+        for cells in [2u16, 3, 4, 5] {
+            for cursor in [None, Some(0), Some(1)] {
+                let block = render_with_cursor(
+                    &body,
+                    &vec![LineMark::default(); 2],
+                    &pane,
+                    geom(&pane, cells),
+                    0,
+                    cursor,
+                    &palette(),
+                    ColorProfile::Ascii,
+                );
+                assert_eq!(block.lines.len(), 3, "{cells} cells, cursor {cursor:?}");
+                for line in &block.lines {
+                    assert_eq!(
+                        display_width(line),
+                        cells as usize,
+                        "{cells} cells, cursor {cursor:?}: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_marked_row_keeps_its_change_highlight_coordinates() {
+        // The shift and the clip are one derivation in two places. Move
+        // only the shift and a run lands two chars left of the
+        // characters it describes — plausible-looking and silent.
+        let pane = pane(2, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["abcdef", "ghijkl"]);
+        let mut marks = vec![LineMark::default(); 2];
+        marks[0] = marked(2..5);
+        let block = render_with_cursor(
+            &body,
+            &marks,
+            &pane,
+            geom(&pane, 12),
+            0,
+            Some(0),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(block.marks[0].cells, vec![2 + CURSOR_COLS..5 + CURSOR_COLS]);
+        let row = crate::core::measure::strip_escapes(&block.lines[0]);
+        let run = &block.marks[0].cells[0];
+        assert_eq!(
+            row.chars()
+                .skip(run.start)
+                .take(run.end - run.start)
+                .collect::<String>(),
+            "cde",
+            "the run must land on the characters it describes: {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_reaching_the_cut_still_marks_the_ellipsis_under_a_reserved_region() {
+        // The clip limit is the content's own budget, which the reserve
+        // narrowed. Shift without narrowing and a run reaches two chars
+        // past the real cut — which, once the panes are joined,
+        // addresses the gap and the neighbour.
+        let pane = pane(1, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["abcdefghij"]);
+        let mut marks = vec![LineMark::default(); 1];
+        marks[0] = marked(0..10);
+        let block = render_with_cursor(
+            &body,
+            &marks,
+            &pane,
+            geom(&pane, 8),
+            0,
+            Some(0),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        let limit = kept_chars(&body[0], 8 - CURSOR_COLS, ELLIPSIS);
+        assert_eq!(block.marks[0].cells, vec![CURSOR_COLS..limit + CURSOR_COLS]);
+        assert!(
+            block.marks[0].cells[0].end <= 8,
+            "a run must never leave the pane: {:?}",
+            block.marks[0].cells
+        );
+    }
+
+    #[test]
+    fn a_cursor_outside_the_window_marks_nothing_and_still_reserves() {
+        // The reserve follows the cursor's EXISTENCE, the mark follows
+        // its visibility. Off-window is transient — the window follows
+        // the cursor — but it is reachable for one composition, and it
+        // must render sanely rather than clamp or mark row zero.
+        let pane = pane(3, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["L1", "L2", "L3", "L4", "L5", "L6", "L7"]);
+        let block = render_with_cursor(
+            &body,
+            &vec![LineMark::default(); 7],
+            &pane,
+            geom(&pane, 6),
+            4,
+            Some(0),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(block.lines, lines(&["  L5  ", "  L6  ", "  L7  "]));
     }
 
     #[test]
@@ -1560,6 +2012,7 @@ mod tests {
             &pane,
             geom(&pane, 90),
             0,
+            None,
             &chrome,
             &palette(),
             ColorProfile::Ascii,
@@ -1587,6 +2040,7 @@ mod tests {
             &pane,
             geom(&pane, 90),
             0,
+            None,
             &chrome,
             &palette(),
             ColorProfile::Ascii,
