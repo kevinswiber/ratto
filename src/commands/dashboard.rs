@@ -184,9 +184,15 @@ fn pane_help(registry: &Registry, bindings: &[KeyBinding]) -> Vec<String> {
             lines.push(format!("      {trigger}"));
         }
     }
-    // Unconditional, unlike the sections below: every dashboard registry
-    // is Composition::Panes, so the gestures always apply.
-    lines.extend(PANE_GESTURE_HELP.iter().map(|l| (*l).to_string()));
+    // The gestures themselves are unconditional, unlike the sections
+    // below: every dashboard registry is Composition::Panes, so they
+    // always apply. The cursor's rows inside the block are not — the
+    // key is the board's own where no pane asked for one.
+    lines.extend(pane_gesture_help(
+        registry
+            .ids()
+            .any(|id| registry.pane(id).is_some_and(|pane| pane.selectable)),
+    ));
     lines.extend(binding_help(bindings));
     if registry.ids().any(|id| registry.spec(id).live) {
         lines.extend(LIVE_HELP.iter().map(|l| (*l).to_string()));
@@ -299,14 +305,29 @@ const BINDING_HELP_TAIL: &[&str] = &[
     "    status row names the key that declined.",
 ];
 
-const PANE_GESTURE_HELP: &[&str] = &[
+/// The gestures every board answers, up to the `Esc` row — which is
+/// where the two shapes diverge, because the rung Esc peels first
+/// exists only on a board that can hold a cursor.
+const PANE_GESTURE_HELP_HEAD: &[&str] = &[
     "",
     "  pane gestures (while the frame is live — not the `live` label):",
     "    Tab, BackTab     cycle focus between panes — a zoom rides along",
     "    Alt-h/j/k/l      move focus directionally",
     "    Alt-1..9         jump straight to a numbered focusable pane",
-    "    s                put a line cursor in the focused pane, or drop it",
-    "    Esc              peel one layer: cursor, zoom, focus, frame scroll",
+];
+
+/// The cursor's own row, between the focus gestures and `Esc` — where
+/// a reader looks for a key, not appended in a clump at the end.
+const CURSOR_GESTURE_ROW: &str =
+    "    s                put a line cursor in the focused pane, or drop it";
+
+/// `Esc`, in its two forms. The ladder it peels is the board's, and
+/// naming a rung that cannot exist would be a reference that lies.
+const ESC_ROW_WITH_CURSOR: &str =
+    "    Esc              peel one layer: cursor, zoom, focus, frame scroll";
+const ESC_ROW: &str = "    Esc              peel one layer: zoom, focus, frame scroll";
+
+const PANE_GESTURE_HELP_TAIL: &[&str] = &[
     "    Enter            zoom the focused pane; zoomed, page its body",
     "    z                zoom the focused pane to the full frame",
     "    Space            collapse the focused pane to its title row",
@@ -317,11 +338,36 @@ const PANE_GESTURE_HELP: &[&str] = &[
     "    focus is held, every focusable title counts itself in layout",
     "    order; Alt-1..9 jumps to the first nine (from rest, too),",
     "    and Tab reaches the rest of a larger board.",
+];
+
+/// What the cursor changes about keys the block above already
+/// documents. It follows the prose it qualifies.
+const CURSOR_GESTURE_HELP: &[&str] = &[
     "    With a cursor up, the scroll keys move the cursor instead and",
     "    the pane's window follows it; a key action then reads the",
     "    marked line as RAT_SELECTION. The cursor holds its line when",
     "    the pane re-runs, and a paused frame ignores all of this.",
 ];
+
+/// The pane-gesture block for one board. A cursor is opt-in, so on a
+/// board where no pane asked for one the key does nothing and belongs
+/// to that board's own bindings — a reference naming it there would be
+/// wrong, not merely noisy.
+fn pane_gesture_help(cursor: bool) -> Vec<String> {
+    let mut lines: Vec<String> = PANE_GESTURE_HELP_HEAD
+        .iter()
+        .map(|l| (*l).to_string())
+        .collect();
+    if cursor {
+        lines.push(CURSOR_GESTURE_ROW.to_string());
+    }
+    lines.push(if cursor { ESC_ROW_WITH_CURSOR } else { ESC_ROW }.to_string());
+    lines.extend(PANE_GESTURE_HELP_TAIL.iter().map(|l| (*l).to_string()));
+    if cursor {
+        lines.extend(CURSOR_GESTURE_HELP.iter().map(|l| (*l).to_string()));
+    }
+    lines
+}
 
 /// What the `live` label means, and what `interval` means under it.
 ///
@@ -802,7 +848,20 @@ mod tests {
     };
     use crate::core::trigger::TriggerSpec;
 
+    /// The ordinary board: two panes, neither of which asked for a
+    /// line cursor. That is the shape of nearly every board, and the
+    /// help block it produces is the one worth pinning byte for byte.
     fn registry(triggers: bool) -> Registry {
+        registry_of(triggers, false)
+    }
+
+    /// The same board with a pane that asked for a cursor, for the arm
+    /// that pins what the reference grows when one does.
+    fn registry_with_a_cursor() -> Registry {
+        registry_of(false, true)
+    }
+
+    fn registry_of(triggers: bool, selectable: bool) -> Registry {
         let spec = |id: &str, path: &str| SourceSpec {
             id: id.to_string(),
             program: SourceProgram::Argv(vec!["true".into()]),
@@ -825,7 +884,7 @@ mod tests {
             title: None,
             chrome: true,
             focusable: true,
-            selectable: true,
+            selectable,
         };
         Registry::panes(
             vec![spec("a", "./sa"), spec("b", "./sb")],
@@ -1008,10 +1067,7 @@ mod tests {
                 "    Tab, BackTab     cycle focus between panes — a zoom rides along".to_string(),
                 "    Alt-h/j/k/l      move focus directionally".to_string(),
                 "    Alt-1..9         jump straight to a numbered focusable pane".to_string(),
-                "    s                put a line cursor in the focused pane, or drop it"
-                    .to_string(),
-                "    Esc              peel one layer: cursor, zoom, focus, frame scroll"
-                    .to_string(),
+                "    Esc              peel one layer: zoom, focus, frame scroll".to_string(),
                 "    Enter            zoom the focused pane; zoomed, page its body".to_string(),
                 "    z                zoom the focused pane to the full frame".to_string(),
                 "    Space            collapse the focused pane to its title row".to_string(),
@@ -1022,10 +1078,6 @@ mod tests {
                 "    focus is held, every focusable title counts itself in layout".to_string(),
                 "    order; Alt-1..9 jumps to the first nine (from rest, too),".to_string(),
                 "    and Tab reaches the rest of a larger board.".to_string(),
-                "    With a cursor up, the scroll keys move the cursor instead and".to_string(),
-                "    the pane's window follows it; a key action then reads the".to_string(),
-                "    marked line as RAT_SELECTION. The cursor holds its line when".to_string(),
-                "    the pane re-runs, and a paused frame ignores all of this.".to_string(),
             ]
         );
         // Stated rather than implied: a board with no bindings gains
@@ -1035,6 +1087,53 @@ mod tests {
             !quiet.iter().any(|l| l.contains("key actions")),
             "{quiet:?}"
         );
+    }
+
+    /// The reference documents the keys this board answers, and a
+    /// cursor is opt-in — so `s` appears exactly where pressing it does
+    /// something. A reference that named a key the board hands to its
+    /// own bindings would be worse than silent: it would be wrong.
+    ///
+    /// The DIFFERENCE is the assertion, not a second literal block. A
+    /// copy of the whole reference here would go stale against the one
+    /// above without either failing.
+    #[test]
+    fn the_reference_grows_the_cursor_rows_only_where_a_pane_asked_for_one() {
+        let without = pane_help(&registry(false), &[]);
+        let with = pane_help(&registry_with_a_cursor(), &[]);
+        assert!(
+            !without.iter().any(|l| l.contains("line cursor")),
+            "a board with no cursor must not advertise the key: {without:?}"
+        );
+        let added: Vec<&String> = with.iter().filter(|l| !without.contains(l)).collect();
+        assert_eq!(
+            added,
+            [
+                "    s                put a line cursor in the focused pane, or drop it",
+                "    Esc              peel one layer: cursor, zoom, focus, frame scroll",
+                "    With a cursor up, the scroll keys move the cursor instead and",
+                "    the pane's window follows it; a key action then reads the",
+                "    marked line as RAT_SELECTION. The cursor holds its line when",
+                "    the pane re-runs, and a paused frame ignores all of this.",
+            ]
+        );
+        // Esc is REPLACED rather than added beside: the rung it peels
+        // first only exists on a board that can hold a cursor, and two
+        // Esc rows would describe two different keys.
+        assert_eq!(
+            with.iter().filter(|l| l.contains("    Esc ")).count(),
+            1,
+            "{with:?}"
+        );
+        // The rows keep their places rather than being appended in a
+        // clump: `s` reads with the gestures, and the paragraph reads
+        // with the prose.
+        let at = |lines: &[String], needle: &str| {
+            lines.iter().position(|l| l.contains(needle)).expect(needle)
+        };
+        assert!(at(&with, "    s   ") > at(&with, "Alt-1..9"));
+        assert!(at(&with, "    s   ") < at(&with, "    Esc "));
+        assert!(at(&with, "With a cursor up") > at(&with, "and Tab reaches"));
     }
 
     #[test]
@@ -1053,16 +1152,18 @@ mod tests {
             "z ",
             "Space",
             "focus",
-            // Not `"s"` or `"s "`: both match incidentally, in `pane
-            // gestures`, in `panes`, in half the prose. A phrase that
-            // can only come from the new row.
-            "line cursor",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in {text}");
         }
         // The retargeting sentence is a behavior change to keys the
         // shared reference already documents, so it must be stated here.
         assert!(text.contains("scroll keys"), "the retarget is unstated");
+        // And the cursor row, on the board that has one. Not `"s"` or
+        // `"s "`: both match incidentally, in `pane gestures`, in
+        // `panes`, in half the prose. A phrase that can only come from
+        // that row.
+        let with_cursor = pane_help(&registry_with_a_cursor(), &[]).join("\n");
+        assert!(with_cursor.contains("line cursor"), "{with_cursor}");
     }
 
     #[test]

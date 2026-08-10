@@ -41,9 +41,5 @@ row {
     pane "nested" {
         command "rat" "dashboard" "examples/panes.kdl" "--once"
         height 15
-        // This pane's body is a composed frame rather than a list of
-        // lines, so a line cursor over it would mark a horizontal slice
-        // through a picture.
-        selectable #false
     }
 }

@@ -14,8 +14,10 @@
 //
 //   echo src/main.rs > "$(git rev-parse --git-common-dir)/review.sel"
 //
-// 1. `s` is rat's own key, not this board's: it marks a line in the
-//    focused pane. Every key action then sees that line as
+// 1. `s` is rat's own key HERE because one pane asked for a cursor
+//    (`selectable #true` on `changed`); on a board where none does the
+//    key stays free for that board to bind. It marks a line in the
+//    focused pane, and every key action then sees that line as
 //    $RAT_SELECTION with its styling stripped, its pane as
 //    $RAT_SELECTION_PANE, and its 1-based row as $RAT_SELECTION_LINE.
 // 2. With no cursor up, none of the three is SET — not set to empty.
@@ -75,6 +77,10 @@ row {
         interval "10s"
         shell #true
         command "git diff --name-only HEAD"
+        // The only pane here whose body is a list worth marking, so the
+        // only one that asks for a cursor. `s` reaches it from rest,
+        // and the panes below never take one.
+        selectable #true
     }
 
     pane "selection" {

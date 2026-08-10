@@ -370,12 +370,12 @@ box, borders and chrome included — the pin is what keeps the frame's
 row count constant and repaints cheap. Longer output is cut by
 `overflow`: `keep-top` (the default) or `keep-bottom` for a log tail.
 `width` takes cells (`"40"`), a weight (`"2fr"`), or `"auto"`.
-`focusable #false` leaves a pane visible and running but removes it from
-pane navigation; use it for headings and other presentational panes.
-`selectable #false` says a pane's body is a composed picture rather than
-a list of lines, so it takes no line cursor while staying fully
-navigable; use it for a nested dashboard, a rendered table, or a chart.
-Both default to `#true`.
+`focusable #false` (default `#true`) leaves a pane visible and running
+but removes it from pane navigation; use it for headings and other
+presentational panes. `selectable #true` (default `#false`) says a
+pane's body is a list of lines a reader can mark one of, and asks for
+the line cursor below — a pane whose body is a composed picture, or one
+no key action reads, simply does not ask.
 
 Every pane's last inner row is a faint `{cadence} · {stamp}` line the
 loop owns. The stamp is when that pane's output last *changed*, not
@@ -498,10 +498,22 @@ new shape, never reset. The horizontal shift (`h/l`) is a plain-watch
 affair: pane content is clipped to its box, so on a board those keys
 are inert.
 
+**A pane asks for the line cursor with `selectable #true`.** It is the
+one pane gesture that is opt-in, because it is the one with no built-in
+consumer: nothing in rat reads a marked line, and its value flows out
+through a key action's environment. So a board declares which pane
+holds lines worth marking, usually exactly one, and the rest of the
+board is unaffected — on a board where no pane asks, `s` does nothing
+and stays free for that board to bind as a key action of its own.
+
 `s` puts a line cursor in the focused pane — a `>` mark on one of its
 own retained lines — and `s` again takes it away. With no pane
-focused, `s` focuses the first one and marks a line there, the way
-every pane gesture behaves from rest. While a cursor is up the scroll
+focused, `s` focuses the first pane that asked for a cursor and marks a
+line there, the way every pane gesture lands from rest on the first
+pane it can act on. Standing in a pane that asked for nothing and
+pressing `s` does nothing at all: the gesture declines where you are
+rather than moving the mark somewhere you were not looking. While a
+cursor is up the scroll
 keys move it rather than the window (`j/k` a line, `d/u` a half,
 `f/b` a window, `g/G` the ends) and the window follows the cursor
 rather than the other way round; the footer names the mark's place as
@@ -517,16 +529,15 @@ and goes nowhere until the pane is expanded, which the footer says as
 zoom. What a key action does with the marked line is under Key actions
 below.
 
-A line only means something where the pane's body is a list of lines.
-A pane running a nested dashboard, a rendered table, or a chart holds a
-composed picture, and a mark across one row of it hands a command a
+A line only means something where the pane's body is a list of lines,
+which is why the ask exists rather than being assumed. A pane running a
+nested dashboard, a rendered table, or a chart holds a composed
+picture, and a mark across one row of it would hand a command a
 horizontal slice — which parses, so a script written for a list gets a
-plausible-looking token instead of an error. `selectable #false` on such
-a pane says so: `s` declines there, silently and from every route,
-including from rest, where it leaves the focus where it was rather than
-moving on to a pane you did not point it at. Everything else about the
-pane is untouched — Tab, the number jump, zoom, collapse, and its own
-scroll all keep working.
+plausible-looking token instead of an error. Such a pane simply never
+asks. Asking is also not `focusable`: a pane that takes no cursor is
+still reached by `Tab` and the number jump, still zooms, still
+collapses, and still drives its own scroll.
 
 **The mark is a visual channel.** A board repaints in place, and in
 our testing with VoiceOver in macOS Terminal an in-place mark was not
@@ -773,7 +784,12 @@ else — a function key, a `Ctrl` chord, a character outside ASCII — is
 refused when the board loads, with the list of what is spellable,
 because the ceiling is not visible from the file. A key the dashboard
 already uses is refused the same way: a built-in wins, and it wins
-with an error rather than by quietly swallowing the binding.
+with an error rather than by quietly swallowing the binding. `s` is
+the one key whose ownership depends on the board — it belongs to the
+line cursor only where a pane asked for one, and is otherwise yours to
+bind. Adding `selectable #true` to a pane on a board that binds `s`
+therefore turns that binding into a load error, which is the refusal
+above doing its job.
 
 `command` and `script` are a pane's own two program forms, unchanged,
 and `shell` inherits from `defaults` exactly as a pane's does. What a
