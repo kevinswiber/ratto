@@ -10694,6 +10694,77 @@ mod tests {
         assert_eq!(panes.cursor[0], Some(59), "the cursor clamps to the body");
     }
 
+    #[test]
+    fn no_sequence_of_ticks_ever_raises_a_cursor() {
+        let registry = zoom_row_registry();
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let mut panes = view_zooming(&registry, None);
+        let geom = derive_geometry(&registry, (80, 24), None, false, &panes);
+        let window = geom[0].inner_rows as usize;
+        assert_eq!(window, 2, "fixture premise");
+
+        // Pane 0 rides its tail; pane 1 is re-placed high before every
+        // tick so it clamps or holds visibly. Without that anchor, "the
+        // cursors are all absent" is the assertion that passes just as
+        // happily against a build where the helper is never called.
+        panes.scroll[0] = LiveScroll::start(ScrollStep::Bottom, 0, window);
+        let bodies: [Option<Vec<String>>; 5] = [
+            None,
+            Some((1..=40).map(|i| format!("a{i}")).collect()),
+            Some(Vec::new()),
+            Some((1..=3).map(|i| format!("b{i}")).collect()),
+            Some((1..=400).map(|i| format!("c{i}")).collect()),
+        ];
+        for body in bodies {
+            let total = body.as_ref().map_or(0, Vec::len);
+            runtime[0].output = body.clone();
+            runtime[1].output = body;
+            panes.scroll[1] = LiveScroll::at(30, 400, window);
+            reanchor_pane_view(&mut panes, &runtime, &geom);
+            assert_eq!(
+                panes.cursor,
+                vec![None; 2],
+                "a tick raised a cursor over {total} lines"
+            );
+            assert_eq!(
+                panes.scroll[0].offset(),
+                max_offset(total, window),
+                "the pinned window rides {total} lines"
+            );
+            assert_eq!(
+                panes.scroll[1].offset(),
+                30.min(max_offset(total, window)),
+                "the held window holds, clamped, over {total} lines"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pane_with_no_body_and_a_pane_with_an_empty_body_both_rest() {
+        // The two shapes of "nothing to point at" are different values
+        // in the tree — a pane that has never completed, and a child
+        // that ran and printed nothing — and they must be one answer
+        // here. The lined neighbour is what stops the test passing
+        // because the helper cleared everything.
+        let registry = zoom_row_registry();
+        let lined: Vec<String> = (1..=8).map(|i| format!("n{i}")).collect();
+        let nothing: [Option<Vec<String>>; 2] = [None, Some(Vec::new())];
+        for empty in nothing {
+            for start in [Some(3), None] {
+                let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+                runtime[0].output = empty.clone();
+                runtime[1].output = Some(lined.clone());
+                let mut panes = view_zooming(&registry, None);
+                let geom = derive_geometry(&registry, (80, 24), None, false, &panes);
+                panes.cursor[0] = start;
+                panes.cursor[1] = Some(7);
+                reanchor_pane_view(&mut panes, &runtime, &geom);
+                assert_eq!(panes.cursor[0], None, "{empty:?} starting from {start:?}");
+                assert_eq!(panes.cursor[1], Some(7), "the neighbour keeps its line");
+            }
+        }
+    }
+
     // The engine itself never names these two types (they live behind
     // the registry contract), so the test module imports them
     // explicitly — `use super::*` cannot supply them.

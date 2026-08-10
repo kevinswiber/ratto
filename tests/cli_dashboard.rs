@@ -2944,6 +2944,112 @@ fn a_piped_once_board_is_byte_identical_with_and_without_bindings() {
     assert_eq!(a.stderr, b.stderr, "stderr moved");
 }
 
+/// Two stacked panes over constant bodies, with every input the frame's
+/// bytes depend on declared rather than defaulted. `row-gap` is spelled
+/// out so the literal below does not rest on a default anyone may later
+/// change, and the pane names are inside the rendered text, so a board
+/// that failed to load cannot produce a passing comparison.
+fn stacked_constant_board(dir: &std::path::Path, name: &str, interval: &str) -> String {
+    let pane = |label: &str| {
+        format!(
+            "pane \"{label}\"{interval} {{\n    command \"{bin}\" \"style\" \"{label}-const\"\n    height 3\n    chrome #false\n    border \"none\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\"),
+        )
+    };
+    fixture(
+        dir,
+        name,
+        &format!("row-gap 0\n\n{}\n{}", pane("left"), pane("right")),
+    )
+}
+
+/// The per-pane view state the composer receives is the whole reason
+/// this witness is a PANES composition rather than a single box:
+/// `compose_sources` takes that value, so a composer that ever read a
+/// pane's selected line would move exactly these bytes.
+///
+/// Green BEFORE the per-pane selected-line state landed and green after
+/// — a witness that has never been green proves nothing. Verified at
+/// `f35f93c` (v0.19.0 plus the cmd.exe example) before the field
+/// existed, and again on the branch that added it.
+#[test]
+fn a_panes_board_renders_byte_identically_with_the_view_state_in_place() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = stacked_constant_board(dir.path(), "board.kdl", "");
+    // The width is an INPUT, for the reason the one-pane witness above
+    // records: a piped frame is composed for whoever reads the pipe, so
+    // it takes RAT_WIDTH over any console it can still measure.
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "80")
+        .env("RAT_HEIGHT", "24")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    // Six rows, each padded to the declared width: the first pane's
+    // three (its one line of output and the two the declared height
+    // leaves empty), then the second pane's three. `row-gap 0` is why
+    // nothing separates them, `border "none"` and `chrome #false` are
+    // why no box or title row appears.
+    let expected = format!(
+        "{:<80}\n{:<80}\n{:<80}\n{:<80}\n{:<80}\n{:<80}\n",
+        "left-const", "", "", "right-const", "", ""
+    );
+    assert_eq!(stdout, expected, "the frame's exact bytes moved");
+}
+
+/// The repaint gate on the route with no terminal. Both panes complete
+/// on every tick and compose an identical frame, so the silence here is
+/// two frame keys comparing equal — not the absence of work. A digest
+/// that made equal views hash unequally would re-emit the whole frame
+/// every interval, because the piped branch writes its lines in full
+/// rather than diffing.
+///
+/// Green BEFORE the per-pane selected-line state landed and green after
+/// — verified at `f35f93c` and again on the branch that added it.
+#[test]
+fn a_piped_board_that_keeps_ticking_writes_one_frame_and_stops() {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = stacked_constant_board(dir.path(), "board.kdl", " interval=\"200ms\"");
+    let dash = std::process::Command::new(rat_bin())
+        .args(["dashboard", &file])
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "80")
+        .env("RAT_HEIGHT", "24")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat dashboard piped");
+    let mut dash = KillOnDrop(dash);
+    let out = stdout_stream(dash.0.stdout.take().expect("piped stdout"));
+    let err = stderr_stream(dash.0.stderr.take().expect("piped stderr"));
+    let mut seen_out = String::new();
+    let mut seen_err = String::new();
+    // The anti-vacuity anchor: the board must have rendered before its
+    // quiet means anything.
+    read_until(&out, &mut seen_out, "right-const");
+    settle(&out, &mut seen_out);
+
+    // Five intervals: one missed skip shows up as a whole frame, and a
+    // window this wide catches it whichever tick it lands on. A bare
+    // number here is how a flaky witness gets "fixed" by shortening it.
+    let quiet_window = INTERVAL * 5;
+    let deadline = std::time::Instant::now() + quiet_window;
+    let mut extra = String::new();
+    while let Ok(chunk) =
+        out.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+    {
+        extra.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert_eq!(extra, "", "a settled piped board repainted");
+
+    settle(&err, &mut seen_err);
+    // A diagnostic is a behavior change too.
+    assert_eq!(seen_err, "", "the board wrote to stderr");
+}
+
 /// The anti-vacuity guard: two boards that both refused to load would
 /// produce identical, empty output — green witnesses proving the
 /// opposite of what they claim. This pins that the bound half loads

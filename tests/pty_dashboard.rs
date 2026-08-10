@@ -528,6 +528,105 @@ pane "slow" {{
     );
 }
 
+/// Two panes over CONSTANT bodies on a short interval. Both complete on
+/// every tick and compose an identical frame, so a board built this way
+/// is quiet only because two frame keys compared equal — unlike a live
+/// follower, whose quiet comes from nothing arriving at all and never
+/// consults the gate.
+fn constant_row(interval: &str) -> String {
+    let pane = |label: &str| {
+        format!(
+            "pane \"{label}\" interval=\"{interval}\" {{\n        command \"printf '{label}-const'\"\n    }}\n"
+        )
+    };
+    format!(
+        "gap 1\n\n\
+         defaults {{\n    height 5\n    border \"rounded\"\n    width \"1fr\"\n    shell #true\n}}\n\n\
+         row {{\n    {}    {}}}\n",
+        pane("left"),
+        pane("right"),
+    )
+}
+
+/// The interactive route's witness, and the only test in this file's
+/// selection work that presses a key: nothing sends a keystroke down a
+/// pipe, so the piped witnesses would pass just as happily against a
+/// build that had already given `s` a meaning.
+///
+/// `s` is inert today — the dispatch table answers `Ignore` for it in
+/// every frame mode — and this is the byte-level companion to that
+/// unit fact. It is also the BEFORE measurement for the toggle: when
+/// `s` gains a meaning, this test's silence assertion is expected to
+/// invert, and the commit that inverts it says so.
+#[test]
+fn a_settled_board_stays_silent_and_s_does_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(dir.path(), &constant_row("200ms"));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"right-const",
+            Duration::from_secs(5)
+        ),
+        "the first composition never painted"
+    );
+    // Drain the tail of the first composition, then require silence.
+    // `drain_for`, not a single `read_available`: the latter returns
+    // after its FIRST read, and a first-composition tail larger than
+    // one read would land in the silence window as a false repaint.
+    let _ = drain_for(&session, Duration::from_millis(500));
+    session.write_bytes(b"s");
+    let quiet = session.read_available(Duration::from_millis(800));
+    assert!(
+        quiet.is_empty(),
+        "the board painted {} bytes after s: {:?}",
+        quiet.len(),
+        String::from_utf8_lossy(&quiet)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// The fourth route cell: a terminal that is NOT interactive, because
+/// `--once` turns the interactive test off whatever the tty says. It
+/// exists so that cell rests on a measurement rather than on the
+/// argument that a tty only selects a renderer — an argument that stops
+/// holding the moment a later change touches the renderer.
+#[test]
+fn a_once_board_on_a_terminal_paints_its_frame_with_s_pressed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(dir.path(), &constant_row("200ms"));
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string(), "--once"],
+        &[],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"right-const",
+            Duration::from_secs(5)
+        ),
+        "the once frame never painted"
+    );
+    session.write_bytes(b"s");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(5)),
+        "a once board exits on its own"
+    );
+}
+
 /// Accumulate everything the session writes within `total` — unlike
 /// `read_available`, which returns at the first chunk. Duplicated from
 /// the watch suite's local helper, never lifted.
