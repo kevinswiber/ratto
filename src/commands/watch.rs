@@ -4091,6 +4091,16 @@ struct PaneView {
     /// Indexed by `SourceId`; `len() == registry.len()`.
     collapsed: Vec<bool>,
     scroll: Vec<LiveScroll>,
+    /// The selected line in each pane, or `None` for a pane with no
+    /// cursor — the resting state, and the overwhelmingly common one.
+    /// An index into the pane's retained body, not into its window: a
+    /// window is what the reader can see, a cursor is what they picked.
+    ///
+    /// No pin bit, and that is a ruling rather than an oversight. Its
+    /// neighbour carries one because a log window should ride a growing
+    /// tail; a selection must not, or it moves under the reader's hand
+    /// between the row they read and the key they press.
+    cursor: Vec<Option<usize>>,
 }
 
 impl PaneView {
@@ -4100,7 +4110,16 @@ impl PaneView {
             zoomed: None,
             collapsed: vec![false; len],
             scroll: vec![LiveScroll::at(0, 0, 0); len],
+            cursor: vec![None; len],
         }
+    }
+
+    /// Whether this pane's body is off screen right now: the collapse
+    /// bit, unless zoom is overruling it. Zoom never clears the bit, so
+    /// the two must be read together or the same pane is "collapsed" to
+    /// one caller and expanded to another.
+    fn body_hidden(&self, id: SourceId) -> bool {
+        self.collapsed[id.0] && self.zoomed != Some(id)
     }
 
     /// The digest the repaint gate compares. The per-pane vectors fold
@@ -4109,10 +4128,16 @@ impl PaneView {
     fn key(&self) -> PaneViewKey {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
-        for (collapsed, scroll) in self.collapsed.iter().zip(&self.scroll) {
+        for ((collapsed, scroll), cursor) in
+            self.collapsed.iter().zip(&self.scroll).zip(&self.cursor)
+        {
             collapsed.hash(&mut hasher);
             scroll.offset().hash(&mut hasher);
             scroll.pinned().hash(&mut hasher);
+            // The Option, never `unwrap_or(0)`: absence and the first
+            // line are different views, and the first thing the toggle
+            // does on a pane at its head is select line 0.
+            cursor.hash(&mut hasher);
         }
         PaneViewKey {
             focus: self.focus,
@@ -7092,7 +7117,7 @@ fn compose_sources(
                 focused: view.focus == Some(id),
                 zoomed: zoom_cursor.as_deref(),
             };
-            if view.collapsed[id.0] && view.zoomed != Some(id) {
+            if view.body_hidden(id) {
                 // Collapse hides the body; zoom overrules it (INV-12),
                 // so a zoomed pane composes its full content and the
                 // bit survives to restore the row on unzoom.
@@ -10100,6 +10125,7 @@ mod tests {
             zoomed,
             collapsed: vec![false; n],
             scroll: vec![initial_pane_scroll(Overflow::KeepTop, 0, 0); n],
+            cursor: vec![None; n],
         }
     }
 
@@ -10767,6 +10793,96 @@ mod tests {
         let mut scrolled = PaneView::new(3);
         scrolled.scroll[0] = LiveScroll::at(2, 50, 10);
         assert_ne!(base.key(), scrolled.key());
+
+        let mut curs = PaneView::new(3);
+        curs.cursor[0] = Some(2);
+        assert_ne!(base.key(), curs.key());
+        // WHICH pane, again: the same line selected in a different pane
+        // is a different view, and a fold that iterated only the raised
+        // ones would call these two equal.
+        let mut elsewhere = PaneView::new(3);
+        elsewhere.cursor[2] = Some(2);
+        assert_ne!(curs.key(), elsewhere.key());
+    }
+
+    #[test]
+    fn a_raised_cursor_at_line_zero_is_not_the_resting_state() {
+        // The `unwrap_or(0)` trap. Raising a cursor on a pane whose
+        // window is at its head selects line 0, which is what the
+        // toggle will do on most panes — so a fold that flattens
+        // absence to zero makes the very first gesture invisible.
+        let base = PaneView::new(1);
+        let mut raised = PaneView::new(1);
+        raised.cursor[0] = Some(0);
+        assert_ne!(base.key(), raised.key(), "absence is not line zero");
+    }
+
+    #[test]
+    fn moving_a_cursor_within_one_pane_moves_the_view_key() {
+        let base = PaneView::new(2);
+        let mut moved = PaneView::new(2);
+        moved.cursor[1] = Some(4);
+        let raised = moved.key();
+        assert_ne!(base.key(), raised, "raising a cursor is a repaint");
+        moved.cursor[1] = Some(5);
+        assert_ne!(raised, moved.key(), "so is moving one");
+        // And dropping it returns to the resting key, so a toggle off
+        // repaints exactly as the toggle on did.
+        moved.cursor[1] = None;
+        assert_eq!(base.key(), moved.key());
+    }
+
+    #[test]
+    fn a_new_pane_view_rests_with_one_absent_cursor_per_pane() {
+        // The field's own contract, beside the two vectors that already
+        // carry it: one slot per pane, and the resting value is absence.
+        for len in [0usize, 1, 5] {
+            let panes = PaneView::new(len);
+            assert_eq!(panes.cursor.len(), len);
+            assert_eq!(panes.cursor.len(), panes.collapsed.len());
+            assert_eq!(panes.cursor.len(), panes.scroll.len());
+            assert!(panes.cursor.iter().all(Option::is_none));
+        }
+        // Equal state, equal key — the gate must never repaint on its
+        // own, and a term that hashed anything build- or run-varying
+        // would break exactly here.
+        assert_eq!(PaneView::new(3).key(), PaneView::new(3).key());
+    }
+
+    #[test]
+    fn a_zoomed_pane_is_never_body_hidden_even_while_collapsed() {
+        // Zoom overrules collapse and never clears the bit, so the two
+        // fields must be read together. Reading the bit alone would
+        // call a pane with its full body on screen "hidden" — and the
+        // rules that consume this decide whether a mark draws, whether
+        // a key moves it, and whether the line is exported.
+        let mut panes = PaneView::new(2);
+        assert!(
+            !panes.body_hidden(SourceId(0)),
+            "an ordinary pane is on screen"
+        );
+
+        panes.collapsed[0] = true;
+        assert!(
+            panes.body_hidden(SourceId(0)),
+            "collapsed alone hides the body"
+        );
+        assert!(!panes.body_hidden(SourceId(1)), "and only that pane's");
+
+        panes.zoomed = Some(SourceId(0));
+        assert!(
+            !panes.body_hidden(SourceId(0)),
+            "zoom overrules collapse: the body is on screen"
+        );
+        assert!(
+            panes.collapsed[0],
+            "and the bit survives, to restore the row on unzoom"
+        );
+
+        // Zooming the OTHER pane leaves this one hidden — the predicate
+        // is per-pane, not a global "something is zoomed" flag.
+        panes.zoomed = Some(SourceId(1));
+        assert!(panes.body_hidden(SourceId(0)));
     }
 
     #[test]
