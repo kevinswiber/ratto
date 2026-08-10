@@ -7481,6 +7481,40 @@ fn focus_segment(
     let mut segments: Vec<String> = Vec::new();
     if let Some(id) = view.focus {
         let mut seg = format!("focus {}", pane_display_name(registry, id));
+        // Where the cursor is, in the `zoomed 2/4` family — a position
+        // in an ordered set, not a window, which is what keeps it from
+        // being read as the `lines 3-14 of 40` that may follow it.
+        // 1-based, the same number a key-action's environment carries,
+        // so the row and the script cannot disagree.
+        //
+        // NOT gated on `!pane.chrome` like the two sub-segments below:
+        // those are gated because a chromed pane carries them in its own
+        // chrome row, and no pane carries a cursor badge at all. There
+        // is nothing here to say twice.
+        //
+        // Admissible under the run-constant tail rule for the same
+        // reason the focus name is: the per-pane view key carries the
+        // cursor. Nothing here goes near the activity digest, which is
+        // the activations'.
+        if let Some(line) = view.cursor[id.0] {
+            let total = runtime[id.0].output.as_ref().map_or(0, Vec::len);
+            // A pane whose body is off screen holds a DORMANT cursor —
+            // no mark drawn and no selection exported — so an
+            // unqualified position would promise something a command
+            // will not receive. The qualifier names the CAUSE, which is
+            // the thing the collapse gesture undoes.
+            //
+            // Through the one predicate, never a second conjunction: a
+            // zoom overrules a collapse in the renderer, so a
+            // collapsed-but-zoomed pane's body IS on screen and its
+            // cursor is live.
+            let why = if view.body_hidden(id) {
+                " (collapsed)"
+            } else {
+                ""
+            };
+            seg.push_str(&format!(" · cursor {}/{total}{why}", line + 1));
+        }
         // D5: a `chrome = #false` pane is scrollable and has nowhere on
         // itself to say where its window is, so the footer says it. A
         // chromed pane already carries the badge, and saying it twice
@@ -9228,6 +9262,117 @@ mod tests {
             focus_segment(&registry, &runtime, &geom, &panes),
             Some("focus right".to_string())
         );
+    }
+
+    /// The two-pane fixture with a body under each pane, so a cursor
+    /// has something to be a position within.
+    fn two_panes_with_bodies(lines: usize) -> (Registry, Vec<SourceRuntime>) {
+        let registry = two_weighted_panes();
+        let body: Vec<String> = (1..=lines).map(|i| format!("L{i}")).collect();
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        runtime[0].output = Some(body.clone());
+        runtime[1].output = Some(body);
+        (registry, runtime)
+    }
+
+    #[test]
+    fn the_row_says_where_the_cursor_is() {
+        // 1-based, the same number a key-action's environment carries:
+        // a reader who reads 7 off the row and a script that acts on
+        // line 7 must be talking about the same line.
+        let (registry, runtime) = two_panes_with_bodies(40);
+        let geom = registry.geometry((80, 24));
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(0));
+        panes.cursor[0] = Some(6);
+        let seg = focus_segment(&registry, &runtime, &geom, &panes).expect("a focused pane");
+        assert!(seg.contains("cursor 7/40"), "{seg}");
+    }
+
+    #[test]
+    fn no_cursor_says_nothing_about_one() {
+        // The whole row against a literal, not a `!contains`: an
+        // absence assertion needs its presence anchor, and asserting
+        // the whole string gives one for free.
+        let (registry, runtime) = two_panes_with_bodies(40);
+        let geom = registry.geometry((80, 24));
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(0));
+        assert_eq!(
+            focus_segment(&registry, &runtime, &geom, &panes),
+            Some("focus left".to_string())
+        );
+    }
+
+    #[test]
+    fn a_cursor_in_an_unfocused_pane_is_not_reported() {
+        // The row, the mark and the exported environment all name the
+        // same one cursor: the focused pane's. An unfocused pane's
+        // index is a bookmark, not a selection.
+        let (registry, runtime) = two_panes_with_bodies(40);
+        let geom = registry.geometry((80, 24));
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(0));
+        panes.cursor[1] = Some(3);
+        assert_eq!(
+            focus_segment(&registry, &runtime, &geom, &panes),
+            Some("focus left".to_string())
+        );
+    }
+
+    #[test]
+    fn no_focus_means_no_cursor_segment() {
+        let (registry, runtime) = two_panes_with_bodies(40);
+        let geom = registry.geometry((80, 24));
+        let mut panes = PaneView::new(registry.len());
+        panes.cursor[0] = Some(3);
+        assert_eq!(focus_segment(&registry, &runtime, &geom, &panes), None);
+    }
+
+    #[test]
+    fn only_an_effectively_collapsed_pane_says_its_cursor_is_not_live() {
+        // Four arms as a table. The qualifier alone would pass for a
+        // segment that always says it; the plain form alone is another
+        // test; and a two-arm version passes for the RAW collapse bit,
+        // which is precisely the bug — a zoom overrules a collapse in
+        // the renderer, so a collapsed-but-zoomed pane's body is on
+        // screen, its mark draws, and its selection is exported.
+        //
+        // An unqualified position on a pane whose body is hidden would
+        // promise a selection the environment does not carry, which is
+        // the confusion this warning exists to prevent.
+        let (registry, runtime) = two_panes_with_bodies(40);
+        let geom = registry.geometry((80, 24));
+        let table = [
+            (false, None, "cursor 7/40"),
+            (true, None, "cursor 7/40 (collapsed)"),
+            (true, Some(SourceId(0)), "cursor 7/40"),
+            (false, Some(SourceId(0)), "cursor 7/40"),
+        ];
+        for (collapsed, zoomed, want) in table {
+            let mut panes = PaneView::new(registry.len());
+            panes.focus = Some(SourceId(0));
+            panes.cursor[0] = Some(6);
+            panes.collapsed[0] = collapsed;
+            panes.zoomed = zoomed;
+            let seg = focus_segment(&registry, &runtime, &geom, &panes).expect("a focused pane");
+            assert!(
+                seg.contains(want),
+                "collapsed={collapsed} zoomed={zoomed:?}: {seg}"
+            );
+            // Asserted against the predicate itself, not against two
+            // fields set by hand: a segment and a test that each
+            // hand-roll the conjunction agree with each other and with
+            // nothing else.
+            assert_eq!(
+                seg.contains("(collapsed)"),
+                panes.body_hidden(SourceId(0)),
+                "collapsed={collapsed} zoomed={zoomed:?}"
+            );
+            // And the numbers never move, so a transition can never
+            // read as a new cursor.
+            assert!(seg.contains("cursor 7/40"), "{seg}");
+        }
     }
 
     #[test]
@@ -15794,6 +15939,53 @@ mod tests {
         let focus_at = text.find("focus ").expect("the focus segment");
         let running_at = text.find("running").expect("the running segment");
         assert!(focus_at < running_at, "{text}");
+    }
+
+    #[test]
+    fn the_segment_sits_after_the_pane_name_and_before_the_action() {
+        let (registry, runtime) = two_panes_with_bodies(40);
+        let geom = registry.geometry((80, 24));
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(0));
+        panes.cursor[0] = Some(6);
+        let bindings = [declared_binding(Key::Char('r'))];
+        let running = [(ActivationId(1), 0usize)];
+        let tail = status_tail(
+            &registry, &runtime, &geom, &panes, None, &running, &bindings,
+        );
+        let text = tail.text.expect("both segments compose");
+        let focus_at = text.find("focus ").expect("the focus segment");
+        let cursor_at = text.find("cursor ").expect("the cursor segment");
+        let running_at = text.find("running").expect("the running segment");
+        assert!(focus_at < cursor_at && cursor_at < running_at, "{text}");
+    }
+
+    #[test]
+    fn a_cursor_move_changes_the_text_and_not_the_activity_digest() {
+        // Three claims in one test, because each alone is satisfiable
+        // by an implementation the others reject. Text-only passes for
+        // a segment with no key contribution at all — the silently
+        // stale row. Digest-only passes for a segment folded into the
+        // activity digest, which re-keys a quiet board on things that
+        // are not activations and costs it its byte-silence. The key
+        // assertion alone belongs to the field's own test.
+        let (registry, runtime) = two_panes_with_bodies(40);
+        let geom = registry.geometry((80, 24));
+        let build = |at: usize| {
+            let mut panes = PaneView::new(registry.len());
+            panes.focus = Some(SourceId(0));
+            panes.cursor[0] = Some(at);
+            let tail = status_tail(&registry, &runtime, &geom, &panes, None, &[], &[]);
+            (tail, panes.key())
+        };
+        let (before, before_key) = build(6);
+        let (after, after_key) = build(7);
+        assert_ne!(before.text, after.text, "the segment is live");
+        assert_eq!(
+            before.activity, after.activity,
+            "the cursor must not reach the activations' digest"
+        );
+        assert_ne!(before_key, after_key, "and the gate can see it move");
     }
 
     #[test]

@@ -1135,6 +1135,176 @@ fn a_zoom_refollows_the_cursor() {
     );
 }
 
+/// The status row says where the cursor is, and stops saying it when
+/// the cursor goes. Each needle is a different value on purpose: two
+/// steps landing on the same row would write nothing the second time,
+/// because the differ eats a byte-identical repaint.
+#[test]
+fn the_footer_follows_the_cursor_and_clears_with_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(dir.path(), &a_deep_pane_and_a_neighbour());
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"A04", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    session.write_bytes(b"s");
+    session.write_bytes(b"j");
+    session.write_bytes(b"j");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"cursor 1/10", b"cursor 3/10"],
+        Duration::from_secs(5),
+    );
+
+    // The disappearance needs its own evidence, and it has to be read
+    // off the LAST status row: the segment legitimately appeared
+    // earlier in the same capture, so a whole-stream `!contains` would
+    // be false by construction.
+    session.write_bytes(b"s");
+    let after = drain_for(&session, Duration::from_millis(700));
+    let row = row_containing(&after, b"? help").expect("the status row");
+    assert!(
+        !contains(row, b"cursor "),
+        "dropping the cursor must clear the segment: {:?}",
+        String::from_utf8_lossy(row)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The trailing segments are composed through two different arms — one
+/// for the live row and one for the scrolled row — so a fixture that
+/// only ever presses at live rest exercises half of the surface.
+#[test]
+fn the_scrolled_row_carries_the_segment_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    // Focus the pane below the fold: the frame stays scrolled, so the
+    // row that carries the segment is the scrolled composition's.
+    session.write_bytes(b"\t\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 9-30 of 30", b"focus b"],
+        Duration::from_secs(3),
+    );
+    session.write_bytes(b"s");
+    let seen = wait_for_bytes(&session, &mut terminal, b"cursor ", Duration::from_secs(5))
+        .expect("the scrolled row never carried the segment");
+    let row = row_containing(&seen, b"cursor ").expect("the status row");
+    assert!(
+        contains(row, b"lines 9-30 of 30"),
+        "the segment must ride the scrolled composition's own row: {:?}",
+        String::from_utf8_lossy(row)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A board with nothing to do has no other reason to paint, so a footer
+/// segment that re-keys on something it should not turns it into a
+/// repainting one. This is the only test that sees that.
+#[test]
+fn a_quiet_board_with_a_parked_cursor_stops_writing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 5
+    border "none"
+    chrome #true
+    shell #true
+    interval "never"
+}
+
+pane "a" {
+    command "printf 'A%s\n' 01 02 03"
+}
+pane "b" {
+    command "printf 'B%s\n' 01 02 03"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B03", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    session.write_bytes(b"s");
+    // The presence anchor: an implementation that painted nothing at
+    // all would pass the silence below.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 1/3",
+            Duration::from_secs(5)
+        ),
+        "the segment never painted"
+    );
+    let _ = drain_for(&session, Duration::from_millis(500));
+    let quiet = session.read_available(Duration::from_millis(1500));
+    assert!(
+        quiet.is_empty(),
+        "a parked board repainted {} bytes: {:?}",
+        quiet.len(),
+        String::from_utf8_lossy(&quiet)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// The mark takes two columns from the pane's content and `RAT_WIDTH`
 /// deliberately does not move with it: a view gesture that changed the
 /// exported width would read as a resize and restart every child on the
