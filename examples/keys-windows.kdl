@@ -1,0 +1,66 @@
+// `keys.kdl` for Windows, where `shell #true` means `cmd.exe /C`. The
+// `key` grammar is identical — only the bodies changed dialects. Run it:
+//
+//   rat dashboard examples/keys-windows.kdl
+//
+// and press the keys it names; `r` deletes the log when you are done.
+//
+// 1. The log path is derived ONCE at load rather than written inline,
+//    because `trigger "file:..."` is rat's own file watcher, not cmd:
+//    a literal `%TEMP%` in the trigger would watch a path *named*
+//    `%TEMP%`. The derivation runs through cmd, which expands it, and
+//    the memoized value feeds the trigger and every body below. The
+//    command is a raw `#"…"#` string so its backslash stays a
+//    backslash.
+// 2. The cmd rules from `tail-windows.kdl` govern every body here:
+//    no double quotes (rat's argument quoting escapes them in a way
+//    cmd does not read), no `|` (cmd claims the pipe), and no space
+//    before `>>` (cmd appends the space to the line).
+// 3. The notes pane reads the tail through PowerShell, which costs
+//    ~220ms per launch — affordable, because the pane respawns only
+//    when the trigger fires. The clock respawns every second, so it
+//    stays on cmd's ~20ms echo.
+
+variables {
+    log #"echo %TEMP%\rat-keys-demo.log"# shell=#true
+}
+
+defaults {
+    height 5
+    border "rounded"
+    shell #true
+}
+
+key "n" {
+    description "append a timestamped note"
+    command "echo %TIME%>>{{log}}"
+}
+
+key "e" {
+    description "read the notes in the pager"
+    // `findstr .` matches any non-empty line: an empty log exits 1
+    // and a missing one exits 2, so either declines the binding.
+    when "findstr . {{log}}"
+    output "pager"
+    command "type {{log}}"
+}
+
+key "r" {
+    description "throw the notes away"
+    confirm "Delete the notes?"
+    output "hide"
+    command "del /q {{log}}"
+}
+
+pane "notes" {
+    title "notes — press n"
+    interval "never"
+    trigger "file:{{log}}"
+    command "powershell -NoProfile -Command if (Test-Path '{{log}}') {Get-Content '{{log}}' -Tail 5} else {'nothing yet'}"
+}
+
+pane "clock" {
+    height 4
+    interval "1s"
+    command "echo %TIME%"
+}

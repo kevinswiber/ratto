@@ -453,6 +453,11 @@ const TEMPLATES: &[BoardTemplate] = &[
         summary: "a board that acts: bindings with a guard, a confirm, and a pager",
         body: include_str!("../../examples/keys.kdl"),
     },
+    BoardTemplate {
+        name: "keys-windows",
+        summary: "the same board for cmd.exe",
+        body: include_str!("../../examples/keys-windows.kdl"),
+    },
 ];
 
 /// `panes` because it is the README's own first example: `init` with
