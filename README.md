@@ -513,6 +513,16 @@ and goes nowhere until the pane is expanded, which the footer says as
 zoom. What a key action does with the marked line is under Key actions
 below.
 
+**The mark is a visual channel.** A board repaints in place, and in
+our testing with VoiceOver in macOS Terminal an in-place mark was not
+announced — not as it moved, and not on a re-read of the line.
+Appended lines were, which is why `rat watch --append` exists; but
+`--append` is watch-only, so a board has no linear surface to fall
+back to. The cursor is a sighted gesture today and this section does
+not claim otherwise. What a board would need first is a linear mode of
+its own — a way to append what changed instead of repainting it — and
+it does not have one yet.
+
 `z` zooms the focused pane to the full frame and back. A live pane
 just re-clips to the new width — a view gesture never restarts a
 long-lived child, the same rule the gutter toggle and a resize already

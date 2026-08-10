@@ -78,6 +78,10 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
         // Append is watch-only today: a dashboard's composed panes
         // don't linearize, and this arm's resize/reflow machinery would
         // need its own treatment first.
+        //
+        // It is also the reason the line cursor's mark reaches nobody
+        // who cannot see it: the mark is visual only, and a linear mode
+        // for boards is the missing piece, not a better mark.
         append: false,
         variables,
         bindings,

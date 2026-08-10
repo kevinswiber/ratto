@@ -25,6 +25,19 @@ use crate::theme::Palette;
 /// region and this is a PANE region, and a future change to either must
 /// not silently move the other.
 ///
+/// **The mark is a VISUAL channel and only that.** Measured in this
+/// project's own testing with VoiceOver in macOS Terminal: an in-place
+/// mark is not announced by a screen reader — not as it moves, and not
+/// on a re-read — while appended lines are, which is the measurement
+/// `watch --append` exists for. A board repaints in place and has no
+/// append mode (`commands/dashboard.rs` sets `append: false`), so
+/// nothing drawn here reaches a linear reader.
+///
+/// The fix is NOT a second glyph, a bolder colour, or a wider mark.
+/// What is missing is a linear surface for boards; until one exists,
+/// making this mark louder only makes it louder for people who could
+/// already see it.
+///
 /// The gap is load-bearing, not padding. A marker abutting the text
 /// reads as part of the child's first token — and the first token of a
 /// diff row is `+`, `-`, or a space.
