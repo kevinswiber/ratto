@@ -1874,6 +1874,459 @@ fn a_confirmed_action_sees_the_line_the_reader_pressed_on() {
     );
 }
 
+/// A binding body that probes BOTH questions the contract answers:
+/// what the value is, and whether the name is set at all.
+///
+/// `${V-…}` (no colon) substitutes the default only when the name is
+/// UNSET, so an empty value prints empty. `${V+…}` (no colon) answers
+/// only when it is SET, empty included. The colon forms treat empty as
+/// unset, which collapses precisely the distinction under test — a
+/// fixture written with `:-` passes whether or not the feature works.
+const PROBE_SH: &str = "\
+printf 'SEL=[%s] PRESENT=[%s] PANE=[%s] LINE=[%s]\\n' \\
+    \"${RAT_SELECTION-<unset>}\" \"${RAT_SELECTION+present}\" \\
+    \"${RAT_SELECTION_PANE-<unset>}\" \"${RAT_SELECTION_LINE-<unset>}\" > @OUT@
+";
+
+/// Wait for the probe's line and hand it back whole.
+fn read_probe(out: &std::path::Path) -> Option<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(out)
+            && text.contains("LINE=[")
+        {
+            return Some(text.trim_end().to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
+/// A numbered pane and a binding that probes its environment.
+fn probe_board(dir: &std::path::Path, body: &str) -> (std::path::PathBuf, String) {
+    let out = dir.join("probe.txt");
+    let script = dir.join("probe.sh");
+    write_script(&script, PROBE_SH, &out);
+    let board = format!(
+        "row-gap 0\n\n\
+         key \"x\" {{\n    description \"probe\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+         pane \"numbered\" {{\n    height 8\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
+         command \"{body}\"\n}}\n",
+        script = script.display(),
+    );
+    (out, board)
+}
+
+/// With no cursor the three names are genuinely unset, so a script can
+/// branch on their absence. The anchor is the second half: "all three
+/// unset" is satisfied by a board where the key does nothing at all,
+/// which is the most likely way this goes green while broken.
+///
+/// The blank-line arm rides the same test on purpose — set-and-empty
+/// and unset are only meaningful next to each other.
+#[test]
+fn no_cursor_leaves_the_three_variables_unset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // An interior blank line, so one board serves both halves.
+    let (out, board) = probe_board(dir.path(), "printf 'L01\\n\\nL03\\n'");
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"L03", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"x");
+    let absent = read_probe(&out).expect("the binding never probed its environment");
+    assert!(
+        absent.contains("SEL=[<unset>]")
+            && absent.contains("PRESENT=[]")
+            && absent.contains("PANE=[<unset>]")
+            && absent.contains("LINE=[<unset>]"),
+        "no cursor must leave all three unset: {absent}"
+    );
+
+    // The anchor, and the blank-line half: the cursor lands on line 1,
+    // one `j` reaches the blank line — set, and empty.
+    std::fs::remove_file(&out).expect("clear the probe");
+    session.write_bytes(b"s");
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 2/3",
+            Duration::from_secs(3)
+        ),
+        "the cursor never reached the blank line"
+    );
+    session.write_bytes(b"x");
+    let blank = read_probe(&out).expect("the binding never probed its environment");
+    assert!(
+        blank.contains("SEL=[] PRESENT=[present]"),
+        "a blank selected line is set and empty, not unset: {blank}"
+    );
+    assert!(blank.contains("LINE=[2]"), "{blank}");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A cursor whose pane's body is off screen is DORMANT: it exports
+/// nothing, and the index survives untouched. Both ways of putting the
+/// body back — a zoom, which overrules the collapse without clearing
+/// it, and an expand — export the same line again.
+///
+/// Two different wrong implementations die here and neither dies on a
+/// shorter test. Absence while hidden is satisfied by one that CLEARED
+/// the cursor; only re-revealing tells them apart. And exporting
+/// nothing while collapsed-and-zoomed is what reading the raw collapse
+/// bit does — the inverse failure, on the one gesture a reader uses to
+/// look closer before acting.
+#[test]
+fn a_hidden_panes_cursor_exports_nothing_and_survives_the_round_trip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (out, board) = probe_board(dir.path(), "for i in $(seq -w 1 20); do echo L$i; done");
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"L05", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"s");
+    session.write_bytes(b"j");
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 3/20",
+            Duration::from_secs(3)
+        ),
+        "the cursor never landed"
+    );
+    session.write_bytes(b"x");
+    let baseline = read_probe(&out).expect("the binding never probed its environment");
+    assert!(baseline.contains("LINE=[3]"), "{baseline}");
+
+    // Each arm SETTLES rather than racing: the previous arm's binding
+    // completion repaints the status row too, so a bare wait on a
+    // needle can return on that instead of on the state change this arm
+    // asked for — and then fire the probe against a board that has not
+    // moved yet. Drain first, send the keys, then poll to a settled
+    // state.
+    let probe = |keys: &[&[u8]], ready: &dyn Fn(&[u8]) -> bool| {
+        let _ = drain_for(&session, Duration::from_millis(300));
+        let _ = std::fs::remove_file(&out);
+        for k in keys {
+            session.write_bytes(k);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut acc: Vec<u8> = Vec::new();
+        while !ready(&acc) {
+            acc.extend(drain_for(&session, Duration::from_millis(200)));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the board never reached the state this arm needs: {:?}",
+                String::from_utf8_lossy(&acc)
+            );
+        }
+        session.write_bytes(b"x");
+        read_probe(&out).expect("the binding never probed its environment")
+    };
+    let qualified = |acc: &[u8]| {
+        row_containing(acc, b"cursor 3/20").is_some_and(|row| contains(row, b"(collapsed)"))
+    };
+    let unqualified = |acc: &[u8]| {
+        row_containing(acc, b"cursor 3/20").is_some_and(|row| !contains(row, b"(collapsed)"))
+    };
+
+    // Collapsed and not zoomed: the body is off screen, so nothing is
+    // exported — but the status row still names the cursor, which is
+    // how the reader knows it is only dormant.
+    let hidden = probe(&[b" "], &qualified);
+    assert!(
+        hidden.contains("SEL=[<unset>]") && hidden.contains("PRESENT=[]"),
+        "a hidden body must export nothing: {hidden}"
+    );
+
+    // Zoomed while still collapsed: the body fills the screen — only a
+    // zoomed pane shows its last line — so the cursor is live again, at
+    // the same index.
+    let woken = probe(&[b"z"], &|acc: &[u8]| contains(acc, b"L20"));
+    assert!(
+        woken.contains("LINE=[3]") && woken.contains("PRESENT=[present]"),
+        "a zoom overrules the collapse, so the selection is live: {woken}"
+    );
+
+    // Unzoomed: hidden again, index still held.
+    let hidden_again = probe(&[b"z"], &qualified);
+    assert!(hidden_again.contains("SEL=[<unset>]"), "{hidden_again}");
+
+    // Expanded: the same line comes back, which is the only external
+    // way to say dormant rather than cleared.
+    let restored = probe(&[b" "], &unqualified);
+    assert!(
+        restored.contains("LINE=[3]") && restored.contains("PRESENT=[present]"),
+        "the index must survive the round trip: {restored}"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A value already in rat's own environment must never reach a
+/// cursorless action. A key-action's child receives these names, so
+/// anything it launches — a nested board most obviously — would
+/// otherwise read an outer board's cursor, and the failure is a WRONG
+/// selection rather than a missing one.
+///
+/// The needle is deliberately unlovely and appears nowhere else in the
+/// fixture: a test must not contain the string whose absence it asserts.
+#[test]
+fn an_inherited_selection_never_reaches_a_cursorless_action() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (out, board) = probe_board(dir.path(), "printf 'L01\\nL02\\n'");
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[
+            ("RAT_SELECTION", "XYZZY-LEAKED"),
+            ("RAT_SELECTION_PANE", "XYZZY-PANE"),
+            ("RAT_SELECTION_LINE", "9999"),
+        ],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"L02", Duration::from_secs(5)),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"x");
+    let absent = read_probe(&out).expect("the binding never probed its environment");
+    assert!(
+        !absent.contains("XYZZY"),
+        "an inherited value leaked: {absent}"
+    );
+    assert!(
+        absent.contains("SEL=[<unset>]") && absent.contains("PRESENT=[]"),
+        "{absent}"
+    );
+
+    std::fs::remove_file(&out).expect("clear the probe");
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 1/2",
+            Duration::from_secs(3)
+        ),
+        "the cursor never landed"
+    );
+    session.write_bytes(b"x");
+    let real = read_probe(&out).expect("the binding never probed its environment");
+    assert!(!real.contains("XYZZY"), "an inherited value leaked: {real}");
+    assert!(
+        real.contains("SEL=[L01]") && real.contains("LINE=[1]"),
+        "{real}"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A pane body is styled bytes; the exported line is not.
+///
+/// Asserted on the ESC byte rather than one spelling of an escape: a
+/// partially handled sequence leaves the byte with its parameters
+/// mangled, and a substring check for `[31m` would miss it. The escapes
+/// under test are the CHILD's — the cursor's own mark is applied at
+/// compose time and never enters the retained body, so if this ever
+/// fails with an escape the fixture did not print, something is
+/// exporting composed bytes instead of the body.
+#[test]
+fn a_styled_pane_exports_a_clean_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The styled body lives in its own script: `\033` is not a KDL
+    // escape, so spelling it in the board makes the board unparseable —
+    // and a load error PRINTS the board, so the fixture's own needle
+    // would then be found in the error message rather than in a frame.
+    let body = dir.path().join("body.sh");
+    std::fs::write(
+        &body,
+        "printf '\u{1b}[31mL01 red\u{1b}[0m\n\u{1b}[32mL02 green\u{1b}[0m\n'\n",
+    )
+    .expect("write the styled body");
+    let (out, board) = probe_board(dir.path(), &format!("sh {}", body.display()));
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"L02 green",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"s");
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 2/2",
+            Duration::from_secs(3)
+        ),
+        "the cursor never reached the second line"
+    );
+    session.write_bytes(b"x");
+    let probe = read_probe(&out).expect("the binding never probed its environment");
+    assert!(probe.contains("SEL=[L02 green]"), "{probe}");
+    let raw = std::fs::read(&out).expect("read the probe's bytes");
+    assert!(
+        !raw.contains(&0x1b),
+        "an escape rode into the environment: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The guard route sees the stripped value too — which is what catches
+/// a strip applied in one route's builder call instead of at the
+/// capture the two share.
+#[test]
+fn a_styled_selection_reaches_a_when_clean_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let guard = dir.path().join("guard.sh");
+    std::fs::write(&guard, "[ \"${RAT_SELECTION-}\" = \"L02 green\" ]\n").expect("write the guard");
+    // Same reason as the probe's: no escape may cross the KDL layer.
+    let body = dir.path().join("body.sh");
+    std::fs::write(
+        &body,
+        "printf '\u{1b}[31mL01 red\u{1b}[0m\n\u{1b}[32mL02 green\u{1b}[0m\n'\n",
+    )
+    .expect("write the styled body");
+    let board = format!(
+        "row-gap 0\n\n\
+         key \"r\" {{\n    description \"act\"\n    shell #true\n    output \"hide\"\n    \
+         when \"sh {guard}\"\n    command \"{counter_cmd}\"\n}}\n\n\
+         pane \"styled\" {{\n    height 6\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
+         command \"sh {body}\"\n}}\n",
+        guard = guard.display(),
+        counter_cmd = counter_cmd(&counter),
+        body = body.display(),
+    );
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"L02 green",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"s");
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 2/2",
+            Duration::from_secs(3)
+        ),
+        "the cursor never reached the styled line"
+    );
+    session.write_bytes(b"r");
+    wait_for_counter(&counter, 1);
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The non-rest arm for the absence, and the sharpest presence-anchor
+/// case in the plan: a frame-scrolled board on which the binding never
+/// fires at all produces no probe file, which a careless assertion
+/// reads as "the variables were absent". So the command is proven to
+/// have run before its output's emptiness means anything.
+#[test]
+fn a_cursorless_action_from_a_frame_scrolled_board_still_runs_and_still_exports_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("probe.txt");
+    let script = dir.path().join("probe.sh");
+    write_script(&script, PROBE_SH, &out);
+    let counter = dir.path().join("counter");
+    let board = format!(
+        "row-gap 0\n\n\
+         defaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n}}\n\n\
+         key \"x\" {{\n    description \"probe\"\n    shell #true\n    output \"hide\"\n    \
+         command \"{counter_cmd}; sh {script}\"\n}}\n\n\
+         pane \"a\" {{\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n\
+         pane \"b\" {{\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}}\n",
+        counter_cmd = counter_cmd(&counter),
+        script = script.display(),
+    );
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"j");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 2-23 of 30"],
+        Duration::from_secs(3),
+    );
+    session.write_bytes(b"x");
+    // Presence first: the command really ran.
+    wait_for_counter(&counter, 1);
+    let absent = read_probe(&out).expect("the binding never probed its environment");
+    assert!(
+        absent.contains("SEL=[<unset>]") && absent.contains("PRESENT=[]"),
+        "a cursorless action exports nothing, scrolled or not: {absent}"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// Accumulate everything the session writes within `total` — unlike
 /// `read_available`, which returns at the first chunk. Duplicated from
 /// the watch suite's local helper, never lifted.

@@ -4437,7 +4437,19 @@ struct Selection {
     pane: String,
     /// 1-based, into the pane's RETAINED body — never a viewport row.
     line: usize,
-    /// The selected line's text, as the pane retained it.
+    /// The selected line's TEXT: the retained line with the child's
+    /// escape sequences removed, through the same strip every notice
+    /// row's tail takes. Stripped at the CAPTURE, so this value is the
+    /// one exported — one strip per activation rather than one per
+    /// rung, and one place the rule lives. The raw form is not offered
+    /// anywhere: a command handed escape sequences would have to strip
+    /// them itself, and most would forget.
+    ///
+    /// Tabs are already spaces (the display decode expands them) and a
+    /// CRLF terminator is already gone (the retainer pops it), so this
+    /// is the only transformation between the pane's body and the
+    /// variable. Nothing else is trimmed or clipped: the value is a
+    /// coordinate's payload, not a display string.
     text: String,
 }
 
@@ -4478,7 +4490,7 @@ fn selection_snapshot(
         return None;
     }
     let index = (*panes.cursor.get(id.0)?)?;
-    let text = runtime.get(id.0)?.output.as_ref()?.get(index)?.clone();
+    let text = strip_escapes(runtime.get(id.0)?.output.as_ref()?.get(index)?);
     Some(Selection {
         pane: registry.spec(id).id.clone(),
         line: index + 1,
@@ -6204,6 +6216,19 @@ fn build_action_command(
     };
     command.stdin(std::process::Stdio::null());
     command.env("RAT_APPEARANCE", appearance.as_str());
+    // The absence is part of the CONTRACT, so it is made rather than
+    // assumed: a command inherits this process's environment, and rat
+    // can be running with these already set — a key-action's own child
+    // receives them, so anything that child launches (another board,
+    // most obviously) inherits them too. Removing unconditionally makes
+    // "unset means no cursor" a property of this builder rather than of
+    // whatever environment rat happened to start in.
+    //
+    // Before the sets, never after: an environment is a map, so the
+    // order is what decides which wins.
+    command.env_remove("RAT_SELECTION");
+    command.env_remove("RAT_SELECTION_PANE");
+    command.env_remove("RAT_SELECTION_LINE");
     // The selection joins the environment the same way the appearance
     // does — a value handed to a NEW process. Nothing here goes near
     // stdin: no key is ever forwarded to a child, and a selection is
@@ -14984,6 +15009,23 @@ mod tests {
         }
     }
 
+    /// Like `action_envs`, but it KEEPS the removals. `get_envs` yields
+    /// `(key, None)` for a removal, which the value-map view below
+    /// throws away with its `v?` — so an absence assertion written
+    /// through that helper cannot tell "never set" from "actively
+    /// removed", and that difference is exactly what the selection
+    /// variables promise.
+    fn action_env_entries(cmd: &std::process::Command) -> Vec<(String, Option<String>)> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
     fn action_envs(cmd: &std::process::Command) -> std::collections::HashMap<String, String> {
         cmd.get_envs()
             .filter_map(|(k, v)| {
@@ -15119,6 +15161,117 @@ mod tests {
             selection_snapshot(&hidden, &registry, &runtime).is_some(),
             "a zoomed pane is showing its whole body"
         );
+    }
+
+    /// The selection fixture with a chosen body under the focused pane,
+    /// cursor on its second line.
+    fn snapshot_of(body: &[&str]) -> Option<Selection> {
+        let registry = two_weighted_panes();
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        runtime[1].output = Some(body.iter().map(|s| s.to_string()).collect());
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(1));
+        panes.cursor[1] = Some(1);
+        selection_snapshot(&panes, &registry, &runtime)
+    }
+
+    #[test]
+    fn a_styled_body_line_is_captured_without_its_escapes() {
+        let styled = "\u{1b}[31mrev:09bf00c6\u{1b}[0m  ready";
+        let sel = snapshot_of(&["first", styled]).expect("a selection");
+        assert_eq!(sel.text, "rev:09bf00c6  ready");
+        // Against the strip's own output as well as the literal, so the
+        // test cannot drift from the function it pins.
+        assert_eq!(sel.text, crate::core::measure::strip_escapes(styled));
+    }
+
+    #[test]
+    fn the_strip_keeps_text_and_drops_every_escape_kind() {
+        // The kinds a pane body really carries, not one sample. The
+        // last row is the overwhelmingly common case and the one a
+        // clever implementation breaks: no escapes at all must pass
+        // through byte-identical.
+        let table = [
+            ("\u{1b}[31mred\u{1b}[0m", "red"),
+            ("\u{1b}]0;title\u{7}after", "after"),
+            ("\u{1b}[2Kcleared", "cleared"),
+            ("plain  text\twith bits", "plain  text\twith bits"),
+        ];
+        for (body, want) in table {
+            let sel = snapshot_of(&["first", body]).expect("a selection");
+            assert_eq!(sel.text, want, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_blank_selected_line_is_a_selection_with_empty_text() {
+        // Two ways to reach an empty string, and only the second
+        // depends on the strip. Together they say the rule: emptiness
+        // never demotes a selection to absence — that distinction is
+        // carried by the Option alone.
+        let blank = snapshot_of(&["first", "", "third"]).expect("a blank line is still a line");
+        assert_eq!(blank.text, "");
+        assert_eq!((blank.pane.as_str(), blank.line), ("right", 2));
+
+        let styling_only = snapshot_of(&["first", "\u{1b}[31m\u{1b}[0m"]).expect("still a line");
+        assert_eq!(styling_only.text, "");
+    }
+
+    #[test]
+    fn a_command_built_without_a_selection_removes_the_three_names() {
+        // Actively removed, not merely never set: a command inherits
+        // this process's environment, and a key-action's own child
+        // carries these names — so anything it launches, a nested board
+        // most obviously, would read an outer board's cursor.
+        let spawn = build_action_command(
+            &ResolvedProgram::Argv(vec!["true".into()]),
+            &ShellMode::Direct,
+            ActionScript::None,
+            Appearance::Dark,
+            None,
+        );
+        let entries = action_env_entries(&spawn.command);
+        for name in ["RAT_SELECTION", "RAT_SELECTION_PANE", "RAT_SELECTION_LINE"] {
+            assert!(
+                entries.contains(&(name.to_string(), None)),
+                "{name} must be removed, not merely unmentioned: {entries:?}"
+            );
+        }
+        assert!(
+            entries.contains(&("RAT_APPEARANCE".to_string(), Some("dark".to_string()))),
+            "the guard against a command that was never built: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_selection_overwrites_a_removal_rather_than_racing_it() {
+        // A command's environment is a map rather than a log, so this
+        // holds by construction — but only if the removals come first,
+        // and "remove after set" is a plausible edit for someone tidying
+        // the tail. One assertion buys the ordering.
+        let sel = Selection {
+            pane: "diff".to_string(),
+            line: 7,
+            text: "+ let x = 42;".to_string(),
+        };
+        let spawn = build_action_command(
+            &ResolvedProgram::Argv(vec!["true".into()]),
+            &ShellMode::Direct,
+            ActionScript::None,
+            Appearance::Dark,
+            Some(&sel),
+        );
+        let entries = action_env_entries(&spawn.command);
+        for name in ["RAT_SELECTION", "RAT_SELECTION_PANE", "RAT_SELECTION_LINE"] {
+            assert!(
+                !entries.contains(&(name.to_string(), None)),
+                "{name} was removed after being set: {entries:?}"
+            );
+            assert!(
+                entries.iter().any(|(k, v)| k == name && v.is_some()),
+                "{name} never reached the command: {entries:?}"
+            );
+        }
     }
 
     #[test]
