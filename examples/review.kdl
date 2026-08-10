@@ -18,16 +18,16 @@
 //    (`selectable #true` on `changed`); on a board where none does the
 //    key stays free for that board to bind. It marks a line in the
 //    focused pane, and every key action then sees that line as
-//    $RAT_SELECTION with its styling stripped, its pane as
-//    $RAT_SELECTION_PANE, and its 1-based row as $RAT_SELECTION_LINE.
+//    $RAT_CURSOR with its styling stripped, its pane as
+//    $RAT_CURSOR_PANE, and its 1-based row as $RAT_CURSOR_LINE.
 // 2. With no cursor up, none of the three is SET — not set to empty.
-//    Gating on $RAT_SELECTION_PANE, as `x` does below, is what tells
+//    Gating on $RAT_CURSOR_PANE, as `x` does below, is what tells
 //    "nothing is marked" from "the marked line is blank".
 // 3. `when` sees the same variables the command does, so `x` declines
 //    before it runs anything when the cursor is somewhere else.
 // 4. With a clean tree the `changed` pane holds nothing but a blank
-//    line. `s` still marks it — a blank line is a real selection, which
-//    is why the guard below asks which PANE the cursor is in rather
+//    line. `s` still marks it — a blank line is a real line, which is
+//    why the guard below asks which PANE the cursor is in rather
 //    than whether the marked text is empty — and `x` writes it, leaving
 //    the console in its empty state. Edit a file and the board fills.
 
@@ -123,10 +123,10 @@ pane "diff" {
 // them.
 key "x" {
     description "review the file under the cursor"
-    when "test \"$RAT_SELECTION_PANE\" = changed"
+    when "test \"$RAT_CURSOR_PANE\" = changed"
     shell #true
     output "hide"
-    command "printf '%s' \"$RAT_SELECTION\" > \"{{sel}}\""
+    command "printf '%s' \"$RAT_CURSOR\" > \"{{sel}}\""
 }
 
 key "X" {

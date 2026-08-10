@@ -3020,15 +3020,15 @@ fn a_panes_command_never_inherits_a_selection_from_rats_own_environment() {
         dir.path(),
         "board.kdl",
         "row-gap 0\n\npane \"probe\" {\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n    interval \"1h\"\n    \
-         command \"echo SEL=[${RAT_SELECTION-unset}] PANE=[${RAT_SELECTION_PANE-unset}] LINE=[${RAT_SELECTION_LINE-unset}]\"\n}\n",
+         command \"echo SEL=[${RAT_CURSOR-unset}] PANE=[${RAT_CURSOR_PANE-unset}] LINE=[${RAT_CURSOR_LINE-unset}]\"\n}\n",
     );
     let assert = rat()
         .env("NO_COLOR", "1")
         .env("RAT_WIDTH", "80")
         .env("RAT_HEIGHT", "12")
-        .env("RAT_SELECTION", "XYZZY-LEAKED-LINE")
-        .env("RAT_SELECTION_PANE", "XYZZY-LEAKED-PANE")
-        .env("RAT_SELECTION_LINE", "99")
+        .env("RAT_CURSOR", "XYZZY-LEAKED-LINE")
+        .env("RAT_CURSOR_PANE", "XYZZY-LEAKED-PANE")
+        .env("RAT_CURSOR_LINE", "99")
         .args(["dashboard", &file, "--once"])
         .assert()
         .success();

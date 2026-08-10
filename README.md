@@ -827,19 +827,19 @@ variables, and so does its `when`:
 
 | | |
 |---|---|
-| `RAT_SELECTION` | the marked line's text, with styling stripped |
-| `RAT_SELECTION_PANE` | the id of the pane the cursor is in |
-| `RAT_SELECTION_LINE` | the line's 1-based place in that pane's body |
+| `RAT_CURSOR` | the marked line's text, with styling stripped |
+| `RAT_CURSOR_PANE` | the id of the pane the cursor is in |
+| `RAT_CURSOR_LINE` | the line's 1-based place in that pane's body |
 
 With no cursor — and with the cursor's pane collapsed to its title
-row, where there is nothing on screen to have selected — all three are
-**absent** rather than empty. That distinction needs the right test,
-and the obvious one is not it: `[ -n "$RAT_SELECTION" ]` asks whether
-the marked line has any text in it, and a blank line is a real
-selection. To ask whether anything is marked, test for the variable's
-presence — `[ -n "${RAT_SELECTION+x}" ]`, which is `x` when the
+row, where there is nothing on screen to put a cursor on — all three
+are **absent** rather than empty. That distinction needs the right
+test, and the obvious one is not it: `[ -n "$RAT_CURSOR" ]` asks
+whether the marked line has any text in it, and a blank line is a
+real line. To ask whether anything is marked, test for the variable's
+presence — `[ -n "${RAT_CURSOR+x}" ]`, which is `x` when the
 variable is set and empty when it is unset, whatever the value — or
-test `RAT_SELECTION_PANE`, which holds a pane id and so is never
+test `RAT_CURSOR_PANE`, which holds a pane id and so is never
 legitimately blank. Either way, a `when` written that way declines
 before anything runs.
 
@@ -856,7 +856,7 @@ eight-column stop as it reads a child's output, so split on whitespace
 rather than on `\t`; and a `\r\n` line arrives without its carriage
 return, so the value compares equal to what you read on screen.
 
-**`RAT_SELECTION_LINE` is a coordinate, under three conditions.** The
+**`RAT_CURSOR_LINE` is a coordinate, under three conditions.** The
 index lets a command re-derive the pane's own output and find the same
 row — turning "the line I was looking at" into a file and a line
 number — but the technique is only sound when all three hold. The
@@ -868,13 +868,13 @@ that adds or drops rows when its color or format flag changes breaks
 the mapping while both outputs still look right. And the pane must
 keep its **head**, `overflow "keep-top"`: retention drops lines from
 the other end, so a `keep-bottom` pane's indices shift as it grows.
-Where the three do not hold, `RAT_SELECTION` itself is the honest
+Where the three do not hold, `RAT_CURSOR` itself is the honest
 value to use.
 
 A *pane's* command never sees any of this — a pane would have to
-respawn on every cursor move to keep it true — so a selection reaches
-panes the way every other choice does, through the handoff file the
-section below describes.
+respawn on every cursor move to keep it true — so the line under the
+cursor reaches panes the way every other choice does, through the
+handoff file the section below describes.
 
 **Actions are asynchronous unless they need the screen.** A binding's
 command runs on a worker, exactly the way a pane's child does, so the

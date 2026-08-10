@@ -220,7 +220,7 @@ pub struct KeyBinding {
     /// and for a reason the single `shell` field cannot express.
     ///
     /// A `when` value is a command LINE — `test -s ./x`,
-    /// `[ "$RAT_SELECTION_PANE" = requests ]` — not an argv. It has no
+    /// `[ "$RAT_CURSOR_PANE" = requests ]` — not an argv. It has no
     /// meaning without a shell, so an absent shell promotes to
     /// `Platform` here while an argv `command` stays `Direct`. One
     /// field cannot hold both answers, and deriving the second at

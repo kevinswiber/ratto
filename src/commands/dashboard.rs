@@ -345,7 +345,7 @@ const PANE_GESTURE_HELP_TAIL: &[&str] = &[
 const CURSOR_GESTURE_HELP: &[&str] = &[
     "    With a cursor up, the scroll keys move the cursor instead and",
     "    the pane's window follows it; a key action then reads the",
-    "    marked line as RAT_SELECTION. The cursor holds its line when",
+    "    marked line as RAT_CURSOR. The cursor holds its line when",
     "    the pane re-runs, and a paused frame ignores all of this.",
 ];
 
@@ -1113,7 +1113,7 @@ mod tests {
                 "    Esc              peel one layer: cursor, zoom, focus, frame scroll",
                 "    With a cursor up, the scroll keys move the cursor instead and",
                 "    the pane's window follows it; a key action then reads the",
-                "    marked line as RAT_SELECTION. The cursor holds its line when",
+                "    marked line as RAT_CURSOR. The cursor holds its line when",
                 "    the pane re-runs, and a paused frame ignores all of this.",
             ]
         );

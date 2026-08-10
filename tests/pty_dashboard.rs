@@ -1560,9 +1560,9 @@ fn raising_a_cursor_never_restarts_a_child() {
 /// reports itself as "the first frame never painted".
 const DUMP_SH: &str = "\
 {
-  echo \"PANE=${RAT_SELECTION_PANE-}\"
-  echo \"LINE=${RAT_SELECTION_LINE-}\"
-  echo \"TEXT=${RAT_SELECTION-}\"
+  echo \"PANE=${RAT_CURSOR_PANE-}\"
+  echo \"LINE=${RAT_CURSOR_LINE-}\"
+  echo \"TEXT=${RAT_CURSOR-}\"
 } > @OUT@
 ";
 
@@ -1716,7 +1716,7 @@ fn a_when_reads_the_selection_and_declines_on_the_wrong_line() {
     let guard = dir.path().join("guard.sh");
     // Written from Rust for the same reason the dumper is: the body is
     // shell-quoted and would otherwise cross two escaping layers.
-    std::fs::write(&guard, "[ \"${RAT_SELECTION_LINE:-0}\" -ge 3 ]\n").expect("write the guard");
+    std::fs::write(&guard, "[ \"${RAT_CURSOR_LINE:-0}\" -ge 3 ]\n").expect("write the guard");
     let board = format!(
         "row-gap 0\n\n\
          key \"r\" {{\n    description \"act\"\n    shell #true\n    output \"hide\"\n    \
@@ -2089,8 +2089,8 @@ fn a_confirmed_action_sees_the_line_the_reader_pressed_on() {
 /// fixture written with `:-` passes whether or not the feature works.
 const PROBE_SH: &str = "\
 printf 'SEL=[%s] PRESENT=[%s] PANE=[%s] LINE=[%s]\\n' \\
-    \"${RAT_SELECTION-<unset>}\" \"${RAT_SELECTION+present}\" \\
-    \"${RAT_SELECTION_PANE-<unset>}\" \"${RAT_SELECTION_LINE-<unset>}\" > @OUT@
+    \"${RAT_CURSOR-<unset>}\" \"${RAT_CURSOR+present}\" \\
+    \"${RAT_CURSOR_PANE-<unset>}\" \"${RAT_CURSOR_LINE-<unset>}\" > @OUT@
 ";
 
 /// Wait for the probe's line and hand it back whole.
@@ -2372,9 +2372,9 @@ fn an_inherited_selection_never_reaches_a_cursorless_action() {
         &rat_bin(),
         &["dashboard", &decl.display().to_string()],
         &[
-            ("RAT_SELECTION", "XYZZY-LEAKED"),
-            ("RAT_SELECTION_PANE", "XYZZY-PANE"),
-            ("RAT_SELECTION_LINE", "9999"),
+            ("RAT_CURSOR", "XYZZY-LEAKED"),
+            ("RAT_CURSOR_PANE", "XYZZY-PANE"),
+            ("RAT_CURSOR_LINE", "9999"),
         ],
     )
     .expect("spawn rat dashboard under a pty");
@@ -2492,7 +2492,7 @@ fn a_styled_selection_reaches_a_when_clean_too() {
     let dir = tempfile::tempdir().expect("tempdir");
     let counter = dir.path().join("counter");
     let guard = dir.path().join("guard.sh");
-    std::fs::write(&guard, "[ \"${RAT_SELECTION-}\" = \"L02 green\" ]\n").expect("write the guard");
+    std::fs::write(&guard, "[ \"${RAT_CURSOR-}\" = \"L02 green\" ]\n").expect("write the guard");
     // Same reason as the probe's: no escape may cross the KDL layer.
     let body = dir.path().join("body.sh");
     std::fs::write(

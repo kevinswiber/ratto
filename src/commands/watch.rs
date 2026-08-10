@@ -6291,9 +6291,9 @@ fn build_source_command(
     // that DOES set them: a pane's spawn environment cannot depend on
     // cursor state without either respawning every pane on every cursor
     // move or handing a child a value that was true once.
-    command.env_remove("RAT_SELECTION");
-    command.env_remove("RAT_SELECTION_PANE");
-    command.env_remove("RAT_SELECTION_LINE");
+    command.env_remove("RAT_CURSOR");
+    command.env_remove("RAT_CURSOR_PANE");
+    command.env_remove("RAT_CURSOR_LINE");
     command
 }
 
@@ -6385,17 +6385,17 @@ fn build_action_command(
     //
     // Before the sets, never after: an environment is a map, so the
     // order is what decides which wins.
-    command.env_remove("RAT_SELECTION");
-    command.env_remove("RAT_SELECTION_PANE");
-    command.env_remove("RAT_SELECTION_LINE");
+    command.env_remove("RAT_CURSOR");
+    command.env_remove("RAT_CURSOR_PANE");
+    command.env_remove("RAT_CURSOR_LINE");
     // The selection joins the environment the same way the appearance
     // does — a value handed to a NEW process. Nothing here goes near
     // stdin: no key is ever forwarded to a child, and a selection is
     // not a keystroke.
     if let Some(sel) = selection {
-        command.env("RAT_SELECTION", &sel.text);
-        command.env("RAT_SELECTION_PANE", &sel.pane);
-        command.env("RAT_SELECTION_LINE", sel.line.to_string());
+        command.env("RAT_CURSOR", &sel.text);
+        command.env("RAT_CURSOR_PANE", &sel.pane);
+        command.env("RAT_CURSOR_LINE", sel.line.to_string());
     }
     // All three fields from the ONE construction point — no caller
     // attaches anything afterwards, because a caller that forgets is a
@@ -15525,7 +15525,7 @@ mod tests {
             None,
         );
         let entries = action_env_entries(&spawn.command);
-        for name in ["RAT_SELECTION", "RAT_SELECTION_PANE", "RAT_SELECTION_LINE"] {
+        for name in ["RAT_CURSOR", "RAT_CURSOR_PANE", "RAT_CURSOR_LINE"] {
             assert!(
                 entries.contains(&(name.to_string(), None)),
                 "{name} must be removed, not merely unmentioned: {entries:?}"
@@ -15556,7 +15556,7 @@ mod tests {
             Some(&sel),
         );
         let entries = action_env_entries(&spawn.command);
-        for name in ["RAT_SELECTION", "RAT_SELECTION_PANE", "RAT_SELECTION_LINE"] {
+        for name in ["RAT_CURSOR", "RAT_CURSOR_PANE", "RAT_CURSOR_LINE"] {
             assert!(
                 !entries.contains(&(name.to_string(), None)),
                 "{name} was removed after being set: {entries:?}"
@@ -15584,15 +15584,12 @@ mod tests {
         );
         let envs = action_envs(&spawn.command);
         assert_eq!(
-            envs.get("RAT_SELECTION_PANE").map(String::as_str),
+            envs.get("RAT_CURSOR_PANE").map(String::as_str),
             Some("diff")
         );
+        assert_eq!(envs.get("RAT_CURSOR_LINE").map(String::as_str), Some("7"));
         assert_eq!(
-            envs.get("RAT_SELECTION_LINE").map(String::as_str),
-            Some("7")
-        );
-        assert_eq!(
-            envs.get("RAT_SELECTION").map(String::as_str),
+            envs.get("RAT_CURSOR").map(String::as_str),
             Some("+ let x = 42;")
         );
         // The guard against a tail that REPLACED the shipped
@@ -15613,9 +15610,9 @@ mod tests {
             None,
         );
         let envs = action_envs(&spawn.command);
-        assert!(!envs.contains_key("RAT_SELECTION"));
-        assert!(!envs.contains_key("RAT_SELECTION_PANE"));
-        assert!(!envs.contains_key("RAT_SELECTION_LINE"));
+        assert!(!envs.contains_key("RAT_CURSOR"));
+        assert!(!envs.contains_key("RAT_CURSOR_PANE"));
+        assert!(!envs.contains_key("RAT_CURSOR_LINE"));
         assert!(envs.contains_key("RAT_APPEARANCE"));
     }
 
@@ -15703,7 +15700,7 @@ mod tests {
             ctx.selection.as_ref(),
         );
         let (a, b) = (action_envs(&command.command), action_envs(&guard.command));
-        for name in ["RAT_SELECTION", "RAT_SELECTION_PANE", "RAT_SELECTION_LINE"] {
+        for name in ["RAT_CURSOR", "RAT_CURSOR_PANE", "RAT_CURSOR_LINE"] {
             assert_eq!(a.get(name), b.get(name), "{name}");
             assert!(a.contains_key(name), "{name} reached neither route");
         }
