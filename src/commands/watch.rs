@@ -1084,7 +1084,7 @@ pub(crate) fn run_registry(
             );
             // The bodies just changed and the geometry is fresh: clamp
             // every pane's window into the new shape before it composes.
-            reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+            reanchor_pane_view(&mut panes, &runtime, &geom);
             // Composed once, above the repaint gate: the newest frame
             // is tracked on every completion, so paging always acts on
             // the newest content. Combining the single source's output
@@ -1679,7 +1679,7 @@ pub(crate) fn run_registry(
             if step.geom_moved {
                 resize_gate.fire(Instant::now());
                 // Every pane's window moved with its inner_rows.
-                reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+                reanchor_pane_view(&mut panes, &runtime, &geom);
             }
             if step.size_moved
                 && is_tty
@@ -2542,7 +2542,7 @@ pub(crate) fn run_registry(
                             // `geom[i].inner_rows`, which collapse leaves
                             // alone — and that is exactly why an expanded
                             // pane returns to the viewport it left.
-                            reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+                            reanchor_pane_view(&mut panes, &runtime, &geom);
                             recompose_live(
                                 &mut live,
                                 &registry,
@@ -2620,7 +2620,7 @@ pub(crate) fn run_registry(
                             zoom_gates[id.0].fire(Instant::now());
                             // The pane's window just changed shape:
                             // clamp every viewport into it (INV-7).
-                            reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+                            reanchor_pane_view(&mut panes, &runtime, &geom);
                             recompose_live(
                                 &mut live,
                                 &registry,
@@ -2710,7 +2710,7 @@ pub(crate) fn run_registry(
                                 zoom_gates[id.0].fire(Instant::now());
                                 // And its window: clamp every viewport
                                 // back into the declared shape (INV-7).
-                                reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+                                reanchor_pane_view(&mut panes, &runtime, &geom);
                                 recompose_live(
                                     &mut live,
                                     &registry,
@@ -2805,7 +2805,7 @@ pub(crate) fn run_registry(
                                 // INV-5's reason to exist).
                                 zoom_gates[from.0].fire(Instant::now());
                                 zoom_gates[to.0].fire(Instant::now());
-                                reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+                                reanchor_pane_view(&mut panes, &runtime, &geom);
                                 recompose_live(
                                     &mut live,
                                     &registry,
@@ -4744,7 +4744,7 @@ fn clamp_cursor(cursor: Option<usize>, total: usize) -> Option<usize> {
 /// body that empties drops it. Nothing here resets on a hash change or
 /// a failure: the clamp is the only thing allowed to move a reader's
 /// place.
-fn reanchor_pane_scrolls(panes: &mut PaneView, runtime: &[SourceRuntime], geom: &[PaneGeometry]) {
+fn reanchor_pane_view(panes: &mut PaneView, runtime: &[SourceRuntime], geom: &[PaneGeometry]) {
     for (i, (scroll, cursor)) in panes.scroll.iter_mut().zip(&mut panes.cursor).enumerate() {
         let total = runtime[i].output.as_ref().map_or(0, Vec::len);
         let window = geom[i].inner_rows as usize;
@@ -10591,13 +10591,13 @@ mod tests {
         // tail when the window grows.
         let (mut panes, geom) = panes_at(Some(SourceId(0)));
         panes.scroll[0] = LiveScroll::start(ScrollStep::Bottom, 60, 2);
-        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
         assert!(panes.scroll[0].pinned());
         assert_eq!(panes.scroll[0].offset(), 60 - 19);
 
         // An unpinned offset HOLDS across the gesture (D4) …
         panes.scroll[0] = LiveScroll::at(5, 60, 2);
-        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
         assert_eq!(
             (panes.scroll[0].offset(), panes.scroll[0].pinned()),
             (5, false)
@@ -10606,7 +10606,7 @@ mod tests {
         // … and is CLAMPED, never left past the end, when the bigger window
         // shortens the maximum offset from 58 to 41.
         panes.scroll[0] = LiveScroll::at(58, 60, 2);
-        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
         assert_eq!(panes.scroll[0].offset(), 41);
 
         // Unzoom is the same call with the declared geometry: the reader's
@@ -10617,7 +10617,7 @@ mod tests {
         let (mut panes, geom) = panes_at(None);
         panes.scroll[0] = LiveScroll::at(41, 60, 19);
         let neighbour = panes.scroll[1];
-        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
         assert_eq!(panes.scroll[0].offset(), 41);
         assert_eq!(panes.scroll[1], neighbour, "a pane at rest is unmoved");
     }
@@ -10638,29 +10638,29 @@ mod tests {
         let neighbour = panes.scroll[1];
 
         panes.cursor[0] = Some(58);
-        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
         assert_eq!(panes.cursor[0], Some(58), "same shape, same line");
 
         // Sixty different lines: the index is positional, and the text
         // under it changed. Agreement with the body is the guarantee;
         // stability of what the line says is not one.
         runtime[0].output = Some((1..=60).map(|i| format!("q{i}")).collect());
-        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
         assert_eq!(panes.cursor[0], Some(58), "a replacement holds it");
 
         runtime[0].output = Some((1..=10).map(|i| format!("s{i}")).collect());
-        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
         assert_eq!(panes.cursor[0], Some(9), "a shorter body clamps it");
 
         runtime[0].output = Some(Vec::new());
-        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
         assert_eq!(panes.cursor[0], None, "an empty body has no line to hold");
 
         // A pane that has never completed reports zero lines the same
         // way, and a cursor put there by hand does not survive it.
         runtime[0].output = None;
         panes.cursor[0] = Some(3);
-        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
         assert_eq!(panes.cursor[0], None, "nor does a pane with no body at all");
 
         assert_eq!(panes.cursor[1], None, "the neighbour never grew one");
@@ -10685,7 +10685,7 @@ mod tests {
 
         panes.scroll[0] = LiveScroll::at(58, 60, 2);
         panes.cursor[0] = Some(59);
-        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        reanchor_pane_view(&mut panes, &runtime, &geom);
         assert_eq!(
             panes.scroll[0].offset(),
             41,
