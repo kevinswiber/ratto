@@ -3013,14 +3013,32 @@ fn a_panes_board_renders_byte_identically_with_the_view_state_in_place() {
 ///
 /// The needles are deliberately unlovely and appear nowhere else in the
 /// fixture: a test must not contain the string whose absence it asserts.
+///
+/// Both shells can say "absent", and neither says it the other's way.
+/// `sh` needs `${VAR-unset}`, because a plain `$VAR` expands to nothing
+/// whether the name is unset or set-and-empty — the one distinction
+/// this contract makes. `cmd` needs no default at all: an undefined
+/// `%VAR%` survives as its own literal, so the probe's own spelling
+/// coming back IS the evidence that nothing was set. The needle differs
+/// by platform for the same reason the command does.
 #[test]
 fn a_panes_command_never_inherits_a_selection_from_rats_own_environment() {
     let dir = tempfile::tempdir().expect("tempdir");
+    #[cfg(unix)]
+    let probe = "echo SEL=[${RAT_CURSOR-unset}] PANE=[${RAT_CURSOR_PANE-unset}] LINE=[${RAT_CURSOR_LINE-unset}]";
+    #[cfg(windows)]
+    let probe = "echo SEL=[%RAT_CURSOR%] PANE=[%RAT_CURSOR_PANE%] LINE=[%RAT_CURSOR_LINE%]";
+    #[cfg(unix)]
+    let absent = "SEL=[unset] PANE=[unset] LINE=[unset]";
+    #[cfg(windows)]
+    let absent = "SEL=[%RAT_CURSOR%] PANE=[%RAT_CURSOR_PANE%] LINE=[%RAT_CURSOR_LINE%]";
     let file = fixture(
         dir.path(),
         "board.kdl",
-        "row-gap 0\n\npane \"probe\" {\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n    interval \"1h\"\n    \
-         command \"echo SEL=[${RAT_CURSOR-unset}] PANE=[${RAT_CURSOR_PANE-unset}] LINE=[${RAT_CURSOR_LINE-unset}]\"\n}\n",
+        &format!(
+            "row-gap 0\n\npane \"probe\" {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n    interval \"1h\"\n    \
+             command \"{probe}\"\n}}\n",
+        ),
     );
     let assert = rat()
         .env("NO_COLOR", "1")
@@ -3037,7 +3055,7 @@ fn a_panes_command_never_inherits_a_selection_from_rats_own_environment() {
     // from "the selected line is empty", which is the distinction the
     // export contract makes everywhere else.
     assert!(
-        stdout.contains("SEL=[unset] PANE=[unset] LINE=[unset]"),
+        stdout.contains(absent),
         "a pane inherited a selection: {stdout}"
     );
     assert!(
