@@ -4582,6 +4582,19 @@ struct Selection {
 /// exported again on expand; the status row is what tells the reader it
 /// is still there.
 ///
+/// One clip is deliberately NOT consulted: the frame's own window. A
+/// pane taller than the painted frame can hold its mark below the fold
+/// and still export it. Both repairs cost more than the case does —
+/// making the frame follow the mark is the exact coupling
+/// `a_cursor_move_never_touches_the_frames_own_window` exists to
+/// forbid, and suppressing the export would widen "visible" past the
+/// one predicate above. It is accepted BECAUSE a marked line is inert
+/// until a second, deliberate keypress: nothing reads one on its own,
+/// so an unseen mark cannot act, and the status row still names its
+/// position at the moment the reader presses. That reasoning expires
+/// the instant anything fires on cursor movement — and it is a real
+/// leak from that instant, not a smaller version of this one.
+///
 /// Every other arm is a real "no selection" too, answered with `None`
 /// rather than a panic or an empty string: no focus, no cursor in the
 /// focused pane, a pane that has not produced output yet, an index past
