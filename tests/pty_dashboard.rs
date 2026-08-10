@@ -7010,6 +7010,69 @@ pane "a" {
     );
 }
 
+/// A zoom puts a collapsed pane's body back on screen, and the scroll
+/// keys follow it there.
+///
+/// The guard asks the one predicate every other pane gesture asks — a
+/// zoom overrules a collapse — rather than the raw collapse bit, which
+/// froze a window the reader was looking at while its own justifying
+/// comment said the window was not on screen. The sibling above holds
+/// the other arm: collapsed and NOT zoomed still declines. The pair is
+/// what says the predicate makes the difference, not the gesture.
+#[test]
+fn a_zoom_gives_a_collapsed_panes_window_its_scroll_keys_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 5
+    border "none"
+    chrome #false
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 60); do echo L$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"L01", b"L05"],
+        Duration::from_secs(5),
+    );
+
+    // Focus, collapse, zoom: the body is back on screen at the window's
+    // row budget (~21 content rows at 24x80), so L21 is reachable and
+    // L40 is not.
+    session.write_bytes(b"\t z");
+    let seen = wait_for_in_order(&session, &mut terminal, &[b"L21"], Duration::from_secs(3));
+    assert!(
+        !contains(&seen, b"L40"),
+        "premise: L40 is below the zoomed window, so its arrival later can only be a scroll: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // Twenty steps down. Under the raw collapse bit these landed
+    // nowhere, because the bit stays set under the zoom.
+    session.write_bytes(b"jjjjjjjjjjjjjjjjjjjj");
+    let _ = wait_for_in_order(&session, &mut terminal, &[b"L40"], Duration::from_secs(3));
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// Zoom shows a collapsed pane's body; unzoom returns the row (INV-12).
 #[test]
 fn zoom_shows_a_collapsed_panes_body_and_unzoom_returns_the_row() {

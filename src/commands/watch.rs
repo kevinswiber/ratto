@@ -2235,11 +2235,10 @@ pub(crate) fn run_registry(
                             // a collapse, and the raw bit would freeze a
                             // mark the reader can see.
                             //
-                            // The scroll arm below reads the raw bit, so
-                            // on a collapsed-then-zoomed pane `j` moves a
-                            // cursor and declines a window step. Each is
-                            // right under its own rule; do not align them
-                            // while working here.
+                            // The scroll arm below asks the same
+                            // predicate, so the two answer alike on a
+                            // collapsed-then-zoomed pane. They diverged
+                            // for exactly as long as it took to notice.
                             if panes.body_hidden(id) {
                                 continue;
                             }
@@ -2321,12 +2320,18 @@ pub(crate) fn run_registry(
                             if let Some(id) =
                                 scroll_target(mode_of(pause.as_ref(), live_scroll), &panes)
                             {
-                                // A focused pane owns the keys even while
-                                // collapsed; its window is not on screen
-                                // to move, so the step declines HERE —
-                                // never by falling back to the whole
-                                // frame (INV-7).
-                                if panes.collapsed[id.0] {
+                                // A focused pane owns the keys even when
+                                // its body is off screen; there is no
+                                // window to move, so the step declines
+                                // HERE — never by falling back to the
+                                // whole frame (INV-7).
+                                //
+                                // The predicate, not the raw collapse
+                                // bit: a zoom overrules a collapse and
+                                // puts the body back on screen, and the
+                                // reader can see the window they are
+                                // asking to move.
+                                if panes.body_hidden(id) {
                                     continue;
                                 }
                                 let total = runtime[id.0].output.as_ref().map_or(0, Vec::len);
@@ -12368,10 +12373,10 @@ mod tests {
         );
         assert_eq!(scroll_target(FrameMode::Paused, &panes), None);
         // A focused pane OWNS the scroll keys even while collapsed: the
-        // target stays Some, and the arm itself declines the step (the
-        // collapse task's `continue`). Returning None here would route
-        // the keys back to the whole-frame arm — the INV-7 violation,
-        // not the no-op.
+        // target stays Some, and the arm itself decides whether the step
+        // lands, by asking `body_hidden`. Returning None here would
+        // route the keys back to the whole-frame arm — the INV-7
+        // violation, not the no-op.
         panes.collapsed[1] = true;
         assert_eq!(scroll_target(FrameMode::Live, &panes), Some(SourceId(1)));
     }
