@@ -1240,6 +1240,50 @@ both pipes whatever the flags say, so the default invocation discards
 plenty, and reporting output you never wanted would be debug noise on
 every long-running command.
 
+### Accessible mode
+
+`RAT_ACCESSIBLE=1`, or `--accessible`, turns `rat choose`, `rat confirm`
+and `rat filter` into a transcript instead of a painted frame. Nothing
+is ever rewritten in place: the prompt, the options, the starting
+position (`1 of 4`) and the keys print once as plain lines on entry;
+every keystroke that changes something appends one short line saying
+what it is now (`beta`, `selected beta`, `ap, 2 matches, apple`); and
+the result appends as its own line before the process exits (`chose
+beta`, `cancelled`, `timed out`). A key that changes nothing prints
+nothing, and a burst of typing settles into one line rather than one per
+character. `Ctrl-O` says where you are and `Ctrl-T` says what is
+selected, at any point. Every key still works, stdout is unchanged, and
+so are the exit codes — `fruit=$(rat choose apple banana)` reads the
+same bytes it always did.
+
+The flags that only shape a painted frame have nothing to act on and are
+ignored: `--height`, `--cursor` (`--indicator` in `filter`), and the
+selection prefixes. Everything else — `--header`, `--limit`,
+`--timeout`, `--no-strict` — works as it always does. The startup query
+`rat` writes to ask the terminal whether it is light or dark is skipped
+as well, since nothing in the mode reads a palette; on a terminal that
+never answers it, the picker opens sooner.
+
+The transcript stays in the scrollback, which is the point, and it is
+worth knowing before turning the mode on: a picker used to erase itself
+on exit and this one does not. What was typed persists with it, so `rat
+filter` over hostnames or ticket titles leaves the query in the
+scrollback — and in any `script` or tmux capture of it — after the
+command has finished.
+
+`--no-accessible` turns the mode off for one run and beats both the flag
+and the variable; `--accessible=false` says the same thing. The variable
+is what reaches invocations you did not write — a script that calls `rat
+choose` inherits it — but it changes nothing else: `rat watch` does not
+start appending because `RAT_ACCESSIBLE` is set, and `rat input` and
+`rat spin` are unaffected either way. Nor does it change how anything
+else finds your terminal's colours: `rat table`, `rat watch` and `rat
+doctor` still ask, and still paint, exactly as they did. `rat doctor`
+reports which mode a session resolved to and what decided it.
+
+This mode exists for linear readers, the same bargain `--append` makes,
+for the three commands that used to erase what they said.
+
 ## A complete dashboard
 
 ```sh

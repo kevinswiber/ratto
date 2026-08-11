@@ -129,9 +129,7 @@ fn probe_sync_support(ui: &mut UiStream) -> SyncSupport {
     result.unwrap_or(SyncSupport::NoReply)
 }
 
-// Threaded for the resolved-mode row this command will report; unread
-// until then.
-pub fn run(args: DoctorArgs, profile: ColorProfile, palette: Palette, _mode: UiMode) -> AppResult {
+pub fn run(args: DoctorArgs, profile: ColorProfile, palette: Palette, mode: UiMode) -> AppResult {
     let mut ui = UiStream::open();
     let is_tty = ui.is_tty();
     let is_dev_tty = ui.is_dev_tty();
@@ -140,6 +138,8 @@ pub fn run(args: DoctorArgs, profile: ColorProfile, palette: Palette, _mode: UiM
     let reason = profile_reason(is_tty);
     let appearance = palette.appearance.as_str();
     let appearance_source = appearance_reason(palette.source);
+    let accessible = mode == UiMode::Echo;
+    let accessible_reason = accessible_reason(mode);
     let sync = probe_sync_support(&mut ui);
 
     #[cfg(unix)]
@@ -158,6 +158,7 @@ pub fn run(args: DoctorArgs, profile: ColorProfile, palette: Palette, _mode: UiM
                 "\"detected_profile\":\"{:?}\",\"active_profile\":\"{:?}\",",
                 "\"profile_reason\":\"{}\",",
                 "\"appearance\":\"{}\",\"appearance_source\":\"{}\",",
+                "\"accessible\":{},\"accessible_reason\":\"{}\",",
                 "\"sync_output\":\"{:?}\",\"sync_supported\":{}}}"
             ),
             stream,
@@ -169,6 +170,8 @@ pub fn run(args: DoctorArgs, profile: ColorProfile, palette: Palette, _mode: UiM
             reason,
             appearance,
             appearance_source,
+            accessible,
+            accessible_reason,
             sync,
             sync.supported(),
         );
@@ -180,9 +183,41 @@ pub fn run(args: DoctorArgs, profile: ColorProfile, palette: Palette, _mode: UiM
         writeln!(out, "Detected profile: {detected:?} ({reason})").context("writing")?;
         writeln!(out, "Active profile:   {profile:?}").context("writing")?;
         writeln!(out, "Appearance:       {appearance} ({appearance_source})").context("writing")?;
+        // The diagnostic keeps asking the terminal for its colours in a
+        // spoken session, deliberately: the three pickers stop asking
+        // because nothing in them reads a palette, and this is not one of
+        // them. Its job is to report what this terminal and this build
+        // actually do, so the row above still names the appearance a
+        // painting command would use.
+        writeln!(
+            out,
+            "Accessible:       {} ({accessible_reason})",
+            if accessible { "on" } else { "off" }
+        )
+        .context("writing")?;
         writeln!(out, "Synchronized out: {}", sync.describe()).context("writing")?;
     }
     Ok(())
+}
+
+/// A short human account of what decided the presentation, in the same
+/// spirit as `profile_reason`. The mode is resolved once at startup and
+/// arrives here already decided; this only names where the request came
+/// from, so it reads the variable to DISPLAY it and never to decide
+/// anything. A variable whose value disagrees with the resolved state
+/// means a flag outranked it, and printing both halves is how that stays
+/// visible instead of looking like a bug.
+///
+/// It prints the value raw rather than interpreting it: the argument
+/// parser owns the vocabulary of truthy spellings, and a second reading
+/// of "is this value truthy" living here would be two expressions of one
+/// fact.
+fn accessible_reason(mode: UiMode) -> String {
+    match (mode, std::env::var("RAT_ACCESSIBLE").ok()) {
+        (_, Some(value)) => format!("RAT_ACCESSIBLE={value}"),
+        (UiMode::Echo, None) => "command line".into(),
+        (UiMode::Painted, None) => "unset".into(),
+    }
 }
 
 /// A short account of what decided the appearance, in the same spirit as
