@@ -49,7 +49,6 @@ fn between<'a>(haystack: &'a [u8], open: &[u8], close: &[u8]) -> &'a [u8] {
 /// terminator so a capture stopped here leaves no `\r\n` behind for a
 /// later drain to read back as a phantom row.
 const KEYS_ONE: &[u8] = b"up and down move, enter chooses, escape cancels\r\n";
-#[allow(dead_code)]
 const KEYS_MULTI: &[u8] = b"up and down move, space selects, enter confirms, escape cancels\r\n";
 
 /// Run a choose session that is expected to paint, and return the bytes
@@ -349,4 +348,85 @@ fn an_item_carrying_a_newline_is_still_one_row() {
 
     session.write_bytes(b"\x1b");
     session.kill_if_alive(Duration::from_secs(5));
+}
+
+/// One key, one row. In echo mode a burst of keys COALESCES to a single
+/// row — the last one — so an ordered chain of transitions cannot be
+/// produced by writing several keys and then reading. Each key is
+/// written only after the previous key's row has been read back, which
+/// is also what makes the sequence race-free: the next row cannot
+/// already be in flight inside the previous wait's final chunk, because
+/// nothing has been pressed yet to cause it.
+///
+/// Returns the bytes it read so the caller can concatenate them into
+/// ONE stream and assert the whole order at the end. Reads are
+/// destructive and sequential, so the concatenation is the stream.
+fn press_and_hear(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    key: &[u8],
+    row: &[u8],
+) -> Vec<u8> {
+    session.write_bytes(key);
+    wait_for_in_order(session, terminal, &[row], Duration::from_secs(5))
+}
+
+#[test]
+fn a_cursor_move_names_the_item_and_a_toggle_names_the_mark() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "choose",
+            "--accessible",
+            "--no-limit",
+            "alpha",
+            "beta",
+            "gamma",
+            "delta",
+        ],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let mut seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[KEYS_MULTI],
+        Duration::from_secs(5),
+    );
+    seen.extend(press_and_hear(
+        &session,
+        &mut terminal,
+        b"\x1b[B",
+        b"beta\r\n",
+    ));
+    seen.extend(press_and_hear(
+        &session,
+        &mut terminal,
+        b" ",
+        b"selected beta\r\n",
+    ));
+    seen.extend(press_and_hear(
+        &session,
+        &mut terminal,
+        b" ",
+        b"deselected beta\r\n",
+    ));
+    assert_eq!(
+        common::pty::first_unmatched_in_order(
+            &seen,
+            &[
+                KEYS_MULTI,
+                b"beta\r\n",
+                b"selected beta\r\n",
+                b"deselected beta\r\n",
+            ],
+        ),
+        None,
+        "{:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"\x1b");
+    assert!(!session.kill_if_alive(Duration::from_secs(5)));
 }

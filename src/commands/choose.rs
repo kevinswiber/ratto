@@ -11,6 +11,7 @@ use crate::core::duration::parse_interval;
 use crate::exit::AppResult;
 use crate::theme::Palette;
 use crate::ui::choose::ChooseState;
+use crate::ui::echo::EchoSnapshot;
 use crate::ui::key::Key;
 use crate::ui::loop_::{Outcome, UiApp, UiMode, run_ui_mode};
 
@@ -23,6 +24,37 @@ struct ChooseApp {
     multi: bool,
     show_help: bool,
     palette: Palette,
+}
+
+/// What one keystroke did, in the fewest words that still say it.
+///
+/// The mark under the cursor is asked about first: no key in this
+/// picker both moves and toggles, but if one is ever added, a change to
+/// the answer matters more than a change to where the reader is
+/// looking. Only the cursor's own mark is consulted — a single-select
+/// toggle clears the previous choice as part of choosing, and saying so
+/// would need a second row for one keystroke.
+///
+/// There is deliberately no "did anything change" guard here: the
+/// driver compares snapshots and does not call this at all when they
+/// match. Two places deciding silence is one place too many.
+fn choose_transition(
+    before: &EchoSnapshot,
+    now: &EchoSnapshot,
+    items: &[String],
+) -> Option<String> {
+    let item = items.get(now.cursor)?;
+    if before.marked.get(now.cursor) != now.marked.get(now.cursor) {
+        return Some(if now.marked.get(now.cursor) == Some(&true) {
+            format!("selected {item}")
+        } else {
+            format!("deselected {item}")
+        });
+    }
+    if before.cursor != now.cursor {
+        return Some(item.clone());
+    }
+    None
 }
 
 impl ChooseApp {
@@ -93,6 +125,21 @@ impl UiApp for ChooseApp {
     fn height(&self, _term: (u16, u16)) -> u16 {
         let rows = (self.state.items.len() as u16).min(self.state.height);
         1 + rows + u16::from(self.show_help)
+    }
+
+    fn echo_snapshot(&self) -> EchoSnapshot {
+        EchoSnapshot {
+            cursor: self.state.cursor,
+            // The reducer's word is `selected`; the snapshot's is
+            // `marked`, because three surfaces share this shape and
+            // filter's marks are not a selection.
+            marked: self.state.selected.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn speak(&self, before: &EchoSnapshot) -> Option<String> {
+        choose_transition(before, &self.echo_snapshot(), &self.state.items)
     }
 
     fn speak_opening(&self) -> Vec<String> {
@@ -177,6 +224,94 @@ mod tests {
 
     use super::*;
     use crate::theme::{Appearance, AppearanceSource};
+
+    fn snap(cursor: usize, marked: &[bool]) -> EchoSnapshot {
+        EchoSnapshot {
+            cursor,
+            marked: marked.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn items4() -> Vec<String> {
+        ["alpha", "beta", "gamma", "delta"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_move_names_the_item_and_a_toggle_names_the_mark_on_it() {
+        const F: bool = false;
+        const T: bool = true;
+        let items = items4();
+        for (n, (before, now, want)) in [
+            (snap(0, &[F, F, F, F]), snap(1, &[F, F, F, F]), Some("beta")),
+            (
+                snap(1, &[F, F, F, F]),
+                snap(0, &[F, F, F, F]),
+                Some("alpha"),
+            ),
+            (
+                snap(3, &[F, F, F, F]),
+                snap(0, &[F, F, F, F]),
+                Some("alpha"),
+            ),
+            (
+                snap(1, &[F, F, F, F]),
+                snap(1, &[F, T, F, F]),
+                Some("selected beta"),
+            ),
+            (
+                snap(1, &[F, T, F, F]),
+                snap(1, &[F, F, F, F]),
+                Some("deselected beta"),
+            ),
+            // A single-select toggle clears the previous choice as part
+            // of choosing; only the item the reader acted on is named.
+            (
+                snap(1, &[T, F, F, F]),
+                snap(1, &[F, T, F, F]),
+                Some("selected beta"),
+            ),
+            (snap(1, &[F, F, F, F]), snap(1, &[F, F, F, F]), None),
+            // Both changed: the mark is the louder event.
+            (
+                snap(0, &[F, F, F, F]),
+                snap(1, &[F, T, F, F]),
+                Some("selected beta"),
+            ),
+            // A cursor past the list declines rather than panicking.
+            (snap(9, &[F, F, F, F]), snap(9, &[F, F, F, F]), None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                choose_transition(&before, &now, &items).as_deref(),
+                want,
+                "row {n}"
+            );
+        }
+
+        // An empty list cannot name an item.
+        let empty = snap(0, &[]);
+        assert_eq!(choose_transition(&empty, &empty, &[]), None);
+    }
+
+    #[test]
+    fn the_snapshot_carries_the_cursor_and_the_marks_and_no_query() {
+        let mut a = app(&["alpha", "beta"], true, "Choose:");
+        a.state.cursor = 1;
+        a.state.on_key(Key::Space);
+        let snap = a.echo_snapshot();
+        assert_eq!(snap.cursor, 1);
+        assert_eq!(snap.marked, vec![false, true]);
+        assert!(
+            snap.query.is_empty(),
+            "choose has no query; the field stays empty"
+        );
+    }
 
     fn app(items: &[&str], multi: bool, header: &str) -> ChooseApp {
         ChooseApp {

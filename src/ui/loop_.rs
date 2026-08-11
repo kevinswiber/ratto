@@ -10,7 +10,7 @@ use crate::exit::{AppError, AppResult};
 use crate::term::buffer_ansi::buffer_to_lines;
 use crate::term::inline::InlineRenderer;
 use crate::term::tty::{RawModeGuard, UiStream};
-use crate::ui::echo::{EchoSnapshot, echo_rows};
+use crate::ui::echo::{Coalescer, EchoSnapshot, echo_rows};
 use crate::ui::key::{Key, from_crossterm};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -61,8 +61,6 @@ pub trait UiApp {
     /// are equal, so the no-op rule is decided once for every surface
     /// rather than in each of them. An app with nothing to describe
     /// keeps the default and is silent by construction.
-    // The driver compares one around every key next.
-    #[allow(dead_code)]
     fn echo_snapshot(&self) -> EchoSnapshot {
         EchoSnapshot::default()
     }
@@ -73,8 +71,6 @@ pub trait UiApp {
     }
     /// The shortest unambiguous words for the transition that just
     /// happened, or `None` when this app has none for it.
-    // The driver hands what this returns to the burst policy next.
-    #[allow(dead_code)]
     fn speak(&self, _before: &EchoSnapshot) -> Option<String> {
         None
     }
@@ -146,8 +142,6 @@ const POLL_SLICE: Duration = Duration::from_millis(250);
 /// from how long a screen reader takes to say a row — that has not been
 /// measured, and this value should be revisited once the mode has
 /// actually been heard.
-// The driver's transcript arm builds its burst policy with this next.
-#[allow(dead_code)]
 const ECHO_QUIESCENCE: Duration = POLL_SLICE;
 
 /// How long to wait for the next key, or `None` when the deadline has
@@ -198,6 +192,10 @@ pub fn run_ui_mode<A: UiApp>(
     if let UiSink::Echo(out) = &mut sink {
         echo_rows(out, &app.speak_opening())?;
     }
+    // Nothing is ever noted in the painted arm, and a coalescer with
+    // nothing pending hands back every wait it is given untouched — so
+    // the painted loop below is the loop it always was.
+    let mut coalescer = Coalescer::new(ECHO_QUIESCENCE);
 
     let deadline = timeout.map(|t| Instant::now() + t);
     let outcome = loop {
@@ -214,7 +212,8 @@ pub fn run_ui_mode<A: UiApp>(
                 .context("painting ui")?;
         }
 
-        let Some(wait) = poll_wait(deadline, Instant::now()) else {
+        let now = Instant::now();
+        let Some(wait) = poll_wait(deadline, now).map(|w| w.min(coalescer.wait_cap(now, w))) else {
             break Err(AppError::Timeout(None));
         };
         if crossterm::event::poll(wait).context("polling events")? {
@@ -226,12 +225,34 @@ pub fn run_ui_mode<A: UiApp>(
                 if key == Key::CtrlC {
                     break Err(AppError::Aborted);
                 }
+                // The state as it was, so the transcript can say what
+                // the key did. Only the transcript needs it, and only
+                // the transcript pays for the clone.
+                let before = match &sink {
+                    UiSink::Echo(_) => Some(app.echo_snapshot()),
+                    UiSink::Painted(_) => None,
+                };
                 match app.on_key(key) {
                     Outcome::Continue => {}
                     Outcome::Submit => break Ok(()),
                     Outcome::Abort => break Err(AppError::NoSelection),
                 }
+                if let Some(before) = before
+                    && app.echo_snapshot() != before
+                {
+                    // A key that changed something but has no words for
+                    // it stays a visible decision here rather than one
+                    // buried in the burst policy.
+                    if let Some(row) = app.speak(&before) {
+                        coalescer.note(row, Instant::now());
+                    }
+                }
             }
+        }
+        if let UiSink::Echo(out) = &mut sink
+            && let Some(row) = coalescer.take_if_due(Instant::now())
+        {
+            echo_rows(out, &[row])?;
         }
     };
 

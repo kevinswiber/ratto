@@ -9,9 +9,6 @@ use crate::core::measure::seal_rows;
 /// surfaces share. Two equal snapshots mean the key changed nothing and
 /// the mode says nothing — the comparison is the whole no-op rule, and
 /// it lives in one place so no surface has to re-implement it.
-// The driver builds one around every key next, and each surface fills
-// it in.
-#[allow(dead_code)]
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct EchoSnapshot {
     pub cursor: usize,
@@ -173,15 +170,11 @@ struct Pending {
 /// It decides WHEN, never WHETHER. Whether a key changed anything is the
 /// driver's comparison of two snapshots; this type is only ever handed
 /// rows that already earned their place.
-// The driver's transcript arm holds one of these next.
-#[allow(dead_code)]
 pub struct Coalescer {
     quiescence: Duration,
     pending: Option<Pending>,
 }
 
-// Every method below is reached from the driver's transcript arm next.
-#[allow(dead_code)]
 impl Coalescer {
     /// The interval is a parameter rather than a constant read from
     /// here: the driver names it at the construction site, where the
@@ -234,6 +227,9 @@ impl Coalescer {
     /// pressed inside the interval and followed straight by Enter
     /// contributes no transition row, because the resting state at exit
     /// IS the result and the closing row names it better.
+    // The driver drops the pending row on the way out next, where the
+    // closing row supersedes it.
+    #[allow(dead_code)]
     pub fn discard(&mut self) {
         self.pending = None;
     }
