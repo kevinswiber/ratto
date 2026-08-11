@@ -861,3 +861,141 @@ fn the_keys_row_names_the_on_demand_keys_once() {
     assert_eq!(count(&single, b"control o says where you are"), 1);
     assert_eq!(count(&single, b"control t says what you selected"), 0);
 }
+
+/// The exit code, or a diagnostic naming which of the three ways it went
+/// wrong: still running, or dead of a signal. All three collapse to
+/// `None`, and they want different fixes.
+fn exit_code(session: &PtySession) -> i32 {
+    match session.wait_code(Duration::from_secs(5)) {
+        Some(code) => code,
+        None => panic!(
+            "no exit code: exited={}, so it is either still running or died of a signal",
+            session.exited()
+        ),
+    }
+}
+
+#[test]
+fn a_clean_exit_reports_its_code() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible=true", "alpha", "beta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    session.write_bytes(b"\x1b");
+    assert_eq!(exit_code(&session), 1);
+}
+
+#[test]
+fn a_reaped_session_does_not_wedge_the_killer() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "alpha", "beta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+    session.write_bytes(b"\x1b");
+
+    // `exited()` reaps. Asking the killer afterwards used to wait for a
+    // reap that had already happened, with no way to tell that from a
+    // live child.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !session.exited() {
+        assert!(std::time::Instant::now() < deadline, "the child never left");
+        let _ = drain_for(&session, Duration::from_millis(20));
+    }
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the child had already exited"
+    );
+    // And the status survived a reap that happened somewhere else
+    // entirely, which is the whole reason it is recorded rather than
+    // read on demand.
+    assert_eq!(session.wait_code(Duration::from_secs(1)), Some(1));
+}
+
+/// One fixture for both modes. The transcript arm adds the variable; the
+/// painted arm is the shipped default, and its only "first output" is a
+/// frame escape, because it has no rows at all — which is the measured
+/// difference this whole mode exists to remove, not a gap in the test.
+fn spawn_mode(args: &[&str], transcript: bool) -> PtySession {
+    let mut argv = vec!["choose"];
+    argv.extend_from_slice(args);
+    let mut envs = vec![("RAT_APPEARANCE", "dark")];
+    if transcript {
+        envs.push(("RAT_ACCESSIBLE", "1"));
+    }
+    PtySession::spawn(&rat_bin(), &argv, &envs).expect("spawn rat choose under a pty")
+}
+
+/// The needle that proves the session reached its driver — and therefore
+/// that raw mode is on, which is what makes an interrupt byte a keystroke
+/// rather than a signal.
+fn first_output(transcript: bool) -> &'static [u8] {
+    if transcript { KEYS_ONE } else { b"\x1b[?25l" }
+}
+
+#[test]
+fn escape_exits_one_in_both_modes() {
+    for transcript in [true, false] {
+        let session = spawn_mode(&["alpha", "beta", "gamma", "delta"], transcript);
+        let mut terminal = FakeTerminal::dark();
+        wait_for_in_order(
+            &session,
+            &mut terminal,
+            &[first_output(transcript)],
+            Duration::from_secs(5),
+        );
+        if transcript {
+            press_and_hear(&session, &mut terminal, b"\x1b", b"cancelled\r\n");
+        } else {
+            session.write_bytes(b"\x1b");
+        }
+        assert_eq!(exit_code(&session), 1, "transcript={transcript}");
+    }
+}
+
+#[test]
+fn an_interrupt_exits_one_hundred_and_thirty_in_both_modes() {
+    for transcript in [true, false] {
+        let session = spawn_mode(&["alpha", "beta", "gamma", "delta"], transcript);
+        let mut terminal = FakeTerminal::dark();
+        // Waiting for the session's own first output IS the proof that
+        // raw mode is engaged: before the guard the line discipline still
+        // owns the interrupt byte and would send a signal instead, and
+        // the child would die of it rather than exiting. A sleep would
+        // work most of the time and fail on a loaded runner, and the
+        // failure would look like a flaky exit code rather than a race.
+        wait_for_in_order(
+            &session,
+            &mut terminal,
+            &[first_output(transcript)],
+            Duration::from_secs(5),
+        );
+        if transcript {
+            press_and_hear(&session, &mut terminal, b"\x03", b"cancelled\r\n");
+        } else {
+            session.write_bytes(b"\x03");
+        }
+        assert_eq!(exit_code(&session), 130, "transcript={transcript}");
+    }
+}
+
+#[test]
+fn a_timeout_exits_one_hundred_and_twenty_four_in_both_modes() {
+    for transcript in [true, false] {
+        let session = spawn_mode(&["--timeout", "300ms", "alpha", "beta"], transcript);
+        // The code, and NOTHING about the stream. The give-up notice is
+        // printed to stderr on this same pty after raw mode drops, in
+        // bytes identical to the transcript's own row — so a containment
+        // check here could not fail. The row is asserted by count where
+        // its wording lives.
+        assert_eq!(exit_code(&session), 124, "transcript={transcript}");
+    }
+}

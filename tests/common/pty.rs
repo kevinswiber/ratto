@@ -10,6 +10,11 @@ use std::time::{Duration, Instant};
 pub struct PtySession {
     master_fd: RawFd,
     child_pid: libc::pid_t,
+    /// The wait status of the ONE reap. `waitpid` answers once; every
+    /// path in this file used to drop the status on the floor, so an
+    /// exit code could not be read after the fact however carefully a
+    /// test asked.
+    status: std::cell::Cell<Option<libc::c_int>>,
 }
 
 impl PtySession {
@@ -115,6 +120,7 @@ impl PtySession {
         Ok(PtySession {
             master_fd: master,
             child_pid: pid,
+            status: std::cell::Cell::new(None),
         })
     }
 
@@ -187,18 +193,62 @@ impl PtySession {
         out
     }
 
+    /// The file's only `waitpid`. Answers "has it been reaped", and
+    /// records the status the first time the answer becomes true.
+    /// Idempotent: once a status is held the child is gone, and asking
+    /// the kernel again would answer ECHILD.
+    fn reap(&self) -> bool {
+        if self.status.get().is_some() {
+            return true;
+        }
+        let mut status: libc::c_int = 0;
+        if unsafe { libc::waitpid(self.child_pid, &mut status, libc::WNOHANG) } == self.child_pid {
+            self.status.set(Some(status));
+            return true;
+        }
+        false
+    }
+
     /// Has the child exited yet, without killing it or waiting for it?
     ///
     /// DIAGNOSTIC: a session that produced nothing looks identical whether
     /// its process wedged or died, and those two want opposite fixes.
     ///
-    /// **REAPS when it answers true, and a caller that then calls
-    /// `kill_if_alive` will SPIN FOREVER** — that helper waits for a reap
-    /// that has already happened and cannot tell it from a live child.
-    /// `Drop` is safe either way; only `kill_if_alive` is not.
+    /// REAPS when it answers true — and that is safe from anywhere now:
+    /// the status is recorded once and every path in this file consults
+    /// the same record, so calling `kill_if_alive` afterwards answers
+    /// "it exited on its own" promptly instead of waiting for a reap that
+    /// has already happened.
     pub fn exited(&self) -> bool {
-        let mut status: libc::c_int = 0;
-        unsafe { libc::waitpid(self.child_pid, &mut status, libc::WNOHANG) == self.child_pid }
+        self.reap()
+    }
+
+    /// The child's exit code, waiting up to `deadline` for it to leave on
+    /// its own.
+    ///
+    /// `None` means there is no exit code to report: the child was still
+    /// running when the deadline passed (nothing is killed here — `Drop`
+    /// still cleans up), or it died of a signal, which is a different
+    /// thing from exiting and must never be read as one.
+    ///
+    /// DRAINS while it waits, for the reason `kill_if_alive` does: an
+    /// exiting child can be blocked mid-write to a slave nobody is
+    /// reading. Those bytes are DISCARDED — capture everything you intend
+    /// to assert on BEFORE calling this.
+    pub fn wait_code(&self, deadline: Duration) -> Option<i32> {
+        let start = Instant::now();
+        loop {
+            if self.reap() {
+                let status = self.status.get()?;
+                return libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
+            }
+            if Instant::now().duration_since(start) >= deadline {
+                return None;
+            }
+            // A terminal always reads: the drain doubles as the loop's
+            // pacing, exactly as it does in `kill_if_alive`.
+            let _ = self.read_available(Duration::from_millis(20));
+        }
     }
 
     /// Kills and reaps the child if it hasn't exited by `deadline`.
@@ -207,9 +257,7 @@ impl PtySession {
     pub fn kill_if_alive(&self, deadline: Duration) -> bool {
         let start = Instant::now();
         loop {
-            let mut status: libc::c_int = 0;
-            let rc = unsafe { libc::waitpid(self.child_pid, &mut status, libc::WNOHANG) };
-            if rc == self.child_pid {
+            if self.reap() {
                 return false; // exited on its own
             }
             if Instant::now().duration_since(start) >= deadline {
@@ -221,8 +269,7 @@ impl PtySession {
                 // drain until the reap lands.
                 loop {
                     let _ = self.read_available(Duration::from_millis(20));
-                    let rc = unsafe { libc::waitpid(self.child_pid, &mut status, libc::WNOHANG) };
-                    if rc == self.child_pid {
+                    if self.reap() {
                         return true;
                     }
                 }
@@ -237,25 +284,21 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        unsafe {
-            let mut status: libc::c_int = 0;
-            // Reap if already exited (the common case: `kill_if_alive` or
-            // a clean quit already did this). If the child is still alive
-            // — a test that panicked before checking — force it so no test
-            // run leaves an orphaned process behind.
-            let reaped = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
-            if reaped == 0 {
+        // Reap if already exited (the common case: `kill_if_alive` or
+        // a clean quit already did this). If the child is still alive —
+        // a test that panicked before checking — force it so no test run
+        // leaves an orphaned process behind.
+        if !self.reap() {
+            unsafe {
                 libc::kill(self.child_pid, libc::SIGKILL);
-                // Same drain-to-reap dance as `kill_if_alive`: the child
-                // may be blocked writing to a slave nobody reads.
-                loop {
-                    let _ = self.read_available(Duration::from_millis(20));
-                    let rc = libc::waitpid(self.child_pid, &mut status, libc::WNOHANG);
-                    if rc == self.child_pid {
-                        break;
-                    }
-                }
             }
+            // Same drain-to-reap dance as `kill_if_alive`: the child may
+            // be blocked writing to a slave nobody reads.
+            while !self.reap() {
+                let _ = self.read_available(Duration::from_millis(20));
+            }
+        }
+        unsafe {
             libc::close(self.master_fd);
         }
     }

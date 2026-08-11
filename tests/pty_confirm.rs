@@ -421,3 +421,78 @@ fn the_spoken_answer_and_the_printed_one_are_the_same_string() {
 
     session.kill_if_alive(Duration::from_secs(5));
 }
+
+fn exit_code(session: &PtySession) -> i32 {
+    match session.wait_code(Duration::from_secs(5)) {
+        Some(code) => code,
+        None => panic!(
+            "no exit code: exited={}, so it is either still running or died of a signal",
+            session.exited()
+        ),
+    }
+}
+
+fn spawn_mode(args: &[&str], transcript: bool) -> PtySession {
+    let mut argv = vec!["confirm", "Ship it?"];
+    argv.extend_from_slice(args);
+    let mut envs = vec![("RAT_APPEARANCE", "dark")];
+    if transcript {
+        envs.push(("RAT_ACCESSIBLE", "1"));
+    }
+    PtySession::spawn(&rat_bin(), &argv, &envs).expect("spawn rat confirm under a pty")
+}
+
+fn first_output(transcript: bool) -> &'static [u8] {
+    if transcript { KEYS_ROW } else { b"\x1b[?25l" }
+}
+
+#[test]
+fn both_ways_of_ending_a_question_exit_one_and_only_the_row_tells_them_apart() {
+    // The strongest entry in the table: same surface, same exit code,
+    // opposite events. A reader who answered no and one who abandoned the
+    // prompt are distinguished by the row alone — collapse the two rows
+    // into one word and they become indistinguishable in both channels at
+    // once.
+    for transcript in [true, false] {
+        let session = spawn_mode(&[], transcript);
+        let mut terminal = FakeTerminal::dark();
+        wait_for_in_order(
+            &session,
+            &mut terminal,
+            &[first_output(transcript)],
+            Duration::from_secs(5),
+        );
+        if transcript {
+            press_and_hear(&session, &mut terminal, b"\x1b", b"cancelled\r\n");
+        } else {
+            session.write_bytes(b"\x1b");
+        }
+        assert_eq!(exit_code(&session), 1, "escape, transcript={transcript}");
+
+        let session = spawn_mode(&[], transcript);
+        let mut terminal = FakeTerminal::dark();
+        wait_for_in_order(
+            &session,
+            &mut terminal,
+            &[first_output(transcript)],
+            Duration::from_secs(5),
+        );
+        if transcript {
+            press_and_hear(&session, &mut terminal, b"n", b"chose No\r\n");
+        } else {
+            session.write_bytes(b"n");
+        }
+        assert_eq!(exit_code(&session), 1, "negative, transcript={transcript}");
+    }
+}
+
+#[test]
+fn a_custom_negative_label_is_what_the_closing_row_names() {
+    // The disagreeing input: a hardcoded label passes both rows above and
+    // fails only this one.
+    let session = spawn_mode(&["--negative", "Abort"], true);
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ROW], Duration::from_secs(5));
+    press_and_hear(&session, &mut terminal, b"n", b"chose Abort\r\n");
+    assert_eq!(exit_code(&session), 1);
+}
