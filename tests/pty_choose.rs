@@ -18,6 +18,40 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.len() > haystack.len() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+/// The slice strictly between the first `open` and the first `close`
+/// after it — for counting rows inside a known span.
+fn between<'a>(haystack: &'a [u8], open: &[u8], close: &[u8]) -> &'a [u8] {
+    let start = haystack
+        .windows(open.len())
+        .position(|w| w == open)
+        .map(|at| at + open.len())
+        .expect("the opening needle must be present");
+    let end = haystack[start..]
+        .windows(close.len())
+        .position(|w| w == close)
+        .expect("the closing needle must be present");
+    &haystack[start..start + end]
+}
+
+/// The opening block's last row for a single-select run. Every
+/// post-opening assertion in this suite anchors on it: it is the only
+/// row that means "the opening is over", and it carries its own row
+/// terminator so a capture stopped here leaves no `\r\n` behind for a
+/// later drain to read back as a phantom row.
+const KEYS_ONE: &[u8] = b"up and down move, enter chooses, escape cancels\r\n";
+#[allow(dead_code)]
+const KEYS_MULTI: &[u8] = b"up and down move, space selects, enter confirms, escape cancels\r\n";
+
 /// Run a choose session that is expected to paint, and return the bytes
 /// of its first frame. Shuts the session down before returning, so a
 /// failing assertion in the caller can never leave a process behind.
@@ -185,4 +219,134 @@ fn an_empty_variable_does_not_stop_the_command() {
     // driver at all, and every rat command would do the same.
     let seen = painted_choose(&[], &[("RAT_APPEARANCE", "dark"), ("RAT_ACCESSIBLE", "")]);
     assert_frame_escapes_present(&seen, "a session with an empty variable");
+}
+
+#[test]
+fn the_opening_block_names_the_header_the_items_the_position_and_the_keys() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "alpha", "beta", "gamma", "delta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[
+            b"Choose:\r\n",
+            b"alpha\r\n",
+            b"beta\r\n",
+            b"gamma\r\n",
+            b"delta\r\n",
+            b"1 of 4\r\n",
+            KEYS_ONE,
+        ],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"\x1b");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(5)),
+        "escape must exit"
+    );
+}
+
+#[test]
+fn the_opening_block_is_written_once_and_never_again() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "alpha", "beta", "gamma", "delta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let opening = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"Choose:\r\n", KEYS_ONE],
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        count(&opening, b"Choose:"),
+        1,
+        "the opening block is written once: {:?}",
+        String::from_utf8_lossy(&opening)
+    );
+
+    // A keystroke must not re-open the block. The assertion names the
+    // two rows only an opening can produce rather than demanding
+    // silence, so it stays true once a keystroke starts speaking a
+    // transition row of its own.
+    session.write_bytes(b"\x1b[B");
+    let after = drain_for(&session, Duration::from_millis(600));
+    assert!(
+        !contains(&after, b"Choose:"),
+        "the header came back: {:?}",
+        String::from_utf8_lossy(&after)
+    );
+    assert!(
+        !contains(&after, KEYS_ONE),
+        "the keys row came back: {:?}",
+        String::from_utf8_lossy(&after)
+    );
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn a_list_longer_than_the_cap_lists_its_head_and_says_how_many_there_are() {
+    // Sixty rather than one past the cap: the cap is a starting value,
+    // and a fixture sized to it would turn any future raise into a
+    // mystifying red. If it is ever raised past 59, this fixture grows.
+    let items: Vec<String> = (1..=60).map(|n| format!("opt{n:02}")).collect();
+    let mut argv = vec!["choose", "--accessible"];
+    argv.extend(items.iter().map(String::as_str));
+    let session = PtySession::spawn(&rat_bin(), &argv, &[("RAT_APPEARANCE", "dark")])
+        .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let opening = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"Choose:\r\n", b"opt01\r\n", b"\r\nfirst ", b"1 of 60\r\n"],
+        Duration::from_secs(5),
+    );
+    assert!(
+        !contains(&opening, b"opt60\r\n"),
+        "the cap must not list the tail: {:?}",
+        String::from_utf8_lossy(&opening)
+    );
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn an_item_carrying_a_newline_is_still_one_row() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "a\nb", "beta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let opening = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"Choose:\r\n", b"1 of 2\r\n"],
+        Duration::from_secs(5),
+    );
+    // Two items, two rows — whatever the writer replaces the break with.
+    // Counting terminators rather than matching text keeps this test
+    // true for any replacement it chooses.
+    let body = between(&opening, b"Choose:\r\n", b"1 of 2\r\n");
+    assert_eq!(
+        count(body, b"\r\n"),
+        2,
+        "an item must not forge a row: {:?}",
+        String::from_utf8_lossy(body)
+    );
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(5));
 }

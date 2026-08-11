@@ -10,7 +10,7 @@ use crate::exit::{AppError, AppResult};
 use crate::term::buffer_ansi::buffer_to_lines;
 use crate::term::inline::InlineRenderer;
 use crate::term::tty::{RawModeGuard, UiStream};
-use crate::ui::echo::EchoSnapshot;
+use crate::ui::echo::{EchoSnapshot, echo_rows};
 use crate::ui::key::{Key, from_crossterm};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -68,8 +68,6 @@ pub trait UiApp {
     }
     /// The block printed once on entry: what this is, what is in it,
     /// where the cursor is, which keys do what.
-    // The driver writes this once on entry next.
-    #[allow(dead_code)]
     fn speak_opening(&self) -> Vec<String> {
         Vec::new()
     }
@@ -197,6 +195,9 @@ pub fn run_ui_mode<A: UiApp>(
         ),
         UiMode::Echo => UiSink::Echo(ui),
     };
+    if let UiSink::Echo(out) = &mut sink {
+        echo_rows(out, &app.speak_opening())?;
+    }
 
     let deadline = timeout.map(|t| Instant::now() + t);
     let outcome = loop {

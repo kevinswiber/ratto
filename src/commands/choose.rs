@@ -25,6 +25,21 @@ struct ChooseApp {
     palette: Palette,
 }
 
+impl ChooseApp {
+    /// What the reader can press, spelled. The painted footer says the
+    /// same thing with arrow glyphs and a middot; a screen reader
+    /// announces the first as nothing and the second as a word, so the
+    /// transcript spells the keys and separates them with the one
+    /// punctuation the vocabulary allows.
+    fn keys_row(&self) -> String {
+        if self.multi {
+            "up and down move, space selects, enter confirms, escape cancels".to_string()
+        } else {
+            "up and down move, enter chooses, escape cancels".to_string()
+        }
+    }
+}
+
 impl UiApp for ChooseApp {
     fn on_key(&mut self, key: Key) -> Outcome {
         self.state.on_key(key)
@@ -78,6 +93,22 @@ impl UiApp for ChooseApp {
     fn height(&self, _term: (u16, u16)) -> u16 {
         let rows = (self.state.items.len() as u16).min(self.state.height);
         1 + rows + u16::from(self.show_help)
+    }
+
+    fn speak_opening(&self) -> Vec<String> {
+        // There is no first of nothing. An empty slot is dropped by the
+        // builder, so this is the whole of the empty-list rule here.
+        let position = if self.state.items.is_empty() {
+            String::new()
+        } else {
+            format!("{} of {}", self.state.cursor + 1, self.state.items.len())
+        };
+        // The cap, the `first N of M` row, dropping an absent header,
+        // and flattening every fragment are all the shared builder's:
+        // one function builds every opening block on all three
+        // surfaces, so a list of eight hundred branches costs the same
+        // rows here as it does anywhere else.
+        crate::ui::echo::opening_block(&self.header, &self.state.items, &position, &self.keys_row())
     }
 }
 
@@ -146,6 +177,89 @@ mod tests {
 
     use super::*;
     use crate::theme::{Appearance, AppearanceSource};
+
+    fn app(items: &[&str], multi: bool, header: &str) -> ChooseApp {
+        ChooseApp {
+            state: ChooseState::new(
+                items.iter().map(|s| s.to_string()).collect(),
+                if multi { None } else { Some(1) },
+                5,
+            ),
+            header: header.into(),
+            cursor: "> ".into(),
+            selected_prefix: "[x] ".into(),
+            unselected_prefix: "[ ] ".into(),
+            multi,
+            show_help: false,
+            palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
+        }
+    }
+
+    #[test]
+    fn the_opening_rows_name_the_header_the_items_the_position_and_the_keys() {
+        assert_eq!(
+            app(&["alpha", "beta", "gamma", "delta"], false, "Choose:").speak_opening(),
+            [
+                "Choose:",
+                "alpha",
+                "beta",
+                "gamma",
+                "delta",
+                "1 of 4",
+                "up and down move, enter chooses, escape cancels",
+            ]
+        );
+
+        assert_eq!(
+            app(&["alpha", "beta", "gamma", "delta"], true, "Choose:").speak_opening(),
+            [
+                "Choose:",
+                "alpha",
+                "beta",
+                "gamma",
+                "delta",
+                "1 of 4",
+                "up and down move, space selects, enter confirms, escape cancels",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_absent_header_opens_on_the_first_item() {
+        let rows = app(&["alpha", "beta"], false, "").speak_opening();
+        assert_eq!(rows[0], "alpha");
+    }
+
+    #[test]
+    fn the_position_row_counts_from_where_the_cursor_actually_is() {
+        // The row a literal `1 of 4` would pass: nothing opens with the
+        // cursor elsewhere today, and the expression is what keeps that
+        // true the day something does.
+        let mut a = app(&["alpha", "beta", "gamma", "delta"], false, "Choose:");
+        a.state.cursor = 2;
+        assert_eq!(a.speak_opening()[5], "3 of 4");
+    }
+
+    #[test]
+    fn an_empty_list_has_no_first_of_nothing() {
+        assert_eq!(
+            app(&[], false, "Choose:").speak_opening(),
+            ["Choose:", "up and down move, enter chooses, escape cancels",]
+        );
+    }
+
+    #[test]
+    fn the_help_footer_flag_changes_nothing_about_the_opening_rows() {
+        // Both of the flag's readers sit inside the painted frame, so it
+        // is render-only by construction — and the keys row is read by
+        // whoever is at the terminal rather than by the script author who
+        // turned the footer off.
+        let mut with_help = app(&["alpha", "beta"], false, "Choose:");
+        with_help.show_help = true;
+        let without_help = app(&["alpha", "beta"], false, "Choose:");
+        assert!(!without_help.show_help);
+        assert_eq!(with_help.speak_opening(), without_help.speak_opening());
+    }
 
     fn cursor_row_fg(palette: Palette) -> Color {
         let mut app = ChooseApp {

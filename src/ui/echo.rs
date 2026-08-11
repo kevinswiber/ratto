@@ -48,8 +48,6 @@ const ECHO_EOL: &str = "\r\n";
 /// neutralization is ever narrowed, and because a single-row seal has
 /// nothing to replay onto. Rows carrying none of it pass through
 /// byte-identical.
-// The driver's transcript arm writes every row through this next.
-#[allow(dead_code)]
 pub fn echo_rows<W: Write>(out: &mut W, rows: &[String]) -> anyhow::Result<()> {
     for row in rows {
         for sealed in seal_rows(vec![flatten_row(row)]) {
@@ -125,8 +123,6 @@ pub fn flatten_row(text: &str) -> String {
 /// says how many there are. A starting value: the blocks measured in use
 /// were a handful of rows, and a list of eight hundred branches must not
 /// be read aloud on entry.
-// Each surface's entry block is built through the function below next.
-#[allow(dead_code)]
 pub const ECHO_OPENING_CAP: usize = 20;
 
 /// The block every surface prints once on entry, built in one place so
@@ -137,8 +133,6 @@ pub const ECHO_OPENING_CAP: usize = 20;
 /// blank row is a spoken pause with no content. An empty ITEM keeps its
 /// row: it is a real item, and dropping it would desynchronize the list
 /// from the position row printed under it.
-// Each of the three surfaces builds its entry block through this next.
-#[allow(dead_code)]
 pub fn opening_block(header: &str, items: &[String], position: &str, keys: &str) -> Vec<String> {
     let mut rows = Vec::with_capacity(items.len().min(ECHO_OPENING_CAP) + 4);
     if !header.is_empty() {
