@@ -1,0 +1,322 @@
+#![cfg(unix)]
+mod common;
+
+use std::time::Duration;
+
+use common::pty::{FakeTerminal, PtySession, drain_for, wait_for_in_order};
+
+fn rat_bin() -> String {
+    assert_cmd::cargo::cargo_bin("rat").display().to_string()
+}
+
+/// The block's last row, in each of its two forms. Named once, because
+/// every test in this suite anchors on it and because it must stay in
+/// step with what the surface says.
+///
+/// Anchoring on it answers two hazards at once: it is the block's LAST
+/// row, so hearing it has consumed the block, and it sits past the
+/// terminal's echo of this test's own item bytes — so no test after the
+/// opening block has to think about the echo at all.
+const KEYS_ONE: &[u8] = b"type to filter, up and down move, enter chooses, escape cancels\r\n";
+#[allow(dead_code)]
+const KEYS_MULTI: &[u8] =
+    b"type to filter, up and down move, tab selects, enter confirms, escape cancels\r\n";
+
+/// One quiescence interval plus one poll slice, plus margin for a loaded
+/// CI box. There is no library target to import those constants from, so
+/// the relation lives here and must move when they do. A shorter drain
+/// does not measure silence — it measures a row still in flight.
+const SILENCE_WINDOW: Duration = Duration::from_millis(1000);
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Everything ahead of the first occurrence of `needle`.
+fn before<'a>(haystack: &'a [u8], needle: &[u8]) -> &'a [u8] {
+    let at = haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("the needle must be present");
+    &haystack[..at]
+}
+
+/// Everything after the first occurrence of `needle`.
+fn after<'a>(haystack: &'a [u8], needle: &[u8]) -> &'a [u8] {
+    let at = haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("the needle must be present");
+    &haystack[at + needle.len()..]
+}
+
+/// The rows strictly between two anchor rows of one capture. The
+/// terminal's echo of this test's own item bytes sits ahead of the first
+/// anchor, so judging the block means judging this slice — never the
+/// whole stream.
+fn rows_between(seen: &[u8], open: &[u8], close: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(before(after(seen, open), close))
+        .split("\r\n")
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Press one key and hear the row it causes, before anything else is
+/// pressed. Race-free by construction: the next row cannot already be in
+/// flight inside this wait's final chunk, because nothing has been
+/// pressed yet to cause it.
+#[allow(dead_code)]
+fn press_and_hear(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    key: &[u8],
+    row: &[u8],
+) -> Vec<u8> {
+    session.write_bytes(key);
+    wait_for_in_order(session, terminal, &[row], Duration::from_secs(5))
+}
+
+/// Listen long enough to believe the silence, then prove the session
+/// could still have spoken. An empty drain and a dead process are
+/// indistinguishable; this is the difference.
+#[allow(dead_code)]
+fn assert_silent_then_alive(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    then: (&[u8], &[u8]),
+) {
+    let quiet = drain_for(session, SILENCE_WINDOW);
+    assert!(
+        quiet.is_empty(),
+        "a key that changed nothing wrote {:?}",
+        String::from_utf8_lossy(&quiet),
+    );
+    press_and_hear(session, terminal, then.0, then.1);
+}
+
+/// Spawn a filter and feed it `items` the way a pipeline would, then end
+/// the list.
+///
+/// The end-of-input marker is what makes this work: the candidates are
+/// read to EOF before the picker takes raw mode, and in the terminal's
+/// default line mode `\x04` on an empty line is that EOF. It does not
+/// close anything — the keystrokes a test sends next still arrive.
+///
+/// A pinned appearance is not decoration here. Left to detect, the
+/// startup probe would query the terminal, the fake terminal would
+/// answer by writing into the session, and that reply would arrive while
+/// the candidates are still being read — that is, it would become an
+/// item.
+///
+/// `--no-fuzzy` throughout: fuzzy matching is subsequence matching, so
+/// `ap` also matches `banana split`. These tests are about what the
+/// picker says, not about how it ranks.
+///
+/// **If this mechanic ever proves unreliable** — the child hangs reading
+/// its candidates, or the item bytes are truncated at the terminal's
+/// canonical line limit — the fallback is to dup a pipe onto the child's
+/// input after it takes the terminal, and write the items into that.
+/// Keys still arrive, because the key path opens the controlling
+/// terminal directly once the input is not a terminal. It is not the
+/// first choice because it changes the spawn signature three other
+/// suites already call.
+fn spawn_filter(items: &[&str], extra: &[&str]) -> (PtySession, FakeTerminal) {
+    let mut args = vec!["filter", "--accessible", "--no-fuzzy"];
+    args.extend_from_slice(extra);
+    let session = PtySession::spawn(&rat_bin(), &args, &[("RAT_APPEARANCE", "dark")])
+        .expect("spawn rat filter under a pty");
+    let mut fed = items.join("\n");
+    fed.push_str("\n\x04");
+    session.write_bytes(fed.as_bytes());
+    (session, FakeTerminal::dark())
+}
+
+#[test]
+fn the_opening_block_follows_a_piped_item_list() {
+    let (session, mut terminal) =
+        spawn_filter(&["apple", "apricot", "banana"], &["--header", "Fruit"]);
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[
+            // Only rat can have written this: the header came from argv,
+            // never from the master. Opening the chain on an item name
+            // would match the terminal's echo of this test's own bytes.
+            b"Fruit\r\n",
+            b"apple\r\n",
+            b"apricot\r\n",
+            b"banana\r\n",
+            b"1 of 3\r\n",
+            KEYS_ONE,
+        ],
+        Duration::from_secs(5),
+    );
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn a_key_after_the_end_of_input_marker_still_reaches_the_picker() {
+    let (session, mut terminal) =
+        spawn_filter(&["apple", "apricot", "banana"], &["--header", "Fruit"]);
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    // Two keys, and what they print — not what they say. The printed
+    // line is the picker's shipped output and owes nothing to the
+    // transcript's wording, which is asserted where that wording lives.
+    // Moving and then taking is what makes this a statement about the
+    // channel: the second candidate can only be printed if BOTH keys
+    // arrived, in order, after the end-of-input marker.
+    //
+    // This is the one test that fails when the item channel and the key
+    // channel stop being the same channel — the condition that sends
+    // this suite to the fallback described on the spawn helper.
+    session.write_bytes(b"\x1b[B\r");
+    let tail = drain_for(&session, SILENCE_WINDOW);
+    assert!(
+        contains(&tail, b"apricot\r\n"),
+        "both keys must reach the picker after the marker: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(!session.kill_if_alive(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_headerless_run_still_says_where_the_cursor_is() {
+    let (session, mut terminal) = spawn_filter(&["apple", "apricot", "banana"], &[]);
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"1 of 3\r\n", KEYS_ONE],
+        Duration::from_secs(5),
+    );
+    // Nothing sits between the position row and the keys row — in
+    // particular no blank row where a header would have been.
+    assert_eq!(
+        rows_between(&seen, b"1 of 3\r\n", KEYS_ONE),
+        Vec::<String>::new(),
+        "{:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn an_entry_query_that_matches_nothing_says_so_instead_of_a_position() {
+    // A seeded query narrows the matches before the block is built, so
+    // this is also the test that proves the block lists MATCHES rather
+    // than items: a block built from the input would name all three
+    // fruits under a query that matches none of them.
+    let (session, mut terminal) = spawn_filter(
+        &["apple", "apricot", "banana"],
+        &["--header", "Fruit", "--value", "zz"],
+    );
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"Fruit\r\n", KEYS_ONE],
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        rows_between(&seen, b"Fruit\r\n", KEYS_ONE),
+        ["no matches"],
+        "{:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn a_long_list_is_capped_at_the_opening() {
+    let items: Vec<String> = (1..=25).map(|n| format!("item{n:02}")).collect();
+    let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+    let (session, mut terminal) = spawn_filter(&refs, &["--header", "Many"]);
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"Many\r\n", KEYS_ONE],
+        Duration::from_secs(5),
+    );
+    let rows = rows_between(&seen, b"Many\r\n", KEYS_ONE);
+
+    // The shape, not a hand-written literal: the cap's value and the
+    // tail row's wording belong to the shared builder, and a literal
+    // here would be a second place to change them.
+    let listed: Vec<&String> = rows
+        .iter()
+        .filter(|r| r.starts_with("item") && r.len() == 6)
+        .collect();
+    assert_eq!(listed.len(), 20, "{rows:?}");
+    assert_eq!(listed[0], "item01");
+    assert_eq!(listed[19], "item20");
+    assert!(
+        !rows.iter().any(|r| r.contains("item21")),
+        "the twenty-first item must not be spoken: {rows:?}"
+    );
+    assert!(rows.iter().any(|r| r == "first 20 of 25"), "{rows:?}");
+    assert!(rows.iter().any(|r| r == "1 of 25"), "{rows:?}");
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn an_item_that_carries_a_line_break_is_still_one_row() {
+    // Candidates that carry line breaks, reached through a different
+    // input delimiter: the line discipline hands the reader its lines,
+    // the run rejoins and splits on the comma, so the three candidates
+    // are literally `one\ntwo`, `three\x0cfour` and `five`.
+    //
+    // The form feed is the arm no other surface can reach — a candidate
+    // carrying one is what a log pipeline or a pasted record produces —
+    // and a build that flattens only the newline passes the first half
+    // and fails this one.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "filter",
+            "--accessible",
+            "--no-fuzzy",
+            "--input-delimiter",
+            ",",
+            "--header",
+            "Fruit",
+        ],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat filter under a pty");
+    let mut terminal = FakeTerminal::dark();
+    session.write_bytes(b"one\ntwo,three\x0cfour,five\n\x04");
+
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"Fruit\r\n", KEYS_ONE],
+        Duration::from_secs(5),
+    );
+    // Judging the slice below the header is mandatory: `two` and `four`
+    // are also in the terminal's echo of this test's own bytes, so an
+    // assertion over the whole stream would fail on the echo rather than
+    // on the picker — and would keep failing after a fix.
+    let rows = rows_between(&seen, b"Fruit\r\n", KEYS_ONE);
+    assert_eq!(rows.len(), 4, "three candidates and a position: {rows:?}");
+    // `five` is a real third candidate and its own row is correct; the
+    // orphans are the halves a break would have split off.
+    for orphan in ["two", "four"] {
+        assert!(
+            !rows.iter().any(|r| r == orphan),
+            "a candidate must not forge a row: {rows:?}"
+        );
+    }
+    assert!(rows.iter().any(|r| r == "five"), "{rows:?}");
+    assert!(contains(seen.as_slice(), b"1 of 3\r\n"), "{rows:?}");
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}

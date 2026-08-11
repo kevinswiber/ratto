@@ -11,6 +11,7 @@ use crate::color::ColorProfile;
 use crate::core::duration::parse_interval;
 use crate::exit::AppResult;
 use crate::theme::Palette;
+use crate::ui::echo::EchoSnapshot;
 use crate::ui::filter::FilterState;
 use crate::ui::key::Key;
 use crate::ui::loop_::{Outcome, UiApp, UiMode, run_ui_mode};
@@ -117,6 +118,47 @@ impl UiApp for FilterApp {
         let row = u16::from(self.header.is_some());
         let col = self.prompt.as_str().width() + self.state.query.caret_col();
         Some((col as u16, row))
+    }
+
+    fn echo_snapshot(&self) -> EchoSnapshot {
+        EchoSnapshot {
+            cursor: self.state.cursor,
+            marked: self.state.selected.clone(),
+            query: self.state.query.value.clone(),
+        }
+    }
+
+    fn speak_opening(&self) -> Vec<String> {
+        // The MATCHES, not the raw candidate list: with a seeded query
+        // the two differ, and the block must describe what the reader is
+        // actually looking at.
+        let listed: Vec<String> = self
+            .state
+            .matches
+            .iter()
+            .map(|m| self.state.items[m.index].clone())
+            .collect();
+        let keys = if self.multi {
+            "type to filter, up and down move, tab selects, enter confirms, escape cancels"
+        } else {
+            "type to filter, up and down move, enter chooses, escape cancels"
+        };
+        let position = if listed.is_empty() {
+            // The same phrase a settled query uses, so a reader meets it
+            // once. There is no first of nothing.
+            "no matches".to_string()
+        } else {
+            format!("1 of {}", listed.len())
+        };
+        crate::ui::echo::opening_block(
+            // Absent becomes the empty string, which the builder drops —
+            // never a blank leading row. The heading is `--header`; the
+            // prompt is a painted prefix and has nothing to say here.
+            self.header.as_deref().unwrap_or(""),
+            &listed,
+            &position,
+            keys,
+        )
     }
 
     fn prepare(&mut self, term: (u16, u16)) {
