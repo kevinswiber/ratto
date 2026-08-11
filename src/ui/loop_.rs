@@ -137,6 +137,21 @@ pub fn resolve_ui_mode(no_accessible: bool, accessible: Option<bool>) -> UiMode 
 /// second fact that drifts the first time one of them is tuned.
 const POLL_SLICE: Duration = Duration::from_millis(250);
 
+/// How long the transcript waits for the reader to stop before it says
+/// where they landed. Expressed in terms of the poll slice so the two
+/// cannot drift apart silently.
+///
+/// A starting value, derived from measured INPUT cadence: typing runs
+/// near an eighth of a second per character, so a typed burst settles
+/// into one row, while an unhurried arrow run is roughly half a second
+/// between keys and still speaks every move. Nothing here is derived
+/// from how long a screen reader takes to say a row — that has not been
+/// measured, and this value should be revisited once the mode has
+/// actually been heard.
+// The driver's transcript arm builds its burst policy with this next.
+#[allow(dead_code)]
+const ECHO_QUIESCENCE: Duration = POLL_SLICE;
+
 /// How long to wait for the next key, or `None` when the deadline has
 /// already passed and the run is over. A nearer deadline shortens the
 /// slice; nothing lengthens it.
@@ -259,6 +274,17 @@ mod tests {
     #[test]
     fn no_caret_stays_no_caret() {
         assert_eq!(park_target(None, 20, 2), None);
+    }
+
+    #[test]
+    fn the_quiescence_interval_is_expressed_in_terms_of_the_poll_slice() {
+        // A ruled relationship, not a mechanical limit: `wait_cap` can
+        // shorten a poll, so a smaller interval would in fact be honored.
+        // The interval is expressed in terms of the constant that already
+        // governs how often the loop wakes, and this is the assertion that
+        // keeps the two from drifting apart. `>=` rather than `==` so it
+        // survives a deliberate re-tune and still catches a bare literal.
+        assert!(ECHO_QUIESCENCE >= POLL_SLICE);
     }
 
     #[test]

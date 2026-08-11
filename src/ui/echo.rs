@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
@@ -158,6 +159,92 @@ pub fn opening_block(header: &str, items: &[String], position: &str, keys: &str)
     rows
 }
 
+/// A row waiting for the reader to stop.
+struct Pending {
+    row: String,
+    due: Instant,
+}
+
+/// The burst policy: while keys keep arriving, only the newest row
+/// survives, and it is handed over once the reader has been quiet for a
+/// full interval. A reader typing eleven characters wants to hear where
+/// they landed, not eleven intermediate states — and a transcript that
+/// narrates every keystroke is one a reader turns off.
+///
+/// Latest-wins, so the row that is written is always the CURRENT state
+/// rather than a stale one. Deliberately pure: it holds no stream and
+/// never reads the clock, so every one of its properties can be
+/// falsified over synthetic instants without a terminal.
+///
+/// It decides WHEN, never WHETHER. Whether a key changed anything is the
+/// driver's comparison of two snapshots; this type is only ever handed
+/// rows that already earned their place.
+// The driver's transcript arm holds one of these next.
+#[allow(dead_code)]
+pub struct Coalescer {
+    quiescence: Duration,
+    pending: Option<Pending>,
+}
+
+// Every method below is reached from the driver's transcript arm next.
+#[allow(dead_code)]
+impl Coalescer {
+    /// The interval is a parameter rather than a constant read from
+    /// here: the driver names it at the construction site, where the
+    /// value a session runs on is readable, and the tests can drive
+    /// small intervals where an off-by-one interval is a failure rather
+    /// than a plausible-looking number.
+    pub fn new(quiescence: Duration) -> Self {
+        Coalescer {
+            quiescence,
+            pending: None,
+        }
+    }
+
+    /// Take note of the row the reader's latest key produced. The newest
+    /// row replaces any older one and restarts the clock — that restart
+    /// is what makes a burst one row instead of a row per interval.
+    pub fn note(&mut self, row: String, now: Instant) {
+        self.pending = Some(Pending {
+            row,
+            due: now + self.quiescence,
+        });
+    }
+
+    /// The row, once the reader has been quiet long enough for it.
+    ///
+    /// `>=`, not `>`, and that is a liveness rule rather than a rounding
+    /// preference: `wait_cap` returns zero once the deadline has passed,
+    /// so a strict comparison would leave the loop polling without
+    /// blocking, never advancing time, and never writing the row.
+    pub fn take_if_due(&mut self, now: Instant) -> Option<String> {
+        match &self.pending {
+            Some(p) if now >= p.due => self.pending.take().map(|p| p.row),
+            _ => None,
+        }
+    }
+
+    /// How long the loop may sleep without sleeping past a pending row.
+    /// With nothing pending it hands back the wait it was given, so a
+    /// session with nothing to say polls exactly as it always has. This
+    /// is the whole reason a pending row is guaranteed to be written
+    /// rather than merely likely to be.
+    pub fn wait_cap(&self, now: Instant, base: Duration) -> Duration {
+        match &self.pending {
+            Some(p) => base.min(p.due.saturating_duration_since(now)),
+            None => base,
+        }
+    }
+
+    /// Drop the pending row unwritten. Called on the way out: a key
+    /// pressed inside the interval and followed straight by Enter
+    /// contributes no transition row, because the resting state at exit
+    /// IS the result and the closing row names it better.
+    pub fn discard(&mut self) {
+        self.pending = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +268,12 @@ mod tests {
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
+
+    /// A short synthetic interval: an off-by-one interval is a visible
+    /// failure at this scale and a plausible-looking number at 250 ms.
+    const Q: Duration = Duration::from_millis(100);
+    /// Stands in for the wait the driver computes for itself.
+    const BASE: Duration = Duration::from_millis(250);
 
     #[test]
     fn a_transcript_row_is_its_words_and_a_carriage_return_newline() {
@@ -441,5 +534,137 @@ mod tests {
                 ..base.clone()
             }
         );
+    }
+
+    #[test]
+    fn a_burst_of_keys_leaves_one_row_and_it_is_the_last() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let mut c = Coalescer::new(Q);
+        for (n, row) in ["a", "ab", "abc", "abcd", "abcde"].iter().enumerate() {
+            c.note((*row).to_string(), at(n as u64 * 20));
+        }
+        // 100 ms after the FIRST key, and 20 ms after the last: the clock
+        // restarted on every note, so nothing is due yet.
+        assert_eq!(c.take_if_due(at(100)), None);
+        assert_eq!(c.take_if_due(at(180)), Some("abcde".to_string()));
+        // Exactly one row: taken once is taken for good.
+        assert_eq!(c.take_if_due(at(500)), None);
+    }
+
+    #[test]
+    fn nothing_is_written_before_the_interval_elapses() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let mut c = Coalescer::new(Q);
+        c.note("beta".to_string(), at(0));
+        assert_eq!(c.take_if_due(at(0)), None);
+        assert_eq!(c.take_if_due(at(99)), None);
+        assert_eq!(c.take_if_due(at(100)), Some("beta".to_string()));
+
+        let mut empty = Coalescer::new(Q);
+        assert_eq!(empty.take_if_due(at(0)), None);
+        assert_eq!(empty.take_if_due(at(10_000)), None);
+    }
+
+    #[test]
+    fn a_noted_row_is_always_written_within_one_interval_and_one_wait() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let mut c = Coalescer::new(Q);
+        let mut now = at(0);
+        c.note("beta".to_string(), now);
+
+        let mut written = None;
+        // Bounded on purpose: an implementation that never comes due would
+        // otherwise HANG here, because wait_cap goes to zero once the
+        // deadline passes and nothing advances the clock.
+        for _ in 0..100 {
+            let wait = c.wait_cap(now, BASE);
+            now += wait;
+            if let Some(row) = c.take_if_due(now) {
+                written = Some((row, now));
+                break;
+            }
+        }
+        let (row, when) = written.expect("a noted row was never written");
+        assert_eq!(row, "beta");
+        assert!(when <= at(0) + Q + BASE, "flushed late");
+
+        // An interval LARGER than the base, so the cap is taken from the
+        // base on the early iterations and from the remaining time on the
+        // last — the arm that proves the cap composes over several waits
+        // rather than only over one.
+        let long = Duration::from_millis(600);
+        let mut c = Coalescer::new(long);
+        let mut now = at(0);
+        c.note("delta".to_string(), now);
+        let mut written = None;
+        for _ in 0..100 {
+            let wait = c.wait_cap(now, BASE);
+            now += wait;
+            if let Some(row) = c.take_if_due(now) {
+                written = Some((row, now));
+                break;
+            }
+        }
+        let (row, when) = written.expect("a noted row was never written");
+        assert_eq!(row, "delta");
+        assert_eq!(when, at(600));
+        assert!(when <= at(0) + long + BASE, "flushed late");
+    }
+
+    #[test]
+    fn the_wait_cap_never_outruns_the_time_remaining() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let mut c = Coalescer::new(Q);
+        c.note("beta".to_string(), at(0));
+        for (now, base, want) in [
+            (at(0), BASE, Duration::from_millis(100)),
+            (at(60), BASE, Duration::from_millis(40)),
+            (at(0), Duration::from_millis(40), Duration::from_millis(40)),
+            (at(100), BASE, Duration::ZERO),
+            (at(400), BASE, Duration::ZERO),
+        ] {
+            assert_eq!(c.wait_cap(now, base), want, "{base:?}");
+        }
+
+        // With nothing pending the driver's own wait comes back
+        // untouched: a session with nothing to say polls exactly as it
+        // always has.
+        let idle = Coalescer::new(Q);
+        for base in [
+            Duration::ZERO,
+            Duration::from_millis(40),
+            BASE,
+            Duration::from_secs(60),
+        ] {
+            assert_eq!(idle.wait_cap(at(0), base), base, "{base:?}");
+            assert_eq!(idle.wait_cap(at(10_000), base), base, "{base:?}");
+        }
+    }
+
+    #[test]
+    fn a_discarded_row_never_arrives_and_the_next_one_still_does() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        // A key pressed inside the interval and followed straight by
+        // enter contributes no transition row: the resting state at exit
+        // IS the result, and the closing row names it better.
+        let mut c = Coalescer::new(Q);
+        c.note("beta".to_string(), at(0));
+        c.discard();
+        assert_eq!(c.take_if_due(at(10_000)), None);
+        assert_eq!(c.wait_cap(at(0), BASE), BASE);
+
+        // Discarding empties the pending row; it does not poison the type.
+        c.note("delta".to_string(), at(200));
+        assert_eq!(c.take_if_due(at(300)), Some("delta".to_string()));
     }
 }
