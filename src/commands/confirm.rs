@@ -9,6 +9,7 @@ use crate::core::duration::parse_interval;
 use crate::exit::{AppError, AppResult};
 use crate::theme::Palette;
 use crate::ui::confirm::ConfirmState;
+use crate::ui::echo::EchoSnapshot;
 use crate::ui::key::Key;
 use crate::ui::loop_::{Outcome, UiApp, UiMode, run_ui_mode};
 
@@ -18,6 +19,25 @@ struct ConfirmApp {
     affirmative: String,
     negative: String,
     palette: Palette,
+}
+
+impl ConfirmApp {
+    /// The armed answer's label.
+    fn armed(&self) -> &str {
+        if self.state.affirmative {
+            &self.affirmative
+        } else {
+            &self.negative
+        }
+    }
+
+    /// What the reader can press, spelled. The painted buttons say the
+    /// same thing with position and color, neither of which a screen
+    /// reader announces, so the transcript spells the keys and separates
+    /// them with the one punctuation the vocabulary allows.
+    fn keys_row(&self) -> String {
+        "left and right move, y and n answer, enter chooses, escape cancels".to_string()
+    }
 }
 
 impl UiApp for ConfirmApp {
@@ -53,6 +73,34 @@ impl UiApp for ConfirmApp {
 
     fn height(&self, _term: (u16, u16)) -> u16 {
         2
+    }
+
+    fn echo_snapshot(&self) -> EchoSnapshot {
+        // Yes sits on the left, so it is cursor 0. A two-button control
+        // has no marks and nothing to type into.
+        EchoSnapshot {
+            cursor: usize::from(!self.state.affirmative),
+            ..EchoSnapshot::default()
+        }
+    }
+
+    fn speak_opening(&self) -> Vec<String> {
+        crate::ui::echo::opening_block(
+            &self.prompt,
+            &[self.affirmative.clone(), self.negative.clone()],
+            // Where you are, in the words a later toggle will use: the
+            // armed answer. A coordinate would name a position in a list
+            // of two unnamed things.
+            self.armed(),
+            &self.keys_row(),
+        )
+    }
+
+    fn speak(&self, _before: &EchoSnapshot) -> Option<String> {
+        // The answer that is armed NOW. What was armed before is what
+        // decided there was anything to say; the row is the resting
+        // state, which is what keeps a coalesced row true.
+        Some(self.armed().to_string())
     }
 }
 
