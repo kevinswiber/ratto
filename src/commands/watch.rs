@@ -13406,6 +13406,44 @@ mod tests {
     }
 
     #[test]
+    fn a_source_command_keeps_the_readers_own_environment() {
+        let spec = source_spec(&["some-tool"], ShellMode::Direct);
+        let cmd = build_source_command(
+            &resolved(&spec),
+            &spec.shell,
+            None,
+            false,
+            Appearance::Dark,
+            terminal_geom(80, 24),
+        );
+        let entries = action_env_entries(&cmd);
+        // Two controls first, or the assertion below means nothing: the
+        // view must still be able to SEE a removal, and the command must
+        // actually have been built.
+        for name in ["RAT_CURSOR", "RAT_CURSOR_PANE", "RAT_CURSOR_LINE"] {
+            assert!(
+                entries.contains(&(name.to_string(), None)),
+                "{name} must be removed, not merely unmentioned: {entries:?}"
+            );
+        }
+        assert!(
+            entries.contains(&("RAT_APPEARANCE".to_string(), Some("dark".to_string()))),
+            "the guard against a command that was never built: {entries:?}"
+        );
+        // `RAT_ACCESSIBLE` is deliberately NOT in the list above. The
+        // cursor names are removed because they describe a board's own
+        // state and would be a lie in a child; this one describes the
+        // person at the keyboard, and a child that cannot see it paints
+        // a picker they cannot read. It reaches a child by ordinary
+        // inheritance, and that is the whole mechanism — there is
+        // nothing else to keep working.
+        assert!(
+            !entries.contains(&("RAT_ACCESSIBLE".to_string(), None)),
+            "RAT_ACCESSIBLE must reach the child: {entries:?}"
+        );
+    }
+
+    #[test]
     fn every_child_is_told_the_frame_size_and_appearance() {
         let spec = source_spec(&["some-tool", "--flag"], ShellMode::Direct);
         let cmd = build_source_command(
@@ -15598,6 +15636,17 @@ mod tests {
         assert!(
             entries.contains(&("RAT_APPEARANCE".to_string(), Some("dark".to_string()))),
             "the guard against a command that was never built: {entries:?}"
+        );
+        // `RAT_ACCESSIBLE` is deliberately NOT in the list above. The
+        // cursor names are removed because they describe a board's own
+        // state and would be a lie in a child; this one describes the
+        // person at the keyboard, and a child that cannot see it paints
+        // a picker they cannot read. It reaches a child by ordinary
+        // inheritance, and that is the whole mechanism — there is
+        // nothing else to keep working.
+        assert!(
+            !entries.contains(&("RAT_ACCESSIBLE".to_string(), None)),
+            "RAT_ACCESSIBLE must reach the child: {entries:?}"
         );
     }
 
