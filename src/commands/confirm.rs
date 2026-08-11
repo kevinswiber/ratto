@@ -10,7 +10,7 @@ use crate::exit::{AppError, AppResult};
 use crate::theme::Palette;
 use crate::ui::confirm::ConfirmState;
 use crate::ui::key::Key;
-use crate::ui::loop_::{Outcome, UiApp, run_ui};
+use crate::ui::loop_::{Outcome, UiApp, UiMode, run_ui_mode};
 
 struct ConfirmApp {
     state: ConfirmState,
@@ -56,7 +56,7 @@ impl UiApp for ConfirmApp {
     }
 }
 
-pub fn run(args: ConfirmArgs, profile: ColorProfile, palette: Palette) -> AppResult {
+pub fn run(args: ConfirmArgs, profile: ColorProfile, palette: Palette, mode: UiMode) -> AppResult {
     let mut app = ConfirmApp {
         state: ConfirmState {
             affirmative: args.default_yes,
@@ -67,7 +67,7 @@ pub fn run(args: ConfirmArgs, profile: ColorProfile, palette: Palette) -> AppRes
         palette,
     };
     let timeout = args.timeout.as_deref().map(parse_interval).transpose()?;
-    run_ui(&mut app, profile, timeout)?;
+    run_ui_mode(&mut app, profile, timeout, mode)?;
 
     let label = if app.state.affirmative {
         &args.affirmative

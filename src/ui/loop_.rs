@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -22,14 +23,20 @@ pub enum Outcome {
 /// transcript of spoken rows appended to the UI stream. Resolved once
 /// per process and threaded by value, so nothing downstream has to ask
 /// the environment a second time and get a different answer.
-// Built by `real_main`, which resolves the presentation once and hands
-// it to the command it runs. The attribute is temporary and goes with
-// the commit that adds that call.
-#[allow(dead_code)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum UiMode {
     Painted,
     Echo,
+}
+
+/// Where a session's own bytes go. Painted mode hands the stream to the
+/// renderer, which owns the frame math; a transcript keeps the stream
+/// and appends rows past it. The variants are what make the two modes
+/// exclusive: an arm with no renderer has no frame to erase and nothing
+/// to hide the cursor with.
+enum UiSink {
+    Painted(InlineRenderer<UiStream>),
+    Echo(UiStream),
 }
 
 /// An interactive command: a pure reducer plus a widget render.
@@ -68,9 +75,6 @@ fn park_target(cursor: Option<(u16, u16)>, cols: u16, height: u16) -> Option<(u1
 /// The flag and the ambient variable have already been ranked against
 /// each other by the argument parser, which prefers what was typed on
 /// the command line; this function never reads the environment itself.
-// Called once, from `real_main`, as soon as the command line carries the
-// two switches it ranks. The attribute goes with that call.
-#[allow(dead_code)]
 pub fn resolve_ui_mode(no_accessible: bool, accessible: Option<bool>) -> UiMode {
     if no_accessible {
         return UiMode::Painted;
@@ -97,35 +101,55 @@ fn poll_wait(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
     }
 }
 
-/// Drive a UiApp on the UI stream: raw mode, event pump, inline repaint.
-/// The UI erases itself on exit so only the result (printed by the caller
-/// to stdout) remains. Esc maps to exit 1, Ctrl-C to 130, --timeout to 124.
+/// Painted mode, for callers with no transcript to write. Its signature
+/// is deliberately unchanged.
 pub fn run_ui<A: UiApp>(
     app: &mut A,
     profile: ColorProfile,
     timeout: Option<Duration>,
+) -> AppResult {
+    run_ui_mode(app, profile, timeout, UiMode::Painted)
+}
+
+/// Drive a UiApp on the UI stream: raw mode, event pump, and either an
+/// inline repaint or a transcript of appended rows. The painted UI
+/// erases itself on exit so only the result (printed by the caller to
+/// stdout) remains; a transcript is meant to stay on screen. Esc maps to
+/// exit 1, Ctrl-C to 130, --timeout to 124, in both.
+pub fn run_ui_mode<A: UiApp>(
+    app: &mut A,
+    profile: ColorProfile,
+    timeout: Option<Duration>,
+    mode: UiMode,
 ) -> AppResult {
     let ui = UiStream::open();
     if !ui.is_tty() {
         return Err(anyhow::anyhow!("interactive commands need a terminal").into());
     }
     let _raw_guard = RawModeGuard::enable().context("enabling raw mode")?;
-    let mut renderer = InlineRenderer::new(ui)
-        .with_cursor_hidden(true)
-        .with_sync_output(true);
+    let mut sink = match mode {
+        UiMode::Painted => UiSink::Painted(
+            InlineRenderer::new(ui)
+                .with_cursor_hidden(true)
+                .with_sync_output(true),
+        ),
+        UiMode::Echo => UiSink::Echo(ui),
+    };
 
     let deadline = timeout.map(|t| Instant::now() + t);
     let outcome = loop {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        app.prepare((cols, rows));
-        let height = app.height((cols, rows)).clamp(1, rows);
-        let area = Rect::new(0, 0, cols, height);
-        let mut buf = Buffer::empty(area);
-        app.render(area, &mut buf);
-        let cursor = park_target(app.cursor_pos(), cols, height);
-        renderer
-            .draw_with_cursor(&buffer_to_lines(&buf, profile), cols, cursor)
-            .context("painting ui")?;
+        if let UiSink::Painted(renderer) = &mut sink {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            app.prepare((cols, rows));
+            let height = app.height((cols, rows)).clamp(1, rows);
+            let area = Rect::new(0, 0, cols, height);
+            let mut buf = Buffer::empty(area);
+            app.render(area, &mut buf);
+            let cursor = park_target(app.cursor_pos(), cols, height);
+            renderer
+                .draw_with_cursor(&buffer_to_lines(&buf, profile), cols, cursor)
+                .context("painting ui")?;
+        }
 
         let Some(wait) = poll_wait(deadline, Instant::now()) else {
             break Err(AppError::Timeout(None));
@@ -148,8 +172,17 @@ pub fn run_ui<A: UiApp>(
         }
     };
 
-    renderer.clear().context("clearing ui")?;
-    renderer.finish().context("restoring terminal")?;
+    match &mut sink {
+        UiSink::Painted(renderer) => {
+            renderer.clear().context("clearing ui")?;
+            renderer.finish().context("restoring terminal")?;
+        }
+        // Nothing to erase and no cursor to restore — the transcript is
+        // meant to stay. Push what it wrote out before the caller prints
+        // the result to stdout, so an uncaptured run reads in the order
+        // the two streams happened.
+        UiSink::Echo(out) => out.flush().context("flushing ui")?,
+    }
     outcome
 }
 

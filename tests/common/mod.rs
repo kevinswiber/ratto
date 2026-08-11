@@ -11,6 +11,11 @@ pub fn rat() -> Command {
     cmd.env_remove("COLORFGBG");
     // A developer's shell must not redirect where test snapshots land.
     cmd.env_remove("RAT_SNAPSHOT_DIR");
+    // The transcript mode is reached from the ambient environment, and
+    // whoever exports it is exactly whoever is testing this. A piped
+    // child must run the shipped default. (The pty harness needs no
+    // equivalent: it builds the child's environment from scratch.)
+    cmd.env_remove("RAT_ACCESSIBLE");
     cmd
 }
 
@@ -33,5 +38,6 @@ pub fn rat_detached() -> Command {
     cmd.env_remove("RAT_APPEARANCE");
     cmd.env_remove("COLORFGBG");
     cmd.env_remove("RAT_SNAPSHOT_DIR");
+    cmd.env_remove("RAT_ACCESSIBLE");
     Command::from_std(cmd)
 }

@@ -13,7 +13,7 @@ use crate::exit::AppResult;
 use crate::theme::Palette;
 use crate::ui::filter::FilterState;
 use crate::ui::key::Key;
-use crate::ui::loop_::{Outcome, UiApp, run_ui};
+use crate::ui::loop_::{Outcome, UiApp, UiMode, run_ui_mode};
 
 struct FilterApp {
     state: FilterState,
@@ -125,7 +125,7 @@ impl UiApp for FilterApp {
     }
 }
 
-pub fn run(args: FilterArgs, profile: ColorProfile, palette: Palette) -> AppResult {
+pub fn run(args: FilterArgs, profile: ColorProfile, palette: Palette, mode: UiMode) -> AppResult {
     let mut stdin = String::new();
     std::io::stdin()
         .read_to_string(&mut stdin)
@@ -173,7 +173,7 @@ pub fn run(args: FilterArgs, profile: ColorProfile, palette: Palette) -> AppResu
         palette,
     };
     let timeout = args.timeout.as_deref().map(parse_interval).transpose()?;
-    run_ui(&mut app, profile, timeout)?;
+    run_ui_mode(&mut app, profile, timeout, mode)?;
 
     let results = app.state.results();
     if results.is_empty() {

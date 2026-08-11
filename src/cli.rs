@@ -64,8 +64,6 @@ pub struct Cli {
     )]
     pub appearance: crate::theme::AppearanceMode,
     /// Speak the picker as a transcript of rows instead of painting it
-    // Read by `real_main`, which resolves the presentation once per
-    // process, beside the color profile.
     #[arg(
         long,
         global = true,
@@ -77,7 +75,6 @@ pub struct Cli {
     )]
     pub accessible: Option<bool>,
     /// Paint the picker even when the environment asks for a transcript
-    // Read beside its sibling, in the same one call.
     #[arg(long, global = true)]
     pub no_accessible: bool,
     #[command(subcommand)]

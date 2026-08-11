@@ -9,6 +9,7 @@ fn rat() -> Command {
         "CLICOLOR_FORCE",
         "CI",
         "RAT_APPEARANCE",
+        "RAT_ACCESSIBLE",
         "COLORFGBG",
     ] {
         cmd.env_remove(var);

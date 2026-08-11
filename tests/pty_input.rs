@@ -3,7 +3,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::pty::{FakeTerminal, PtySession, wait_for, wait_for_in_order};
+use common::pty::{FakeTerminal, PtySession, drain_for, wait_for, wait_for_in_order};
 
 /// Path to the rat binary — mirrors `tests/pty_watch.rs`'s local
 /// `rat_bin()` per that file's precedent.
@@ -13,19 +13,6 @@ fn rat_bin() -> String {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-/// Accumulate everything the session writes within `total`.
-fn drain_for(session: &PtySession, total: Duration) -> Vec<u8> {
-    let deadline = std::time::Instant::now() + total;
-    let mut out = Vec::new();
-    loop {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return out;
-        }
-        out.extend(session.read_available(deadline - now));
-    }
 }
 
 /// The interactive caret is the real hardware cursor: after each paint

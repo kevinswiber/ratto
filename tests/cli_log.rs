@@ -11,6 +11,7 @@ fn rat() -> Command {
         "CI",
         "RAT_LOG_LEVEL",
         "RAT_APPEARANCE",
+        "RAT_ACCESSIBLE",
         "COLORFGBG",
     ] {
         cmd.env_remove(var);

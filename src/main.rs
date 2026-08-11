@@ -16,6 +16,7 @@ use crate::color::ColorProfile;
 use crate::exit::{AppError, OK};
 use crate::term::tty::UiStream;
 use crate::theme::Palette;
+use crate::ui::loop_::UiMode;
 
 fn main() {
     // Die quietly on a closed pipe (`rat ... | head`) like other unix
@@ -54,6 +55,9 @@ fn real_main() -> i32 {
     // command substitution keeps color.
     let is_tty = UiStream::open().is_tty();
     let profile = color::resolve_profile(cli.color, &color::SystemEnv, is_tty);
+    // Resolved once, here, and threaded by value; nothing downstream
+    // asks the environment a second time.
+    let mode = ui::loop_::resolve_ui_mode(cli.no_accessible, cli.accessible);
     // Asked at most once per process, here, before any command runs and long
     // before anything claims raw mode. Commands never ask.
     let detected = if theme::may_detect(cli.appearance, profile) {
@@ -69,7 +73,7 @@ fn real_main() -> i32 {
     let (appearance, source) = theme::resolve_appearance(cli.appearance, detected);
     let palette = theme::Palette::builtin(appearance, source);
 
-    match dispatch(cli.command, profile, palette) {
+    match dispatch(cli.command, profile, palette, mode) {
         Ok(()) => OK,
         Err(err) => {
             match &err {
@@ -83,7 +87,12 @@ fn real_main() -> i32 {
     }
 }
 
-fn dispatch(command: Command, profile: ColorProfile, palette: Palette) -> exit::AppResult {
+fn dispatch(
+    command: Command,
+    profile: ColorProfile,
+    palette: Palette,
+    mode: UiMode,
+) -> exit::AppResult {
     match command {
         Command::Style(args) => commands::style::run(args, profile, palette),
         Command::Bar(args) => commands::bar::run(args, profile, palette),
@@ -96,11 +105,11 @@ fn dispatch(command: Command, profile: ColorProfile, palette: Palette) -> exit::
         Command::Frame(args) => commands::frame::run(args, profile, palette),
         Command::Watch(args) => commands::watch::run(args, profile, palette),
         Command::Dashboard(args) => commands::dashboard::run(args, profile, palette),
-        Command::Doctor(args) => commands::doctor::run(args, profile, palette),
-        Command::Choose(args) => commands::choose::run(args, profile, palette),
-        Command::Confirm(args) => commands::confirm::run(args, profile, palette),
+        Command::Doctor(args) => commands::doctor::run(args, profile, palette, mode),
+        Command::Choose(args) => commands::choose::run(args, profile, palette, mode),
+        Command::Confirm(args) => commands::confirm::run(args, profile, palette, mode),
         Command::Input(args) => commands::input::run(args, profile, palette),
-        Command::Filter(args) => commands::filter::run(args, profile, palette),
+        Command::Filter(args) => commands::filter::run(args, profile, palette, mode),
         Command::Spin(args) => commands::spin::run(args, profile, palette),
         Command::Completion(args) => commands::completion::run(args, profile, palette),
         #[cfg(debug_assertions)]

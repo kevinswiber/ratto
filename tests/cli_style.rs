@@ -15,6 +15,7 @@ fn rat() -> Command {
         "BACKGROUND",
         "BORDER_FOREGROUND",
         "RAT_APPEARANCE",
+        "RAT_ACCESSIBLE",
         "COLORFGBG",
     ] {
         cmd.env_remove(var);

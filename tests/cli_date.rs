@@ -4,6 +4,7 @@ fn rat() -> Command {
     let mut cmd = Command::cargo_bin("rat").expect("rat binary builds");
     cmd.env("TZ", "UTC");
     cmd.env_remove("RAT_APPEARANCE");
+    cmd.env_remove("RAT_ACCESSIBLE");
     cmd.env_remove("COLORFGBG");
     cmd
 }

@@ -497,3 +497,45 @@ pub fn assert_counter_settled_at(path: &std::path::Path, n: usize) {
         .unwrap_or(0);
     assert_eq!(count, n, "counter settled at the wrong value");
 }
+
+/// Accumulate everything the session writes within `total` — unlike
+/// `read_available`, which returns at the first chunk.
+pub fn drain_for(session: &PtySession, total: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + total;
+    let mut out = Vec::new();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return out;
+        }
+        out.extend(session.read_available(deadline - now));
+    }
+}
+
+/// Every escape the in-place engine uses; none may reach a transcript
+/// session's stream.
+///
+/// A deliberate second copy of the append suite's list, and it must stay
+/// one. The two modes are frozen separately — a change to what an
+/// appended frame may contain must not silently move what a transcript
+/// may contain — and integration tests are separate crates, so the two
+/// cannot see each other's constants in any case.
+pub const ECHO_FORBIDDEN: [&[u8]; 6] = [
+    b"\x1b[?25l",  // hide cursor
+    b"\x1b[0J",    // erase below
+    b"\x1b[2K",    // erase line
+    b"\x1b[?2026", // synchronized output
+    b"\x1b[1A",    // cursor up
+    b"\x1b[?1049", // alternate screen
+];
+
+pub fn assert_no_echo_escapes(bytes: &[u8], context: &str) {
+    for escape in ECHO_FORBIDDEN {
+        assert!(
+            find(bytes, escape).is_none(),
+            "{context}: found {:?} in {:?}",
+            String::from_utf8_lossy(escape),
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}

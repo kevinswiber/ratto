@@ -4,7 +4,7 @@ mod common;
 use std::time::Duration;
 
 use common::pty::{
-    FakeTerminal, PtySession, first_unmatched_in_order, wait_for, wait_for_in_order,
+    FakeTerminal, PtySession, drain_for, first_unmatched_in_order, wait_for, wait_for_in_order,
 };
 
 /// Path to the rat binary, used as a portable child process — mirrors
@@ -24,20 +24,6 @@ fn find_at(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Accumulate everything the session writes within `total` — unlike
-/// `read_available`, which returns at the first chunk.
-fn drain_for(session: &PtySession, total: std::time::Duration) -> Vec<u8> {
-    let deadline = std::time::Instant::now() + total;
-    let mut out = Vec::new();
-    loop {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return out;
-        }
-        out.extend(session.read_available(deadline - now));
-    }
 }
 
 /// `wait_for`, returning the accumulated bytes once `needle` appears —

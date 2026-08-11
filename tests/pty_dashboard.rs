@@ -4,8 +4,8 @@ mod common;
 use std::time::Duration;
 
 use common::pty::{
-    FakeTerminal, PtySession, assert_counter_settled_at, counter_cmd, first_unmatched_in_order,
-    try_wait_for_in_order, wait_for, wait_for_counter, wait_for_in_order,
+    FakeTerminal, PtySession, assert_counter_settled_at, counter_cmd, drain_for,
+    first_unmatched_in_order, try_wait_for_in_order, wait_for, wait_for_counter, wait_for_in_order,
 };
 
 /// Path to the rat binary — duplicated from the watch suite's local
@@ -2651,21 +2651,6 @@ fn a_cursorless_action_from_a_frame_scrolled_board_still_runs_and_still_exports_
         !session.kill_if_alive(Duration::from_secs(2)),
         "dashboard should have exited on q"
     );
-}
-
-/// Accumulate everything the session writes within `total` — unlike
-/// `read_available`, which returns at the first chunk. Duplicated from
-/// the watch suite's local helper, never lifted.
-fn drain_for(session: &PtySession, total: std::time::Duration) -> Vec<u8> {
-    let deadline = std::time::Instant::now() + total;
-    let mut out = Vec::new();
-    loop {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return out;
-        }
-        out.extend(session.read_available(deadline - now));
-    }
 }
 
 /// Every `v`-prefixed six-digit counter value in the byte stream — the

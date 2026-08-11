@@ -4,6 +4,7 @@ fn rat() -> Command {
     let mut cmd = Command::cargo_bin("rat").expect("rat binary builds");
     // Both can change which palette a run picks, so tests pin neither.
     cmd.env_remove("RAT_APPEARANCE");
+    cmd.env_remove("RAT_ACCESSIBLE");
     cmd.env_remove("COLORFGBG");
     cmd
 }

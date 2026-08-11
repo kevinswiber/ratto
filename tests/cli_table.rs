@@ -10,6 +10,7 @@ fn rat() -> Command {
         "COLORTERM",
         "TERM",
         "RAT_APPEARANCE",
+        "RAT_ACCESSIBLE",
         "COLORFGBG",
     ] {
         cmd.env_remove(var);
