@@ -320,3 +320,128 @@ fn an_item_that_carries_a_line_break_is_still_one_row() {
     session.write_bytes(b"\x1b");
     session.kill_if_alive(Duration::from_secs(2));
 }
+
+/// Anchor past the opening block, then send a burst and listen long
+/// enough that anything the burst policy was holding has certainly
+/// landed — and anything it should have suppressed has had every chance
+/// to leak. The rows returned are only what the picker wrote after the
+/// block, so the terminal's echo of this test's own item bytes is
+/// outside the window being judged.
+fn burst_and_rows(session: &PtySession, terminal: &mut FakeTerminal, keys: &[u8]) -> Vec<String> {
+    wait_for_in_order(session, terminal, &[KEYS_ONE], Duration::from_secs(5));
+    session.write_bytes(keys);
+    let tail = drain_for(session, SILENCE_WINDOW);
+    String::from_utf8_lossy(&tail)
+        .split("\r\n")
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn three_items() -> [&'static str; 3] {
+    ["alpha bravo one", "alpha bravo two", "charlie delta"]
+}
+
+#[test]
+fn a_typed_burst_speaks_only_the_query_it_settles_on() {
+    let (session, mut terminal) = spawn_filter(&three_items(), &["--header", "Items"]);
+
+    // Eleven characters in ONE write, so the whole burst is in the
+    // terminal's input queue before the picker reads the first of them —
+    // which is what a fast typist looks like to the driver.
+    //
+    // This is the one test in this suite licensed to send several keys
+    // at once: coalescing is its SUBJECT rather than its hazard, and the
+    // assertion is over the settled result rather than an ordered chain.
+    // Paced into eleven separate presses it would stop proving anything.
+    let rows = burst_and_rows(&session, &mut terminal, b"alpha bravo");
+    assert_eq!(rows, ["alpha bravo, 2 matches, alpha bravo one"]);
+
+    // Stated separately so the intent survives someone loosening the
+    // equality above: without the debounce there is one row per
+    // character, and this names WHICH state leaked.
+    for n in 1.."alpha bravo".len() {
+        let leaked = format!("{}, ", &"alpha bravo"[..n]);
+        assert!(
+            !rows.iter().any(|r| r.starts_with(&leaked)),
+            "an intermediate query was spoken: {leaked:?} in {rows:?}"
+        );
+    }
+    // And nothing re-listed the candidates: the block is written once.
+    for absent in ["alpha bravo two", "charlie delta"] {
+        assert!(
+            !rows.iter().any(|r| r.contains(absent)),
+            "{absent:?} in {rows:?}"
+        );
+    }
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn a_query_that_matches_nothing_says_so() {
+    // Not silent: "no matches" is a state the reader needs, and it is
+    // what the painted mode showed as an empty list.
+    let (session, mut terminal) = spawn_filter(&three_items(), &["--header", "Items"]);
+    let rows = burst_and_rows(&session, &mut terminal, b"zzz");
+    assert_eq!(rows, ["zzz, no matches"]);
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn a_query_with_one_match_reads_in_the_singular() {
+    // The row is read aloud, and "1 matches" is a stumble in the one
+    // place this mode exists to be listened to.
+    let (session, mut terminal) = spawn_filter(&three_items(), &["--header", "Items"]);
+    let rows = burst_and_rows(&session, &mut terminal, b"charlie");
+    assert_eq!(rows, ["charlie, 1 match, charlie delta"]);
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn editing_the_query_backwards_settles_the_same_way() {
+    // Deleting reaches the query through the same path, changes the same
+    // field, and must produce the same SHAPE of row — one, on settle. A
+    // transcript written per key rather than per state would say
+    // "deleted" or repeat the whole query four times.
+    let (session, mut terminal) = spawn_filter(&three_items(), &["--header", "Items"]);
+    let rows = burst_and_rows(&session, &mut terminal, b"alpha bravo");
+    assert_eq!(rows, ["alpha bravo, 2 matches, alpha bravo one"]);
+
+    session.write_bytes(b"\x7f\x7f\x7f\x7f");
+    let tail = drain_for(&session, SILENCE_WINDOW);
+    let rows: Vec<String> = String::from_utf8_lossy(&tail)
+        .split("\r\n")
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(rows, ["alpha b, 2 matches, alpha bravo one"]);
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn submitting_inside_the_window_drops_the_row_it_was_holding() {
+    // The query and the submit in one write, inside one quiescence
+    // interval: the state at exit is the result, and the row the burst
+    // policy was holding is discarded rather than spoken.
+    //
+    // This cannot fail against the surface as it stands — nothing is
+    // written on the way out yet — and it is here to make the deliberate
+    // drop EXPLICIT, so a later change that "fixes" the apparent loss by
+    // flushing the pending row on exit fails right here.
+    let (session, mut terminal) = spawn_filter(&three_items(), &["--header", "Items"]);
+    let rows = burst_and_rows(&session, &mut terminal, b"alpha\r");
+    assert!(
+        !rows.iter().any(|r| r.starts_with("alpha, ")),
+        "a row pending at exit must be discarded, not flushed: {rows:?}"
+    );
+
+    session.kill_if_alive(Duration::from_secs(2));
+}

@@ -28,6 +28,37 @@ struct FilterApp {
     palette: Palette,
 }
 
+/// The one phrase for an empty match set. The opening block and a
+/// settled query row both reach for it, and a reader should meet it in
+/// one spelling.
+const NO_MATCHES: &str = "no matches";
+
+impl FilterApp {
+    /// The query as it now stands, what it matched, and where the reader
+    /// landed — the resting state, not the edit that produced it, so a
+    /// row held through a burst is still true when it is written.
+    fn query_row(&self) -> String {
+        let query = &self.state.query.value;
+        match self.state.matches.len() {
+            0 => format!("{query}, {NO_MATCHES}"),
+            // Singular, because the row is read aloud.
+            1 => format!("{query}, 1 match, {}", self.cursor_item()),
+            n => format!("{query}, {n} matches, {}", self.cursor_item()),
+        }
+    }
+
+    /// The item under the cursor. Total by construction: refreshing a
+    /// query resets the cursor while the match list may be empty, and a
+    /// partial function on the loop thread is not worth the saving.
+    fn cursor_item(&self) -> String {
+        self.state
+            .matches
+            .get(self.state.cursor)
+            .map(|m| self.state.items[m.index].clone())
+            .unwrap_or_default()
+    }
+}
+
 impl UiApp for FilterApp {
     fn on_key(&mut self, key: Key) -> Outcome {
         self.state.on_key(key)
@@ -128,6 +159,16 @@ impl UiApp for FilterApp {
         }
     }
 
+    fn speak(&self, before: &EchoSnapshot) -> Option<String> {
+        // The query is the coarsest thing a key can move, and moving it
+        // resets the cursor, so a query change subsumes the cursor row
+        // it would otherwise have produced.
+        if before.query != self.state.query.value {
+            return Some(self.query_row());
+        }
+        None
+    }
+
     fn speak_opening(&self) -> Vec<String> {
         // The MATCHES, not the raw candidate list: with a seeded query
         // the two differ, and the block must describe what the reader is
@@ -146,7 +187,7 @@ impl UiApp for FilterApp {
         let position = if listed.is_empty() {
             // The same phrase a settled query uses, so a reader meets it
             // once. There is no first of nothing.
-            "no matches".to_string()
+            NO_MATCHES.to_string()
         } else {
             format!("1 of {}", listed.len())
         };
