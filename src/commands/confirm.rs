@@ -22,8 +22,11 @@ struct ConfirmApp {
 }
 
 impl ConfirmApp {
-    /// The armed answer's label.
-    fn armed(&self) -> &str {
+    /// The armed answer's label — the one string this command names,
+    /// read by the printed output and by the spoken closing row alike.
+    /// Two derivations of "which one is armed" would agree until the day
+    /// one of them was corrected.
+    fn label(&self) -> &str {
         if self.state.affirmative {
             &self.affirmative
         } else {
@@ -91,16 +94,33 @@ impl UiApp for ConfirmApp {
             // Where you are, in the words a later toggle will use: the
             // armed answer. A coordinate would name a position in a list
             // of two unnamed things.
-            self.armed(),
+            self.label(),
             &self.keys_row(),
         )
+    }
+
+    fn speak_closing(&self, outcome: &AppResult) -> Vec<String> {
+        match outcome {
+            // A negative answer submits like an affirmative one; only
+            // the exit code differs.
+            Ok(()) => vec![format!("chose {}", self.label())],
+            // Both ways of declining read the same: the reader stopped.
+            Err(AppError::NoSelection) | Err(AppError::Aborted) => vec!["cancelled".to_string()],
+            // The one ending with no keystroke behind it, so the only
+            // place the reader can learn why the session stopped.
+            Err(AppError::Timeout(_)) => vec!["timed out".to_string()],
+            // Not a choice the reader made, and stderr has already said
+            // why. No catch-all arm — the next variant added should have
+            // to answer this question.
+            Err(AppError::Fail(_)) | Err(AppError::Child(_)) => Vec::new(),
+        }
     }
 
     fn speak(&self, _before: &EchoSnapshot) -> Option<String> {
         // The answer that is armed NOW. What was armed before is what
         // decided there was anything to say; the row is the resting
         // state, which is what keeps a coalesced row true.
-        Some(self.armed().to_string())
+        Some(self.label().to_string())
     }
 }
 
@@ -117,13 +137,8 @@ pub fn run(args: ConfirmArgs, profile: ColorProfile, palette: Palette, mode: UiM
     let timeout = args.timeout.as_deref().map(parse_interval).transpose()?;
     run_ui_mode(&mut app, profile, timeout, mode)?;
 
-    let label = if app.state.affirmative {
-        &args.affirmative
-    } else {
-        &args.negative
-    };
     if args.show_output {
-        println!("{label}");
+        println!("{}", app.label());
     }
     if app.state.affirmative {
         Ok(())
@@ -138,6 +153,44 @@ mod tests {
 
     use super::*;
     use crate::theme::{Appearance, AppearanceSource};
+
+    fn app(affirmative: bool) -> ConfirmApp {
+        ConfirmApp {
+            state: ConfirmState { affirmative },
+            prompt: "Ship it?".into(),
+            affirmative: "Yes".into(),
+            negative: "No".into(),
+            palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
+        }
+    }
+
+    #[test]
+    fn every_way_the_session_can_end_answers_for_itself() {
+        // A negative answer is a submit too — only the exit code
+        // differs — so it names its label rather than reading as a
+        // cancel.
+        assert_eq!(app(true).speak_closing(&Ok(())), ["chose Yes"]);
+        assert_eq!(app(false).speak_closing(&Ok(())), ["chose No"]);
+
+        let a = app(true);
+        assert_eq!(a.speak_closing(&Err(AppError::NoSelection)), ["cancelled"]);
+        // Raw mode clears the terminal's signal handling, so this
+        // arrives as a keystroke and the row still gets written.
+        assert_eq!(a.speak_closing(&Err(AppError::Aborted)), ["cancelled"]);
+        assert_eq!(
+            a.speak_closing(&Err(AppError::Timeout(None))),
+            ["timed out"]
+        );
+        assert_eq!(
+            a.speak_closing(&Err(AppError::Timeout(Some(anyhow::anyhow!("waiting"))))),
+            ["timed out"]
+        );
+        assert!(
+            a.speak_closing(&Err(anyhow::anyhow!("boom").into()))
+                .is_empty()
+        );
+        assert!(a.speak_closing(&Err(AppError::Child(7))).is_empty());
+    }
 
     fn active_button(palette: Palette) -> (Color, Color) {
         let app = ConfirmApp {

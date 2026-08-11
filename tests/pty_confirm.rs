@@ -32,6 +32,34 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Everything ahead of the first occurrence of `needle`.
+fn before<'a>(haystack: &'a [u8], needle: &[u8]) -> &'a [u8] {
+    let at = haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("the needle must be present");
+    &haystack[..at]
+}
+
+/// Everything after the first occurrence of `needle`.
+fn after<'a>(haystack: &'a [u8], needle: &[u8]) -> &'a [u8] {
+    let at = haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("the needle must be present");
+    &haystack[at + needle.len()..]
+}
+
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.len() > haystack.len() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
 /// Press one key and hear the row it causes, before anything else is
 /// pressed. Race-free by construction: the next row cannot already be
 /// in flight inside this wait's final chunk, because nothing has been
@@ -206,5 +234,189 @@ fn a_label_that_carries_a_newline_is_still_one_row() {
     );
 
     session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+/// Anchor past the opening block, answer, and hand back everything the
+/// session wrote after that. The drain is long enough that a wrongly
+/// flushed row would have arrived.
+fn answer_and_drain(session: &PtySession, terminal: &mut FakeTerminal, key: &[u8]) -> Vec<u8> {
+    wait_for_in_order(session, terminal, &[KEYS_ROW], Duration::from_secs(5));
+    session.write_bytes(key);
+    drain_for(session, SILENCE_WINDOW)
+}
+
+#[test]
+fn answering_yes_outright_speaks_the_choice_and_not_the_move() {
+    // `--default false` is what gives this teeth: with the affirmative
+    // already armed, `y` changes nothing and a missing move row would
+    // prove only that the silence rule works. Starting from the
+    // negative, the state really moves — so the move row's absence can
+    // only be explained by the outcome being matched before the
+    // transcript is asked what changed.
+    let session = spawn(&["confirm", "Ship it?", "--default", "false", "--accessible"]);
+    let mut terminal = FakeTerminal::dark();
+    let tail = answer_and_drain(&session, &mut terminal, b"y");
+
+    assert!(
+        contains(&tail, b"chose Yes\r\n"),
+        "the answer must be spoken: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(
+        before(&tail, b"chose Yes\r\n").is_empty(),
+        "no stuttered move row before the answer: {:?}",
+        String::from_utf8_lossy(before(&tail, b"chose Yes\r\n"))
+    );
+    assert!(
+        after(&tail, b"chose Yes\r\n").is_empty(),
+        "nothing follows it: {:?}",
+        String::from_utf8_lossy(after(&tail, b"chose Yes\r\n"))
+    );
+
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn the_choice_is_spoken_when_stdout_says_nothing() {
+    // Without the output flag this run prints not one byte and reports
+    // its answer only through its exit code, so this row is the only
+    // thing that says what was answered.
+    let session = spawn(&["confirm", "Ship it?", "--accessible"]);
+    let mut terminal = FakeTerminal::dark();
+    let tail = answer_and_drain(&session, &mut terminal, b"\r");
+
+    assert!(
+        contains(&tail, b"chose Yes\r\n"),
+        "the answer must be spoken even with nothing printed: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(before(&tail, b"chose Yes\r\n").is_empty());
+    assert!(
+        after(&tail, b"chose Yes\r\n").is_empty(),
+        "this run prints nothing at all: {:?}",
+        String::from_utf8_lossy(after(&tail, b"chose Yes\r\n"))
+    );
+
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn showing_the_output_adds_a_printed_line_and_changes_no_row() {
+    // Two writers on one device, told apart by content: the transcript's
+    // closing row is written inside the driver, and the printed line
+    // after it. Their agreement is the shared accessor made visible.
+    let session = spawn(&["confirm", "Ship it?", "--show-output", "--accessible"]);
+    let mut terminal = FakeTerminal::dark();
+    let tail = answer_and_drain(&session, &mut terminal, b"\r");
+
+    assert!(
+        contains(&tail, b"chose Yes\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(before(&tail, b"chose Yes\r\n").is_empty());
+    assert_eq!(
+        after(&tail, b"chose Yes\r\n"),
+        b"Yes\r\n",
+        "the printed line is added, not substituted: {:?}",
+        String::from_utf8_lossy(after(&tail, b"chose Yes\r\n"))
+    );
+
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn answering_no_speaks_the_negative_label_not_a_cancel() {
+    // A negative answer submits like an affirmative one; only the exit
+    // code differs. Reading "not ok" as a cancel would put the wrong row
+    // on half of all prompts.
+    let session = spawn(&["confirm", "Ship it?", "--show-output", "--accessible"]);
+    let mut terminal = FakeTerminal::dark();
+    let tail = answer_and_drain(&session, &mut terminal, b"n");
+
+    assert!(
+        contains(&tail, b"chose No\r\n"),
+        "a negative answer is still an answer: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(before(&tail, b"chose No\r\n").is_empty());
+    assert_eq!(after(&tail, b"chose No\r\n"), b"No\r\n");
+
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn pressing_escape_cancels_out_loud() {
+    // Sent alone, never appended to other bytes: an escape followed by
+    // more input is the start of a sequence and the key parser reads it
+    // as one.
+    let session = spawn(&["confirm", "Ship it?", "--accessible"]);
+    let mut terminal = FakeTerminal::dark();
+    let tail = answer_and_drain(&session, &mut terminal, b"\x1b");
+
+    assert_eq!(
+        tail,
+        b"cancelled\r\n",
+        "{:?}",
+        String::from_utf8_lossy(&tail)
+    );
+}
+
+#[test]
+fn an_interrupt_and_a_timeout_close_out_loud_too() {
+    // Raw mode clears the terminal's signal handling, so this arrives as
+    // an ordinary byte and the driver is still running when it writes.
+    let session = spawn(&["confirm", "Ship it?", "--accessible"]);
+    let mut terminal = FakeTerminal::dark();
+    let tail = answer_and_drain(&session, &mut terminal, b"\x03");
+    assert_eq!(
+        tail,
+        b"cancelled\r\n",
+        "{:?}",
+        String::from_utf8_lossy(&tail)
+    );
+
+    let session = spawn(&["confirm", "Ship it?", "--timeout", "300ms", "--accessible"]);
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ROW], Duration::from_secs(5));
+    let tail = drain_for(&session, SILENCE_WINDOW);
+    // Two writers say this and they are byte-identical: the transcript
+    // row, and the shipped give-up line on stderr after raw mode is off.
+    // Counting is what tells them apart.
+    assert_eq!(
+        count(&tail, b"timed out\r\n"),
+        2,
+        "the transcript row and the stderr line must both be there: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn the_spoken_answer_and_the_printed_one_are_the_same_string() {
+    // Custom labels are where two derivations diverge in practice, and
+    // the space in the label also proves the row is not word-split.
+    let session = spawn(&[
+        "confirm",
+        "Ship it?",
+        "--affirmative",
+        "Ship it",
+        "--negative",
+        "Wait",
+        "--show-output",
+        "--accessible",
+    ]);
+    let mut terminal = FakeTerminal::dark();
+    let tail = answer_and_drain(&session, &mut terminal, b"\r");
+
+    assert!(
+        contains(&tail, b"chose Ship it\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert_eq!(after(&tail, b"chose Ship it\r\n"), b"Ship it\r\n");
+
     session.kill_if_alive(Duration::from_secs(5));
 }
