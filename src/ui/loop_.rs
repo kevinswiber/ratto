@@ -10,6 +10,7 @@ use crate::exit::{AppError, AppResult};
 use crate::term::buffer_ansi::buffer_to_lines;
 use crate::term::inline::InlineRenderer;
 use crate::term::tty::{RawModeGuard, UiStream};
+use crate::ui::echo::EchoSnapshot;
 use crate::ui::key::{Key, from_crossterm};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -55,6 +56,52 @@ pub trait UiApp {
     /// field needs the width to place its window, and `render` cannot
     /// mutate. Called every iteration, so a resize lands here too.
     fn prepare(&mut self, _term: (u16, u16)) {}
+    /// What the transcript can describe about this app right now. The
+    /// driver compares it around each key and says nothing when the two
+    /// are equal, so the no-op rule is decided once for every surface
+    /// rather than in each of them. An app with nothing to describe
+    /// keeps the default and is silent by construction.
+    // The driver compares one around every key next.
+    #[allow(dead_code)]
+    fn echo_snapshot(&self) -> EchoSnapshot {
+        EchoSnapshot::default()
+    }
+    /// The block printed once on entry: what this is, what is in it,
+    /// where the cursor is, which keys do what.
+    // The driver writes this once on entry next.
+    #[allow(dead_code)]
+    fn speak_opening(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The shortest unambiguous words for the transition that just
+    /// happened, or `None` when this app has none for it.
+    // The driver hands what this returns to the burst policy next.
+    #[allow(dead_code)]
+    fn speak(&self, _before: &EchoSnapshot) -> Option<String> {
+        None
+    }
+    /// Where the reader is, on demand — the one thing a transcript
+    /// cannot repeat back on its own.
+    // The driver answers the orientation key with this next.
+    #[allow(dead_code)]
+    fn speak_orientation(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// What is marked, on demand.
+    // The driver answers the marked-set key with this next.
+    #[allow(dead_code)]
+    fn speak_selection(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The result, as its own row, before the process exits. This is the
+    /// row that the painted mode cannot deliver at all: it erases itself
+    /// on the way out, so the chosen value is printed into a region that
+    /// has already been wiped.
+    // The driver writes this on the way out next.
+    #[allow(dead_code)]
+    fn speak_closing(&self, _outcome: &AppResult) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Where the hardware cursor may actually be parked. A scrolling field
@@ -212,6 +259,28 @@ mod tests {
     #[test]
     fn no_caret_stays_no_caret() {
         assert_eq!(park_target(None, 20, 2), None);
+    }
+
+    #[test]
+    fn an_app_that_overrides_nothing_has_nothing_to_say() {
+        struct Silent;
+        impl UiApp for Silent {
+            fn on_key(&mut self, _key: Key) -> Outcome {
+                Outcome::Continue
+            }
+            fn render(&self, _area: Rect, _buf: &mut Buffer) {}
+            fn height(&self, _term: (u16, u16)) -> u16 {
+                1
+            }
+        }
+
+        let app = Silent;
+        assert_eq!(app.echo_snapshot(), EchoSnapshot::default());
+        assert!(app.speak_opening().is_empty());
+        assert!(app.speak(&EchoSnapshot::default()).is_none());
+        assert!(app.speak_orientation().is_empty());
+        assert!(app.speak_selection().is_empty());
+        assert!(app.speak_closing(&Ok(())).is_empty());
     }
 
     #[test]
