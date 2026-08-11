@@ -10,6 +10,40 @@ const HELP_STYLES: Styles = Styles::styled()
     .literal(Style::new().fg_color(Some(Color::Ansi256(Ansi256Color(212)))))
     .placeholder(Style::new().dimmed());
 
+/// Boolish, plus one rule clap's own parser does not carry: an EMPTY
+/// value reads as "not asking". A shell profile can export an empty
+/// variable by accident — `export RAT_ACCESSIBLE=$UNSET` is one
+/// expansion away — and that must not turn every command into a usage
+/// error. An empty value and an absent one resolve identically, so the
+/// `false` here is the expressible spelling of "nobody asked", never a
+/// refusal with different consequences.
+#[derive(Clone, Default)]
+struct AccessibleValueParser(clap::builder::BoolishValueParser);
+
+impl clap::builder::TypedValueParser for AccessibleValueParser {
+    type Value = bool;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<bool, clap::Error> {
+        if value.is_empty() {
+            return Ok(false);
+        }
+        self.0.parse_ref(cmd, arg, value)
+    }
+
+    // Forwarded so the help line keeps `[possible values: true, false]`;
+    // the default implementation would silently drop it.
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        self.0.possible_values()
+    }
+}
+
 #[derive(clap::Parser)]
 #[command(
     name = "rat",
@@ -29,6 +63,23 @@ pub struct Cli {
         env = "RAT_APPEARANCE"
     )]
     pub appearance: crate::theme::AppearanceMode,
+    /// Speak the picker as a transcript of rows instead of painting it
+    // Read by `real_main`, which resolves the presentation once per
+    // process, beside the color profile.
+    #[arg(
+        long,
+        global = true,
+        env = "RAT_ACCESSIBLE",
+        value_parser = AccessibleValueParser::default(),
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    pub accessible: Option<bool>,
+    /// Paint the picker even when the environment asks for a transcript
+    // Read beside its sibling, in the same one call.
+    #[arg(long, global = true)]
+    pub no_accessible: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -813,5 +864,137 @@ mod tests {
             panic!("expected the table subcommand");
         };
         assert_eq!(args.ellipsis, crate::core::measure::ELLIPSIS);
+    }
+
+    #[test]
+    fn the_accessible_flag_speaks_the_boolish_vocabulary() {
+        // Every spelling a shell user might reach for, in both cases.
+        // The flag is always explicit here: the parser reads the real
+        // environment, and a bare command line would make this test
+        // depend on the developer's shell.
+        for value in ["1", "true", "TRUE", "yes", "y", "t", "on"] {
+            let flag = format!("--accessible={value}");
+            let cli = super::Cli::parse_from(["rat", flag.as_str(), "choose", "alpha"]);
+            assert_eq!(cli.accessible, Some(true), "{value}");
+        }
+        for value in ["0", "false", "FALSE", "no", "n", "f", "off"] {
+            let flag = format!("--accessible={value}");
+            let cli = super::Cli::parse_from(["rat", flag.as_str(), "choose", "alpha"]);
+            assert_eq!(cli.accessible, Some(false), "{value}");
+        }
+    }
+
+    #[test]
+    fn an_unusable_accessible_value_names_itself_in_the_error() {
+        // A refusal a user can act on has to quote what they typed;
+        // "invalid value" alone sends them to the manual.
+        let Err(err) = super::Cli::try_parse_from(["rat", "--accessible=BOGUS", "choose", "alpha"])
+        else {
+            panic!("a non-boolean must be refused");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        let message = err.to_string();
+        assert!(message.contains("BOGUS"), "{message}");
+    }
+
+    #[test]
+    fn a_bare_accessible_flag_does_not_eat_the_next_word() {
+        // Without an attached value the flag takes none, so the words
+        // after it stay the user's options. This is the case that
+        // decides how the flag is declared, and it is silent when wrong:
+        // the run would simply be missing an item.
+        let cli = super::Cli::parse_from(["rat", "choose", "--accessible", "alpha", "beta"]);
+        assert_eq!(cli.accessible, Some(true), "a bare flag means yes");
+        let super::Command::Choose(args) = cli.command else {
+            panic!("expected the choose subcommand");
+        };
+        assert_eq!(args.options, ["alpha", "beta"]);
+
+        // The other side of the same coin, recorded so it is a decision
+        // and not a surprise: a space-separated value is data, not a
+        // value. Both words reach the list.
+        let cli = super::Cli::parse_from(["rat", "choose", "--accessible", "false", "alpha"]);
+        assert_eq!(cli.accessible, Some(true));
+        let super::Command::Choose(args) = cli.command else {
+            panic!("expected the choose subcommand");
+        };
+        assert_eq!(args.options, ["false", "alpha"]);
+    }
+
+    #[test]
+    fn the_accessible_flag_is_wired_to_the_ambient_variable() {
+        // Declarative, so it reads no environment and races nothing:
+        // the three attributes that each carry a rule. The variable is
+        // what a dashboard-spawned child inherits; global is what puts
+        // the flag on every subcommand; requiring an attached value is
+        // what keeps a positional from being swallowed.
+        let cmd = super::Cli::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_long() == Some("accessible"))
+            .expect("the flag is declared on the top-level command");
+        assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new("RAT_ACCESSIBLE")));
+        assert!(arg.is_global_set(), "every subcommand must accept it");
+        assert!(arg.is_require_equals_set(), "a value must be attached");
+    }
+
+    #[test]
+    fn the_off_switch_is_global_on_both_sides_of_the_subcommand() {
+        // Only the off switch is asserted: the request field is
+        // reachable from the environment, and this test must not depend
+        // on the developer's shell.
+        for argv in [
+            ["rat", "--no-accessible", "choose", "alpha"],
+            ["rat", "choose", "--no-accessible", "alpha"],
+        ] {
+            let cli = super::Cli::parse_from(argv);
+            assert!(cli.no_accessible, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn an_explicitly_false_flag_resolves_like_the_off_switch() {
+        // Two spellings of "paint it", and they must land in the same
+        // place. Both arms are stable whatever the environment says:
+        // one supplies the value explicitly, and the other is refused
+        // outright regardless of what the request field holds.
+        use crate::ui::loop_::{UiMode, resolve_ui_mode};
+        let refused = super::Cli::parse_from(["rat", "--accessible=false", "choose", "alpha"]);
+        assert_eq!(
+            resolve_ui_mode(refused.no_accessible, refused.accessible),
+            UiMode::Painted
+        );
+        let off = super::Cli::parse_from(["rat", "--no-accessible", "choose", "alpha"]);
+        assert_eq!(
+            resolve_ui_mode(off.no_accessible, off.accessible),
+            UiMode::Painted
+        );
+    }
+
+    #[test]
+    fn an_empty_value_reads_as_not_asking() {
+        // A profile can export this variable with no value at all —
+        // `export RAT_ACCESSIBLE=$UNSET` is one expansion away — and
+        // clap's own boolean parser calls that a usage error, which
+        // would make every command fail. Empty means nobody asked.
+        //
+        // An attached empty value on the command line reaches the very
+        // same parser the environment does, so this races nothing and
+        // still exercises the rule; the environment arm is proven
+        // against the shipped binary in the pty suite.
+        use crate::ui::loop_::{UiMode, resolve_ui_mode};
+        let cli = super::Cli::parse_from(["rat", "--accessible=", "choose", "alpha"]);
+        assert_eq!(cli.accessible, Some(false), "empty must not be an error");
+        assert_eq!(
+            resolve_ui_mode(cli.no_accessible, cli.accessible),
+            UiMode::Painted
+        );
+
+        // And the rule is narrow: a value that is merely unrecognised is
+        // still refused, so a typo is still reported rather than
+        // silently ignored.
+        assert!(
+            super::Cli::try_parse_from(["rat", "--accessible=maybe", "choose", "alpha"]).is_err()
+        );
     }
 }
