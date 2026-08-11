@@ -4,7 +4,8 @@ mod common;
 use std::time::Duration;
 
 use common::pty::{
-    FakeTerminal, PtySession, drain_for, first_unmatched_in_order, wait_for_in_order,
+    FakeTerminal, PtySession, SILENCE_WINDOW, after, assert_silent_then_alive, before, contains,
+    count, drain_for, first_unmatched_in_order, press_and_hear, wait_for_in_order,
 };
 
 fn rat_bin() -> String {
@@ -21,79 +22,6 @@ fn rat_bin() -> String {
 /// consumed the whole block and left nothing behind to satisfy one.
 const KEYS_ROW: &[u8] =
     b"left and right move, y and n answer, enter chooses, escape cancels, control o says where you are\r\n";
-
-/// One quiescence interval plus one poll slice, plus margin for a
-/// loaded CI box. There is no library target to import those constants
-/// from, so the relation lives here and must move when they do. A
-/// shorter drain does not measure silence — it measures a row still in
-/// flight.
-const SILENCE_WINDOW: Duration = Duration::from_millis(1000);
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-/// Everything ahead of the first occurrence of `needle`.
-fn before<'a>(haystack: &'a [u8], needle: &[u8]) -> &'a [u8] {
-    let at = haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .expect("the needle must be present");
-    &haystack[..at]
-}
-
-/// Everything after the first occurrence of `needle`.
-fn after<'a>(haystack: &'a [u8], needle: &[u8]) -> &'a [u8] {
-    let at = haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .expect("the needle must be present");
-    &haystack[at + needle.len()..]
-}
-
-fn count(haystack: &[u8], needle: &[u8]) -> usize {
-    if needle.len() > haystack.len() {
-        return 0;
-    }
-    haystack
-        .windows(needle.len())
-        .filter(|w| *w == needle)
-        .count()
-}
-
-/// Press one key and hear the row it causes, before anything else is
-/// pressed. Race-free by construction: the next row cannot already be
-/// in flight inside this wait's final chunk, because nothing has been
-/// pressed yet to cause it. Returns the bytes read so a caller can
-/// concatenate them into ONE stream and assert the whole order at the
-/// end — reads are destructive and sequential, so the concatenation
-/// IS the stream.
-fn press_and_hear(
-    session: &PtySession,
-    terminal: &mut FakeTerminal,
-    key: &[u8],
-    row: &[u8],
-) -> Vec<u8> {
-    session.write_bytes(key);
-    wait_for_in_order(session, terminal, &[row], Duration::from_secs(5))
-}
-
-/// Listen long enough to believe the silence, then prove the session
-/// could still have spoken. An empty drain and a dead process are
-/// indistinguishable; this is the difference.
-fn assert_silent_then_alive(
-    session: &PtySession,
-    terminal: &mut FakeTerminal,
-    then: (&[u8], &[u8]),
-) {
-    let quiet = drain_for(session, SILENCE_WINDOW);
-    assert!(
-        quiet.is_empty(),
-        "a key that changed nothing wrote {:?}",
-        String::from_utf8_lossy(&quiet),
-    );
-    press_and_hear(session, terminal, then.0, then.1);
-}
 
 fn spawn(args: &[&str]) -> PtySession {
     // A pinned appearance suppresses the startup probe, so every byte in

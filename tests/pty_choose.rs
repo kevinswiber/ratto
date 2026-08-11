@@ -4,7 +4,8 @@ mod common;
 use std::time::Duration;
 
 use common::pty::{
-    ECHO_FORBIDDEN, FakeTerminal, PtySession, assert_no_echo_escapes, drain_for,
+    ECHO_FORBIDDEN, FakeTerminal, PtySession, SILENCE_WINDOW, after, assert_no_echo_escapes,
+    assert_silent_then_alive, before, contains, count, drain_for, press_and_hear,
     try_wait_for_in_order, wait_for_in_order,
 };
 
@@ -12,38 +13,6 @@ use common::pty::{
 /// `rat_bin()` per that file's precedent.
 fn rat_bin() -> String {
     assert_cmd::cargo::cargo_bin("rat").display().to_string()
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-fn count(haystack: &[u8], needle: &[u8]) -> usize {
-    if needle.len() > haystack.len() {
-        return 0;
-    }
-    haystack
-        .windows(needle.len())
-        .filter(|w| *w == needle)
-        .count()
-}
-
-/// Everything ahead of the first occurrence of `needle`.
-fn before<'a>(haystack: &'a [u8], needle: &[u8]) -> &'a [u8] {
-    let at = haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .expect("the needle must be present");
-    &haystack[..at]
-}
-
-/// Everything after the first occurrence of `needle`.
-fn after<'a>(haystack: &'a [u8], needle: &[u8]) -> &'a [u8] {
-    let at = haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .expect("the needle must be present");
-    &haystack[at + needle.len()..]
 }
 
 /// The slice strictly between the first `open` and the first `close`
@@ -60,24 +29,6 @@ fn between<'a>(haystack: &'a [u8], open: &[u8], close: &[u8]) -> &'a [u8] {
         .expect("the closing needle must be present");
     &haystack[start..start + end]
 }
-
-/// The opening block's last row for a single-select run. Every
-/// post-opening assertion in this suite anchors on it: it is the only
-/// row that means "the opening is over", and it carries its own row
-/// terminator so a capture stopped here leaves no `\r\n` behind for a
-/// later drain to read back as a phantom row.
-/// How long a silence proof must listen before it may believe the
-/// silence. A row noted into the burst policy is written one quiescence
-/// interval after the last input, and the driver notices it is due on
-/// its next turn of the poll loop — so the worst case a pending row can
-/// hide in is one quiescence plus one poll slice. Both are 250 ms today
-/// and the second is DEFINED as the first (in `src/ui/loop_.rs`), which
-/// makes the floor 500 ms; this doubles it for a loaded CI box.
-///
-/// There is no library target to import those constants from, so the
-/// relation lives here and must move when they do. A drain shorter than
-/// the sum does not measure silence — it measures a row still in flight.
-const SILENCE_WINDOW: Duration = Duration::from_millis(1000);
 
 const KEYS_ONE: &[u8] =
     b"up and down move, enter chooses, escape cancels, control o says where you are\r\n";
@@ -383,27 +334,6 @@ fn an_item_carrying_a_newline_is_still_one_row() {
     session.kill_if_alive(Duration::from_secs(5));
 }
 
-/// One key, one row. In echo mode a burst of keys COALESCES to a single
-/// row — the last one — so an ordered chain of transitions cannot be
-/// produced by writing several keys and then reading. Each key is
-/// written only after the previous key's row has been read back, which
-/// is also what makes the sequence race-free: the next row cannot
-/// already be in flight inside the previous wait's final chunk, because
-/// nothing has been pressed yet to cause it.
-///
-/// Returns the bytes it read so the caller can concatenate them into
-/// ONE stream and assert the whole order at the end. Reads are
-/// destructive and sequential, so the concatenation is the stream.
-fn press_and_hear(
-    session: &PtySession,
-    terminal: &mut FakeTerminal,
-    key: &[u8],
-    row: &[u8],
-) -> Vec<u8> {
-    session.write_bytes(key);
-    wait_for_in_order(session, terminal, &[row], Duration::from_secs(5))
-}
-
 #[test]
 fn a_cursor_move_names_the_item_and_a_toggle_names_the_mark() {
     let session = PtySession::spawn(
@@ -462,24 +392,6 @@ fn a_cursor_move_names_the_item_and_a_toggle_names_the_mark() {
 
     session.write_bytes(b"\x1b");
     assert!(!session.kill_if_alive(Duration::from_secs(5)));
-}
-
-/// Beats 3 and 4 of a silence proof: listen long enough to believe the
-/// silence, then prove the session could still have spoken.
-fn assert_silent_then_alive(
-    session: &PtySession,
-    terminal: &mut FakeTerminal,
-    then: (&[u8], &[u8]),
-) {
-    let quiet = drain_for(session, SILENCE_WINDOW);
-    assert!(
-        quiet.is_empty(),
-        "a key that changed nothing wrote {:?}",
-        String::from_utf8_lossy(&quiet),
-    );
-    // An empty drain and a dead process look identical. This is the
-    // difference.
-    press_and_hear(session, terminal, then.0, then.1);
 }
 
 #[test]
