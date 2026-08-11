@@ -2,6 +2,38 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.20.0](https://github.com/kevinswiber/ratto/compare/f35f93c5189bc1a3f25496d36325f072643ae473..v0.20.0) - 2026-08-11
+#### Features
+- give the cursor key back to boards that have no cursor - ([2f731cc](https://github.com/kevinswiber/ratto/commit/2f731cc05c189665c9b0466e77c6471d403e1645)) - [@kevinswiber](https://github.com/kevinswiber)
+- make the line cursor something a pane asks for - ([fb314ae](https://github.com/kevinswiber/ratto/commit/fb314ae7a76a8af0b4f8ef6fb62225c86559c057)) - [@kevinswiber](https://github.com/kevinswiber)
+- let a pane say its body is a picture rather than a list - ([335be47](https://github.com/kevinswiber/ratto/commit/335be47142ecc4467a7657407a759fab530e8bcd)) - [@kevinswiber](https://github.com/kevinswiber)
+- make the selection absent when there is none, and clean when there is - ([35a95ef](https://github.com/kevinswiber/ratto/commit/35a95ef813c9667d025b3312391235c5b33e9b43)) - [@kevinswiber](https://github.com/kevinswiber)
+- hand a key-action the line the reader was looking at - ([43d08aa](https://github.com/kevinswiber/ratto/commit/43d08aa36ea254fd73bc578617108b1ea98fb132)) - [@kevinswiber](https://github.com/kevinswiber)
+- say where the cursor is on the row that already names the pane - ([e5bf6be](https://github.com/kevinswiber/ratto/commit/e5bf6be2a91e72ba46fe478a824a482bd6fbb482)) - [@kevinswiber](https://github.com/kevinswiber)
+- keep the marked row on screen by moving the pane's own window - ([8370129](https://github.com/kevinswiber/ratto/commit/8370129b2024b7d763efab60808765c784c17de1)) - [@kevinswiber](https://github.com/kevinswiber)
+- mark the cursor's row in the pane the reader is looking at - ([4ef307b](https://github.com/kevinswiber/ratto/commit/4ef307bb8f587ae73057b28df3b178c43f0bd586)) - [@kevinswiber](https://github.com/kevinswiber)
+- put the line cursor on the bottom rung of the Esc ladder - ([f9dca81](https://github.com/kevinswiber/ratto/commit/f9dca81185cb6fc164695c60a0294958d7826fb1)) - [@kevinswiber](https://github.com/kevinswiber)
+- let a raised cursor take the movement keys from the pane's window - ([c767cf7](https://github.com/kevinswiber/ratto/commit/c767cf70cceb4eb89193bef4ef439918aadf1b08)) - [@kevinswiber](https://github.com/kevinswiber)
+- give the focused pane a line cursor the reader can raise - ([11bf129](https://github.com/kevinswiber/ratto/commit/11bf12920eece8c3a2c477bc4deec5793c007f20)) - [@kevinswiber](https://github.com/kevinswiber)
+- reconcile a pane's selected line where its window is reconciled - ([05440d1](https://github.com/kevinswiber/ratto/commit/05440d1e877574c3b4275a06f32e9b2854ffc4ab)) - [@kevinswiber](https://github.com/kevinswiber)
+- give each pane a selected line the repaint gate can see - ([492dfc0](https://github.com/kevinswiber/ratto/commit/492dfc041445c96b1a95eeeed6afb600beb5349c)) - [@kevinswiber](https://github.com/kevinswiber)
+- give the key-actions example a cmd.exe twin - ([f35f93c](https://github.com/kevinswiber/ratto/commit/f35f93c5189bc1a3f25496d36325f072643ae473)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- give a zoomed pane its scroll keys back while it is collapsed - ([5fca141](https://github.com/kevinswiber/ratto/commit/5fca1413c4d4bc0252797d0fadc9950e2af45f44)) - [@kevinswiber](https://github.com/kevinswiber)
+- answer the cursor key from one list instead of two derivations - ([62274c9](https://github.com/kevinswiber/ratto/commit/62274c9a3cbfb4b98d143d5c7806ce1bb97e0ddb)) - [@kevinswiber](https://github.com/kevinswiber)
+- stop a pane inheriting a selection, and a dead key claiming a letter - ([7d6cf61](https://github.com/kevinswiber/ratto/commit/7d6cf6131f6556b4756da8b282975c93101d23f9)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- say which clip the export does not consult - ([bb2e64a](https://github.com/kevinswiber/ratto/commit/bb2e64a0ee2c48373d850ef77c3560d4dadb410e)) - [@kevinswiber](https://github.com/kevinswiber)
+- name the cursor key only where pressing it does something - ([573a193](https://github.com/kevinswiber/ratto/commit/573a193f56fda2299026fa2606a9391a4680ca0d)) - [@kevinswiber](https://github.com/kevinswiber)
+- say which panes hold lines worth marking - ([78f98af](https://github.com/kevinswiber/ratto/commit/78f98af52472dbb1e43b12dd50f712b0393d85c0)) - [@kevinswiber](https://github.com/kevinswiber)
+- record what the mark does not reach, and where the gap actually is - ([8223ddc](https://github.com/kevinswiber/ratto/commit/8223ddc6c79b0b2bfc96a21a83ce3451673f16e0)) - [@kevinswiber](https://github.com/kevinswiber)
+- teach the three surfaces that a pane can carry a cursor - ([f1be834](https://github.com/kevinswiber/ratto/commit/f1be8346ee34db2acb2ac4d104bf1c52ab83c8e5)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Refactoring
+- name the exported variables for the cursor, not a selection - ([b0e08bf](https://github.com/kevinswiber/ratto/commit/b0e08bf2524c7f07d1fc040211e0588c1b8d7b4e)) - [@kevinswiber](https://github.com/kevinswiber)
+- name the reanchor for the view it reconciles, not the scrolls - ([622a242](https://github.com/kevinswiber/ratto/commit/622a242209395d51c89d12fe724f7857b3df1789)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.19.0](https://github.com/kevinswiber/ratto/compare/26ad3ed1599f04fe47c7ea0b941e10bad99bdd72..v0.19.0) - 2026-08-10
 #### Features
 - ship a worked key-actions example and arm the review console - ([6234b95](https://github.com/kevinswiber/ratto/commit/6234b95299c5870e3534e2d7a9be8953b069e8f3)) - [@kevinswiber](https://github.com/kevinswiber)
