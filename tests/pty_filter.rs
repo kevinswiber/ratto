@@ -17,10 +17,11 @@ fn rat_bin() -> String {
 /// row, so hearing it has consumed the block, and it sits past the
 /// terminal's echo of this test's own item bytes — so no test after the
 /// opening block has to think about the echo at all.
-const KEYS_ONE: &[u8] = b"type to filter, up and down move, enter chooses, escape cancels\r\n";
+const KEYS_ONE: &[u8] =
+    b"type to filter, up and down move, enter chooses, escape cancels, control o says where you are\r\n";
 #[allow(dead_code)]
 const KEYS_MULTI: &[u8] =
-    b"type to filter, up and down move, tab selects, enter confirms, escape cancels\r\n";
+    b"type to filter, up and down move, tab selects, enter confirms, escape cancels, control o says where you are, control t says what you selected\r\n";
 
 /// One quiescence interval plus one poll slice, plus margin for a loaded
 /// CI box. There is no library target to import those constants from, so
@@ -679,4 +680,27 @@ fn pressing_escape_cancels_and_prints_nothing() {
         "{:?}",
         String::from_utf8_lossy(&tail)
     );
+}
+
+#[test]
+fn both_questions_are_answered_mid_query_and_the_query_is_untouched() {
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit"]);
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    // A row shape no echo of this test's own bytes can produce.
+    press_and_hear(&session, &mut terminal, b"ap", b"ap, 2 matches, apple\r\n");
+
+    // Only the driver can write these: the reducers have no vocabulary
+    // at all, so this is the arm that fails against a missing intercept.
+    // Two writes rather than one — each chord answers immediately and
+    // independently, so nothing here needs a pending row.
+    press_and_hear(&session, &mut terminal, b"\x0f", b"apple 1 of 2\r\n");
+    press_and_hear(&session, &mut terminal, b"\x14", b"nothing selected\r\n");
+
+    // And the query took the `r` and nothing else: neither chord reached
+    // the editor.
+    press_and_hear(&session, &mut terminal, b"r", b"apr, 1 match, apricot\r\n");
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(5));
 }

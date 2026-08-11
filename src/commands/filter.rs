@@ -219,6 +219,33 @@ impl UiApp for FilterApp {
         None
     }
 
+    fn speak_orientation(&self) -> Vec<String> {
+        if self.state.matches.is_empty() {
+            return vec![NO_MATCHES.to_string()];
+        }
+        // The count is MATCHES: the cursor indexes them, so counting
+        // candidates would be a number the cursor does not mean.
+        vec![format!(
+            "{} {} of {}",
+            self.cursor_item(),
+            self.state.cursor + 1,
+            self.state.matches.len()
+        )]
+    }
+
+    fn speak_selection(&self) -> Vec<String> {
+        let marked = self.state.selected.iter().filter(|m| **m).count();
+        if marked == 0 {
+            return vec!["nothing selected".to_string()];
+        }
+        // The reducer's own list of what is tagged, which is what the
+        // printed line names too.
+        vec![format!(
+            "{marked} selected, {}",
+            self.state.results().join(", ")
+        )]
+    }
+
     fn speak_closing(&self, outcome: &AppResult) -> Vec<String> {
         match outcome {
             Ok(()) => {
@@ -254,11 +281,12 @@ impl UiApp for FilterApp {
             .iter()
             .map(|m| self.state.items[m.index].clone())
             .collect();
-        let keys = if self.multi {
+        let verbs = if self.multi {
             "type to filter, up and down move, tab selects, enter confirms, escape cancels"
         } else {
             "type to filter, up and down move, enter chooses, escape cancels"
         };
+        let keys = format!("{verbs}{}", crate::ui::echo::on_demand_clause(self.multi));
         let position = if listed.is_empty() {
             // The same phrase a settled query uses, so a reader meets it
             // once. There is no first of nothing.
@@ -273,7 +301,7 @@ impl UiApp for FilterApp {
             self.header.as_deref().unwrap_or(""),
             &listed,
             &position,
-            keys,
+            &keys,
         )
     }
 
@@ -346,6 +374,39 @@ mod tests {
 
     use super::*;
     use crate::theme::{Appearance, AppearanceSource};
+
+    #[test]
+    fn the_on_demand_rows_count_matches_rather_than_candidates() {
+        // Three candidates, a query narrowing to two: an implementation
+        // that counted candidates says `1 of 3`, and the cursor indexes
+        // matches, so that would be a number the cursor does not mean.
+        let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let mut a = app(dark);
+        a.state = FilterState::new(
+            vec!["alpha".into(), "beta".into(), "apricot".into()],
+            Some(1),
+            5,
+            true,
+            true,
+            "ap".into(),
+        );
+        assert_eq!(a.speak_orientation(), ["apricot 1 of 2"]);
+        assert_eq!(a.speak_selection(), ["nothing selected"]);
+
+        a.state.on_key(Key::Tab);
+        assert_eq!(a.speak_selection(), ["1 selected, apricot"]);
+
+        let mut none = app(dark);
+        none.state = FilterState::new(
+            vec!["alpha".into(), "beta".into()],
+            Some(1),
+            5,
+            true,
+            true,
+            "zz".into(),
+        );
+        assert_eq!(none.speak_orientation(), ["no matches"]);
+    }
 
     #[test]
     fn every_way_the_session_can_end_answers_for_itself() {

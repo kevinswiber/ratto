@@ -80,11 +80,12 @@ impl ChooseApp {
     }
 
     fn keys_row(&self) -> String {
-        if self.multi {
-            "up and down move, space selects, enter confirms, escape cancels".to_string()
+        let verbs = if self.multi {
+            "up and down move, space selects, enter confirms, escape cancels"
         } else {
-            "up and down move, enter chooses, escape cancels".to_string()
-        }
+            "up and down move, enter chooses, escape cancels"
+        };
+        format!("{verbs}{}", crate::ui::echo::on_demand_clause(self.multi))
     }
 }
 
@@ -156,6 +157,30 @@ impl UiApp for ChooseApp {
 
     fn speak(&self, before: &EchoSnapshot) -> Option<String> {
         choose_transition(before, &self.echo_snapshot(), &self.state.items)
+    }
+
+    fn speak_orientation(&self) -> Vec<String> {
+        let Some(item) = self.state.items.get(self.state.cursor) else {
+            return vec!["no options".to_string()];
+        };
+        vec![format!(
+            "{item} {} of {}",
+            self.state.cursor + 1,
+            self.state.items.len()
+        )]
+    }
+
+    fn speak_selection(&self) -> Vec<String> {
+        let marked = self.state.selected.iter().filter(|m| **m).count();
+        if marked == 0 {
+            // The zero member of one grammar, not a separate sentence.
+            return vec!["nothing selected".to_string()];
+        }
+        // The same accessor the closing row reads, so the tagged set is
+        // named in the order it will be printed. It falls back to the
+        // cursor item only when nothing is marked, which the guard above
+        // has already answered.
+        vec![format!("{marked} selected, {}", self.results().join(", "))]
     }
 
     fn speak_closing(&self, outcome: &AppResult) -> Vec<String> {
@@ -379,6 +404,39 @@ mod tests {
     }
 
     #[test]
+    fn the_orientation_row_names_the_item_and_where_it_sits() {
+        let mut a = app(&["alpha", "beta", "gamma", "delta"], false, "Choose:");
+        a.state.cursor = 1;
+        assert_eq!(a.speak_orientation(), ["beta 2 of 4"]);
+        a.state.cursor = 0;
+        assert_eq!(a.speak_orientation(), ["alpha 1 of 4"]);
+        assert_eq!(
+            app(&[], false, "Choose:").speak_orientation(),
+            ["no options"]
+        );
+    }
+
+    #[test]
+    fn the_selection_row_leads_with_the_count() {
+        // Nothing toggled, cursor on beta. Enter WOULD take beta, and the
+        // tagged set is still empty — two questions, two answers, and
+        // asserting them together is what stops the next reader from
+        // "fixing" one of them.
+        let mut a = app(&["alpha", "beta", "gamma", "delta"], false, "Choose:");
+        a.state.cursor = 1;
+        assert_eq!(a.speak_selection(), ["nothing selected"]);
+        assert_eq!(a.speak_orientation(), ["beta 2 of 4"]);
+
+        let mut one = app(&["alpha", "beta", "gamma", "delta"], true, "Choose:");
+        one.state.cursor = 1;
+        one.state.on_key(Key::Space);
+        assert_eq!(one.speak_selection(), ["1 selected, beta"]);
+        one.state.cursor = 3;
+        one.state.on_key(Key::Space);
+        assert_eq!(one.speak_selection(), ["2 selected, beta, delta"]);
+    }
+
+    #[test]
     fn the_closing_row_names_what_was_chosen_in_the_order_it_prints() {
         let mut a = app(&["alpha", "beta", "gamma", "delta"], true, "Choose:");
         a.state.cursor = 1;
@@ -466,7 +524,7 @@ mod tests {
                 "gamma",
                 "delta",
                 "1 of 4",
-                "up and down move, enter chooses, escape cancels",
+                "up and down move, enter chooses, escape cancels, control o says where you are",
             ]
         );
 
@@ -479,7 +537,7 @@ mod tests {
                 "gamma",
                 "delta",
                 "1 of 4",
-                "up and down move, space selects, enter confirms, escape cancels",
+                "up and down move, space selects, enter confirms, escape cancels, control o says where you are, control t says what you selected",
             ]
         );
     }
@@ -504,7 +562,10 @@ mod tests {
     fn an_empty_list_has_no_first_of_nothing() {
         assert_eq!(
             app(&[], false, "Choose:").speak_opening(),
-            ["Choose:", "up and down move, enter chooses, escape cancels",]
+            [
+                "Choose:",
+                "up and down move, enter chooses, escape cancels, control o says where you are",
+            ]
         );
     }
 

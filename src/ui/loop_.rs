@@ -105,6 +105,23 @@ fn park_target(cursor: Option<(u16, u16)>, cols: u16, height: u16) -> Option<(u1
     cursor.filter(|&(col, row)| col < cols && row < height)
 }
 
+/// The two questions the transcript answers itself. The transcript
+/// only: a painted session has a screen, and both keys are unbound in
+/// every reducer, so a painted press stays the no-op it has always been.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum OnDemand {
+    Orientation,
+    Selection,
+}
+
+fn on_demand(mode: UiMode, key: Key) -> Option<OnDemand> {
+    match (mode, key) {
+        (UiMode::Echo, Key::CtrlO) => Some(OnDemand::Orientation),
+        (UiMode::Echo, Key::CtrlT) => Some(OnDemand::Selection),
+        _ => None,
+    }
+}
+
 /// Rank the two ways of asking for a transcript against the one way of
 /// refusing one. The refusal wins outright. Otherwise the request
 /// decides, and it arrives in three states, not two: nobody asked, or
@@ -223,6 +240,33 @@ pub fn run_ui_mode<A: UiApp>(
                 if key == Key::CtrlC {
                     break Err(AppError::Aborted);
                 }
+                if let Some(question) = on_demand(mode, key)
+                    && let UiSink::Echo(out) = &mut sink
+                {
+                    // Answered HERE, not by a reducer arm. The filter
+                    // hands every key it does not name to the query
+                    // editor, so a reducer arm would have to outrank
+                    // that catch-all in three surfaces and stay ahead of
+                    // it forever. Consuming the key before `on_key` is
+                    // called makes the ordering a property of the code
+                    // rather than a convention.
+                    //
+                    // The pending row goes FIRST: it describes the state
+                    // this answer is about, and written the other way
+                    // round the move arrives after the answer and reads
+                    // as a second move. A deadline already past forces
+                    // it out with no addition to the burst policy's own
+                    // vocabulary.
+                    if let Some(row) = coalescer.take_if_due(now + ECHO_QUIESCENCE) {
+                        echo_rows(out, &[row])?;
+                    }
+                    let rows = match question {
+                        OnDemand::Orientation => app.speak_orientation(),
+                        OnDemand::Selection => app.speak_selection(),
+                    };
+                    echo_rows(out, &rows)?;
+                    continue;
+                }
                 // The state as it was, so the transcript can say what
                 // the key did. Only the transcript needs it, and only
                 // the transcript pays for the clone.
@@ -301,6 +345,34 @@ mod tests {
     #[test]
     fn no_caret_stays_no_caret() {
         assert_eq!(park_target(None, 20, 2), None);
+    }
+
+    #[test]
+    fn only_two_keys_are_answered_by_the_driver_and_only_in_the_transcript() {
+        assert_eq!(
+            on_demand(UiMode::Echo, Key::CtrlO),
+            Some(OnDemand::Orientation)
+        );
+        assert_eq!(
+            on_demand(UiMode::Echo, Key::CtrlT),
+            Some(OnDemand::Selection)
+        );
+        // The painted session answers nothing: it has a screen, and both
+        // keys are unbound in every reducer, so a painted press is the
+        // no-op it has always been.
+        assert_eq!(on_demand(UiMode::Painted, Key::CtrlO), None);
+        assert_eq!(on_demand(UiMode::Painted, Key::CtrlT), None);
+        // The whole spellable space plus the other five chords, in both
+        // modes. A checklist of keys we thought of would not notice the
+        // day someone widens the match.
+        let others = crate::core::key_spelling::ascii_spellable()
+            .into_iter()
+            .chain([Key::CtrlA, Key::CtrlC, Key::CtrlE, Key::CtrlU, Key::CtrlW]);
+        for key in others {
+            for mode in [UiMode::Painted, UiMode::Echo] {
+                assert_eq!(on_demand(mode, key), None, "{key:?} in {mode:?}");
+            }
+        }
     }
 
     #[test]

@@ -79,8 +79,10 @@ fn between<'a>(haystack: &'a [u8], open: &[u8], close: &[u8]) -> &'a [u8] {
 /// the sum does not measure silence — it measures a row still in flight.
 const SILENCE_WINDOW: Duration = Duration::from_millis(1000);
 
-const KEYS_ONE: &[u8] = b"up and down move, enter chooses, escape cancels\r\n";
-const KEYS_MULTI: &[u8] = b"up and down move, space selects, enter confirms, escape cancels\r\n";
+const KEYS_ONE: &[u8] =
+    b"up and down move, enter chooses, escape cancels, control o says where you are\r\n";
+const KEYS_MULTI: &[u8] =
+    b"up and down move, space selects, enter confirms, escape cancels, control o says where you are, control t says what you selected\r\n";
 
 /// Run a choose session that is expected to paint, and return the bytes
 /// of its first frame. Shuts the session down before returning, so a
@@ -789,4 +791,73 @@ fn a_move_inside_the_debounce_window_is_dropped_by_the_key_that_ends_it() {
     );
 
     session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn an_answer_never_arrives_before_the_row_it_answers_about() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "alpha", "beta", "gamma", "delta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    // ONE write, deliberately: the second key must land inside the
+    // quiescence window while the first key's row is still pending, and
+    // that pending row is the only state this test can measure. Reading
+    // the first row back before sending the second — the rule everywhere
+    // else in this suite — would destroy it and the test would pass
+    // against the bug.
+    //
+    // The first needle carries its terminator so `beta` cannot match
+    // inside `beta 2 of 4` and satisfy the chain backwards.
+    session.write_bytes(b"\x1b[B\x0f");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"beta\r\n", b"beta 2 of 4\r\n"],
+        Duration::from_secs(5),
+    );
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+/// Spawn, hear the whole opening block, leave, and hand back everything
+/// the session wrote.
+fn transcript(args: &[&str]) -> Vec<u8> {
+    let mut argv = vec!["choose", "--accessible"];
+    argv.extend_from_slice(args);
+    let session =
+        PtySession::spawn(&rat_bin(), &argv, &[("RAT_APPEARANCE", "dark")]).expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    let mut seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"escape cancels"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"\x1b");
+    seen.extend(drain_for(&session, Duration::from_millis(600)));
+    session.kill_if_alive(Duration::from_secs(5));
+    seen
+}
+
+#[test]
+fn the_keys_row_names_the_on_demand_keys_once() {
+    // The clause is these keys' only advertisement, and the keys row is
+    // written once — so is the clause. A count, not a containment check:
+    // the failure worth catching is a SECOND copy, which containment
+    // passes.
+    let multi = transcript(&["--no-limit", "alpha", "beta", "gamma", "delta"]);
+    assert_eq!(count(&multi, b"control o says where you are"), 1);
+    assert_eq!(count(&multi, b"control t says what you selected"), 1);
+
+    // A single selection advertises only the first: with one selection
+    // the tagged-set key answers the zero member almost every press.
+    let single = transcript(&["alpha", "beta", "gamma", "delta"]);
+    assert_eq!(count(&single, b"control o says where you are"), 1);
+    assert_eq!(count(&single, b"control t says what you selected"), 0);
 }

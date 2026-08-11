@@ -39,7 +39,11 @@ impl ConfirmApp {
     /// reader announces, so the transcript spells the keys and separates
     /// them with the one punctuation the vocabulary allows.
     fn keys_row(&self) -> String {
-        "left and right move, y and n answer, enter chooses, escape cancels".to_string()
+        format!(
+            "left and right move, y and n answer, enter chooses, escape cancels{}",
+            // There is no marked set to have here.
+            crate::ui::echo::on_demand_clause(false)
+        )
     }
 }
 
@@ -97,6 +101,22 @@ impl UiApp for ConfirmApp {
             self.label(),
             &self.keys_row(),
         )
+    }
+
+    fn speak_orientation(&self) -> Vec<String> {
+        vec![format!(
+            "{} {} of 2",
+            self.label(),
+            usize::from(!self.state.affirmative) + 1
+        )]
+    }
+
+    fn speak_selection(&self) -> Vec<String> {
+        // There is no marked set here and an answer is always active, so
+        // the zero member of the grammar would be false. One grammar
+        // across the surfaces, and a bare label would be byte-identical
+        // to this surface's own toggle row.
+        vec![format!("1 selected, {}", self.label())]
     }
 
     fn speak_closing(&self, outcome: &AppResult) -> Vec<String> {
@@ -162,6 +182,16 @@ mod tests {
             negative: "No".into(),
             palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
         }
+    }
+
+    #[test]
+    fn the_on_demand_rows_name_the_armed_answer() {
+        assert_eq!(app(true).speak_orientation(), ["Yes 1 of 2"]);
+        assert_eq!(app(false).speak_orientation(), ["No 2 of 2"]);
+        // There is no marked set here, and an answer is always active —
+        // so "nothing selected" would be false.
+        assert_eq!(app(true).speak_selection(), ["1 selected, Yes"]);
+        assert_eq!(app(false).speak_selection(), ["1 selected, No"]);
     }
 
     #[test]

@@ -116,6 +116,26 @@ pub fn flatten_row(text: &str) -> String {
     out
 }
 
+/// What a keys row gains once the on-demand keys exist. The rows
+/// themselves differ by surface; the questions these two keys answer do
+/// not, so the clause is written once and appended by each.
+///
+/// The tagged-set key is advertised only where there is a set to have:
+/// with a single selection it answers the zero member almost every time
+/// it is pressed, and naming it there spends spoken words on a
+/// non-answer. It still ANSWERS everywhere; only the advertisement is
+/// scoped.
+///
+/// The leading comma lives here so the three callers concatenate and
+/// make no punctuation decision of their own.
+pub fn on_demand_clause(multi: bool) -> &'static str {
+    if multi {
+        ", control o says where you are, control t says what you selected"
+    } else {
+        ", control o says where you are"
+    }
+}
+
 /// How many items an opening block lists before it stops naming them and
 /// says how many there are. A starting value: the blocks measured in use
 /// were a handful of rows, and a list of eight hundred branches must not

@@ -19,7 +19,8 @@ fn rat_bin() -> String {
 /// unambiguous: confirm's transition rows are byte-identical to its
 /// opening rows, so a wait that has heard the keys row has necessarily
 /// consumed the whole block and left nothing behind to satisfy one.
-const KEYS_ROW: &[u8] = b"left and right move, y and n answer, enter chooses, escape cancels\r\n";
+const KEYS_ROW: &[u8] =
+    b"left and right move, y and n answer, enter chooses, escape cancels, control o says where you are\r\n";
 
 /// One quiescence interval plus one poll slice, plus margin for a
 /// loaded CI box. There is no library target to import those constants
