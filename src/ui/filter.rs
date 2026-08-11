@@ -147,6 +147,36 @@ mod tests {
     }
 
     #[test]
+    fn the_on_demand_chords_never_reach_the_query() {
+        let mut st = state(&["alpha", "beta", "apricot"]);
+        st.on_key(Key::Char('a'));
+        st.on_key(Key::Char('p'));
+        let before = (
+            st.query.value.clone(),
+            st.query.cursor,
+            st.cursor,
+            st.selected.clone(),
+            st.matches.iter().map(|m| m.index).collect::<Vec<_>>(),
+        );
+        for key in [Key::CtrlO, Key::CtrlT] {
+            assert_eq!(st.on_key(key), Outcome::Continue, "{key:?}");
+        }
+        // The match list is in the tuple deliberately: this reducer's
+        // catch-all re-runs the filter whenever the query moved, so the
+        // failure this guards is a silently reordered list, not a panic.
+        assert_eq!(
+            (
+                st.query.value.clone(),
+                st.query.cursor,
+                st.cursor,
+                st.selected.clone(),
+                st.matches.iter().map(|m| m.index).collect::<Vec<_>>(),
+            ),
+            before
+        );
+    }
+
+    #[test]
     fn typing_narrows_and_resets_the_cursor() {
         let mut st = state(&["apple", "banana", "apricot"]);
         st.on_key(Key::Down);

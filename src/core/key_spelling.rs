@@ -157,6 +157,8 @@ pub fn spelling_of(key: Key) -> String {
         Key::CtrlE => "Ctrl-e".to_string(),
         Key::CtrlU => "Ctrl-u".to_string(),
         Key::CtrlW => "Ctrl-w".to_string(),
+        Key::CtrlO => "Ctrl-o".to_string(),
+        Key::CtrlT => "Ctrl-t".to_string(),
         Key::Backspace => "Backspace".to_string(),
         Key::Delete => "Delete".to_string(),
         Key::Up
@@ -554,12 +556,14 @@ mod tests {
 
     #[test]
     fn no_control_chord_is_spellable() {
-        // The vocabulary has five, and the unix tap delivers exactly one
-        // of them (`Ctrl-c`, `tap.rs:193`) — which every board already
-        // uses to abort. There is no chord a binding could take, so the
+        // The vocabulary has seven, and the unix tap delivers exactly
+        // one of them (`Ctrl-c`, `tap.rs:193`) — which every board
+        // already uses to abort. Two of the seven are read only by the
+        // pickers' own driver, through crossterm, and are as unspellable
+        // as the rest: there is no chord a binding could take, so the
         // whole form is out rather than narrowed to a single claimed key.
         for spelling in [
-            "Ctrl-a", "Ctrl-c", "Ctrl-e", "Ctrl-u", "Ctrl-w", "Ctrl-x", "Ctrl-",
+            "Ctrl-a", "Ctrl-c", "Ctrl-e", "Ctrl-o", "Ctrl-t", "Ctrl-u", "Ctrl-w", "Ctrl-x", "Ctrl-",
         ] {
             let err = refused(spelling);
             assert!(

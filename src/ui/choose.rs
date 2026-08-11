@@ -138,6 +138,20 @@ mod tests {
     }
 
     #[test]
+    fn the_on_demand_chords_do_nothing_to_a_list() {
+        let mut st = ChooseState::new(items(3), None, 10);
+        st.cursor = 1;
+        let before = (st.cursor, st.offset, st.selected.clone());
+        for key in [Key::CtrlO, Key::CtrlT] {
+            // The outcome is half the assertion: a reducer that answered
+            // a submit would exit the picker with the state intact, and
+            // an unchanged-state check alone would call that inert.
+            assert_eq!(st.on_key(key), Outcome::Continue, "{key:?}");
+        }
+        assert_eq!((st.cursor, st.offset, st.selected.clone()), before);
+    }
+
+    #[test]
     fn cursor_clamps_at_both_ends() {
         let mut st = ChooseState::new(items(3), Some(1), 10);
         assert_eq!(st.on_key(Key::Up), Outcome::Continue);

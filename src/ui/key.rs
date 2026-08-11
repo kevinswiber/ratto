@@ -28,6 +28,11 @@ pub enum Key {
     CtrlE,
     CtrlU,
     CtrlW,
+    /// Read by the transcript driver only. Both chords fell through the
+    /// control match to `None` before they were named, so no reducer has
+    /// ever received either — naming them takes nothing away.
+    CtrlO,
+    CtrlT,
     Char(char),
 }
 
@@ -54,6 +59,8 @@ pub fn from_crossterm(ev: KeyEvent) -> Option<Key> {
             KeyCode::Char('e') => Some(Key::CtrlE),
             KeyCode::Char('u') => Some(Key::CtrlU),
             KeyCode::Char('w') => Some(Key::CtrlW),
+            KeyCode::Char('o') => Some(Key::CtrlO),
+            KeyCode::Char('t') => Some(Key::CtrlT),
             _ => None,
         };
     }
@@ -101,6 +108,40 @@ mod tests {
         assert_eq!(
             from_crossterm(press(KeyCode::Char('u'), KeyModifiers::CONTROL)),
             Some(Key::CtrlU)
+        );
+    }
+
+    #[test]
+    fn the_two_on_demand_chords_map_to_their_own_keys() {
+        // Both fell through to `None` at the control match's catch-all
+        // before this, so no reducer has ever received either byte —
+        // which is what makes them additive rather than a re-binding.
+        assert_eq!(
+            from_crossterm(press(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Some(Key::CtrlO)
+        );
+        assert_eq!(
+            from_crossterm(press(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            Some(Key::CtrlT)
+        );
+        // The unmodified spellings are untouched: `o` and `t` are plain
+        // characters, and the frame reader binds `t`. An arm written
+        // without the modifier guard would take a shipped key away.
+        assert_eq!(
+            from_crossterm(press(KeyCode::Char('o'), KeyModifiers::NONE)),
+            Some(Key::Char('o'))
+        );
+        assert_eq!(
+            from_crossterm(press(KeyCode::Char('t'), KeyModifiers::NONE)),
+            Some(Key::Char('t'))
+        );
+        // Alt-and-control stays a third chord bound to neither.
+        assert_eq!(
+            from_crossterm(press(
+                KeyCode::Char('o'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            )),
+            None
         );
     }
 

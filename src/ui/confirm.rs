@@ -43,6 +43,19 @@ mod tests {
     use crate::ui::loop_::Outcome;
 
     #[test]
+    fn the_on_demand_chords_do_nothing_to_an_answer() {
+        // From both sides: a one-bit state tested from one side would
+        // pass against a reducer that SET the bit.
+        for start in [true, false] {
+            let mut st = ConfirmState { affirmative: start };
+            for key in [Key::CtrlO, Key::CtrlT] {
+                assert_eq!(st.on_key(key), Outcome::Continue, "{key:?}");
+                assert_eq!(st.affirmative, start, "{key:?} from {start}");
+            }
+        }
+    }
+
+    #[test]
     fn y_and_n_submit_immediately() {
         let mut st = ConfirmState { affirmative: true };
         assert_eq!(st.on_key(Key::Char('n')), Outcome::Submit);
