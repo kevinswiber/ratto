@@ -60,7 +60,9 @@ fn real_main() -> i32 {
     let mode = ui::loop_::resolve_ui_mode(cli.no_accessible, cli.accessible);
     // Asked at most once per process, here, before any command runs and long
     // before anything claims raw mode. Commands never ask.
-    let detected = if theme::may_detect(cli.appearance, profile) {
+    let detected = if !speaks_instead_of_painting(&cli.command, mode)
+        && theme::may_detect(cli.appearance, profile)
+    {
         term::appearance::probe(theme::PROBE_TIMEOUT)
             .map(|a| (a, theme::AppearanceSource::Osc))
             .or_else(|| {
@@ -85,6 +87,24 @@ fn real_main() -> i32 {
             err.code()
         }
     }
+}
+
+/// Whether this process will speak its UI instead of painting it — the
+/// only case where the startup appearance query buys nothing, because
+/// nothing will read the palette it answers.
+///
+/// The transcript reaches three commands. Every other command paints
+/// exactly as it always did, however the variable is set: a reader who
+/// exports it in their shell profile must not find their tables and
+/// dashboards quietly re-coloured. The list below and dispatch's arms
+/// below IT differ by one: the diagnostic receives the mode so it can
+/// report it, and keeps painting.
+fn speaks_instead_of_painting(command: &Command, mode: UiMode) -> bool {
+    mode == UiMode::Echo
+        && matches!(
+            command,
+            Command::Choose(_) | Command::Confirm(_) | Command::Filter(_)
+        )
 }
 
 fn dispatch(
@@ -222,6 +242,65 @@ fn dispatch(
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn command_of(args: &[&str]) -> Command {
+        let mut argv = vec!["rat"];
+        argv.extend_from_slice(args);
+        Cli::parse_from(argv).command
+    }
+
+    #[test]
+    fn only_the_spoken_pickers_skip_the_startup_query() {
+        // The three the transcript reaches.
+        for args in [
+            &["choose", "alpha"][..],
+            &["confirm", "Ship it?"],
+            &["filter"],
+        ] {
+            let command = command_of(args);
+            assert!(
+                speaks_instead_of_painting(&command, UiMode::Echo),
+                "{args:?}"
+            );
+            assert!(
+                !speaks_instead_of_painting(&command, UiMode::Painted),
+                "{args:?}"
+            );
+        }
+        // The diagnostic RECEIVES the mode — dispatch hands it over so
+        // the report can name it — and still paints. It exists to say
+        // what this terminal does, so one that stopped asking would
+        // report the default palette on a light terminal to the one
+        // person who ran it to find out why. This row is why the
+        // predicate is not a copy of dispatch's arm list.
+        assert!(!speaks_instead_of_painting(
+            &command_of(&["doctor"]),
+            UiMode::Echo
+        ));
+        // And every other command paints however the variable is set: a
+        // reader who exports it in their profile must not find their
+        // tables and dashboards quietly re-coloured.
+        for args in [
+            &["style", "x"][..],
+            &["table"],
+            &["watch", "--", "true"],
+            &["input"],
+            &["spin", "--", "true"],
+            &["bar"],
+        ] {
+            assert!(
+                !speaks_instead_of_painting(&command_of(args), UiMode::Echo),
+                "{args:?}"
+            );
         }
     }
 }

@@ -1147,3 +1147,80 @@ fn the_result_reaches_a_command_substitution_in_both_modes() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The three queries the startup appearance detection writes, matched as
+/// prefixes: the terminator is either a bell or a string terminator
+/// depending on how the library was built, and pinning the one we happen
+/// to observe would make an upstream detail a contract.
+const STARTUP_QUERIES: [&[u8]; 3] = [b"\x1b]11", b"\x1b]10", b"\x1b[c"];
+
+/// Spawn at an explicitly automatic appearance and capture everything up
+/// to the end of the session.
+///
+/// NOT `RAT_APPEARANCE=dark`, unlike every other test in this suite:
+/// pinning it turns the appearance mode away from automatic, and the
+/// absence below would then be true for a reason that has nothing to do
+/// with this mode. The automatic setting is passed explicitly for the
+/// same reason — the default is allowed to move.
+///
+/// A terminal is driven even though the spoken arm should never query
+/// it: if the suppression breaks, the query fires, nobody answers, and
+/// the child stalls for the probe's whole timeout — turning a clean
+/// failure into a slow one. Both arms share the fixture, because two
+/// arms that differ in their terminal are not a pair.
+fn appearance_probe_stream(spoken: bool) -> Vec<u8> {
+    let envs: Vec<(&str, &str)> = if spoken {
+        vec![("RAT_ACCESSIBLE", "1")]
+    } else {
+        Vec::new()
+    };
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["--appearance", "auto", "choose", "alpha", "beta"],
+        &envs,
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let mut seen = drain_for(&session, Duration::from_millis(900));
+    session.write_bytes(b"\x1b");
+    seen.extend(drain_for(&session, Duration::from_millis(600)));
+    let _ = &mut terminal;
+    session.kill_if_alive(Duration::from_secs(5));
+    seen
+}
+
+#[test]
+fn a_spoken_session_never_asks_the_terminal_what_colour_it_is() {
+    let seen = appearance_probe_stream(true);
+    for query in STARTUP_QUERIES {
+        assert!(
+            !contains(&seen, query),
+            "the transcript asked the terminal a question: {:?} in {:?}",
+            String::from_utf8_lossy(query),
+            String::from_utf8_lossy(&seen)
+        );
+    }
+    // Liveness, so the absence is not simply a session that never ran.
+    assert!(
+        contains(&seen, b"Choose:\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+#[test]
+fn the_painted_path_still_asks() {
+    // The positive control. Under a terminal the child is a session
+    // leader in the foreground group, so the query's own guard passes and
+    // it really does write — which is what makes the absence above mean
+    // the mode suppressed it, rather than the process dying early, the
+    // guard refusing, or the needle being wrong.
+    let seen = appearance_probe_stream(false);
+    for query in STARTUP_QUERIES {
+        assert!(
+            contains(&seen, query),
+            "the painted path must still ask: {:?}",
+            String::from_utf8_lossy(query)
+        );
+    }
+}
