@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::cli::FilterArgs;
 use crate::color::ColorProfile;
 use crate::core::duration::parse_interval;
-use crate::exit::AppResult;
+use crate::exit::{AppError, AppResult};
 use crate::theme::Palette;
 use crate::ui::echo::EchoSnapshot;
 use crate::ui::filter::FilterState;
@@ -24,6 +24,12 @@ struct FilterApp {
     selected_prefix: String,
     unselected_prefix: String,
     multi: bool,
+    /// `--no-strict`, inverted at construction. It lives here rather
+    /// than in the run because the closing row is spoken from inside the
+    /// driver, where only the app is reachable — and a second copy of
+    /// the print rule is exactly what would disagree on the one arm that
+    /// matters.
+    strict: bool,
     header: Option<String>,
     palette: Palette,
 }
@@ -45,6 +51,42 @@ impl FilterApp {
             1 => format!("{query}, 1 match, {}", self.cursor_item()),
             n => format!("{query}, {n} matches, {}", self.cursor_item()),
         }
+    }
+
+    /// Exactly what this run puts on stdout, in the order it prints
+    /// them: the marked items, else the item under the cursor, else —
+    /// when the reader asked for it — the query they typed. Matching
+    /// gum, a strict run prints nothing when nothing matched and a
+    /// non-strict one returns the query itself.
+    ///
+    /// One function, because the answer is read twice: once to print it
+    /// and once to say it. Derived twice, the two would agree on every
+    /// ordinary run and disagree on exactly the run where the reader
+    /// most needs to be told what happened.
+    fn printed(&self) -> Vec<String> {
+        let results = self.state.results();
+        if !results.is_empty() {
+            return results;
+        }
+        if !self.strict && !self.state.query.value.is_empty() {
+            return vec![self.state.query.value.clone()];
+        }
+        Vec::new()
+    }
+
+    /// The mark that CHANGED, named by what the reader did. A single
+    /// selection clears the old mark as it sets the new one, so two
+    /// entries move at once — report the one that was SET, because that
+    /// is the gesture; the clearing is what a single selection means,
+    /// not a second event.
+    fn mark_row(&self, before: &EchoSnapshot) -> Option<String> {
+        let now = &self.state.selected;
+        let set = before.marked.iter().zip(now).position(|(b, n)| !b && *n);
+        if let Some(idx) = set {
+            return Some(format!("selected {}", self.state.items[idx]));
+        }
+        let clear = before.marked.iter().zip(now).position(|(b, n)| *b && !n);
+        clear.map(|idx| format!("deselected {}", self.state.items[idx]))
     }
 
     /// The item under the cursor. Total by construction: refreshing a
@@ -166,7 +208,40 @@ impl UiApp for FilterApp {
         if before.query != self.state.query.value {
             return Some(self.query_row());
         }
+        if let Some(row) = self.mark_row(before) {
+            return Some(row);
+        }
+        if before.cursor != self.state.cursor {
+            // The match's name and nothing else: the count and the query
+            // were said when the query settled.
+            return Some(self.cursor_item());
+        }
         None
+    }
+
+    fn speak_closing(&self, outcome: &AppResult) -> Vec<String> {
+        match outcome {
+            Ok(()) => {
+                let printed = self.printed();
+                if printed.is_empty() {
+                    vec!["chose nothing".to_string()]
+                } else {
+                    // The vocabulary's comma, never the output
+                    // delimiter — whose default is a newline, which
+                    // would let a result forge a transcript row.
+                    vec![format!("chose {}", printed.join(", "))]
+                }
+            }
+            // Both ways of declining read the same: the reader stopped.
+            Err(AppError::NoSelection) | Err(AppError::Aborted) => vec!["cancelled".to_string()],
+            // The one ending with no keystroke behind it, so the only
+            // place the reader can learn why the session stopped.
+            Err(AppError::Timeout(_)) => vec!["timed out".to_string()],
+            // Not a choice the reader made, and stderr has already said
+            // why. No catch-all arm — the next variant added should have
+            // to answer this question.
+            Err(AppError::Fail(_)) | Err(AppError::Child(_)) => Vec::new(),
+        }
     }
 
     fn speak_opening(&self) -> Vec<String> {
@@ -242,7 +317,6 @@ pub fn run(args: FilterArgs, profile: ColorProfile, palette: Palette, mode: UiMo
     };
     let fuzzy = !args.no_fuzzy;
     let sort = !args.no_fuzzy_sort;
-    let strict = !args.no_strict;
     let state = FilterState::new(items, limit, args.height, fuzzy, sort, args.value.clone());
     let mut app = FilterApp {
         state,
@@ -252,22 +326,17 @@ pub fn run(args: FilterArgs, profile: ColorProfile, palette: Palette, mode: UiMo
         selected_prefix: args.selected_prefix.clone(),
         unselected_prefix: args.unselected_prefix.clone(),
         multi: limit != Some(1),
+        strict: !args.no_strict,
         header: args.header.clone(),
         palette,
     };
     let timeout = args.timeout.as_deref().map(parse_interval).transpose()?;
     run_ui_mode(&mut app, profile, timeout, mode)?;
 
-    let results = app.state.results();
-    if results.is_empty() {
-        // Matching gum: strict mode exits 0 with empty output; non-strict
-        // returns the query itself.
-        if !strict && !app.state.query.value.is_empty() {
-            println!("{}", app.state.query.value);
-        }
-        return Ok(());
+    let printed = app.printed();
+    if !printed.is_empty() {
+        println!("{}", printed.join(out_delim));
     }
-    println!("{}", results.join(out_delim));
     Ok(())
 }
 
@@ -277,6 +346,63 @@ mod tests {
 
     use super::*;
     use crate::theme::{Appearance, AppearanceSource};
+
+    #[test]
+    fn every_way_the_session_can_end_answers_for_itself() {
+        let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        // The seeded query matches one item, so the cursor is on it.
+        assert_eq!(app(dark).speak_closing(&Ok(())), ["chose alpha"]);
+
+        // Nothing matched and nothing printed: a strict run says so.
+        // The query is seeded at construction, which is the only way to
+        // reach a matched-nothing state without reaching into the
+        // reducer.
+        let mut empty = app(dark);
+        empty.state = FilterState::new(
+            vec!["alpha".into(), "beta".into()],
+            Some(1),
+            5,
+            true,
+            true,
+            "zz".into(),
+        );
+        assert_eq!(empty.speak_closing(&Ok(())), ["chose nothing"]);
+
+        // The same state one flag apart: a non-strict run prints the
+        // query, so the row must name it. This is the input where a row
+        // derived from the selection alone disagrees with stdout.
+        let mut loose = app(dark);
+        loose.strict = false;
+        loose.state = FilterState::new(
+            vec!["alpha".into(), "beta".into()],
+            Some(1),
+            5,
+            true,
+            true,
+            "zz".into(),
+        );
+        assert_eq!(loose.speak_closing(&Ok(())), ["chose zz"]);
+        assert_eq!(loose.printed(), ["zz"]);
+
+        let a = app(dark);
+        assert_eq!(a.speak_closing(&Err(AppError::NoSelection)), ["cancelled"]);
+        // Raw mode clears the terminal's signal handling, so this
+        // arrives as a keystroke and the row still gets written.
+        assert_eq!(a.speak_closing(&Err(AppError::Aborted)), ["cancelled"]);
+        assert_eq!(
+            a.speak_closing(&Err(AppError::Timeout(None))),
+            ["timed out"]
+        );
+        assert_eq!(
+            a.speak_closing(&Err(AppError::Timeout(Some(anyhow::anyhow!("waiting"))))),
+            ["timed out"]
+        );
+        assert!(
+            a.speak_closing(&Err(anyhow::anyhow!("boom").into()))
+                .is_empty()
+        );
+        assert!(a.speak_closing(&Err(AppError::Child(7))).is_empty());
+    }
 
     fn app(palette: Palette) -> FilterApp {
         FilterApp {
@@ -294,6 +420,7 @@ mod tests {
             selected_prefix: "[x] ".into(),
             unselected_prefix: "[ ] ".into(),
             multi: false,
+            strict: true,
             header: None,
             palette,
         }
@@ -401,6 +528,7 @@ mod tests {
             selected_prefix: "[x] ".into(),
             unselected_prefix: "[ ] ".into(),
             multi: false,
+            strict: true,
             header: None,
             palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
         };
@@ -433,6 +561,7 @@ mod tests {
             selected_prefix: "[x] ".into(),
             unselected_prefix: "[ ] ".into(),
             multi: true,
+            strict: true,
             header: None,
             palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
         };
@@ -482,6 +611,7 @@ mod tests {
             selected_prefix: "[x] ".into(),
             unselected_prefix: "[ ] ".into(),
             multi: false,
+            strict: true,
             header: None,
             palette,
         };

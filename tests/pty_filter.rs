@@ -432,16 +432,251 @@ fn submitting_inside_the_window_drops_the_row_it_was_holding() {
     // interval: the state at exit is the result, and the row the burst
     // policy was holding is discarded rather than spoken.
     //
-    // This cannot fail against the surface as it stands — nothing is
-    // written on the way out yet — and it is here to make the deliberate
-    // drop EXPLICIT, so a later change that "fixes" the apparent loss by
-    // flushing the pending row on exit fails right here.
+    // A later change that "fixes" the apparent loss by flushing the
+    // pending row on exit fails right here.
     let (session, mut terminal) = spawn_filter(&three_items(), &["--header", "Items"]);
-    let rows = burst_and_rows(&session, &mut terminal, b"alpha\r");
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+    session.write_bytes(b"alpha\r");
+    let tail = drain_for(&session, SILENCE_WINDOW);
     assert!(
-        !rows.iter().any(|r| r.starts_with("alpha, ")),
-        "a row pending at exit must be discarded, not flushed: {rows:?}"
+        contains(&tail, b"chose alpha bravo one\r\n"),
+        "the closing row must arrive: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(
+        before(&tail, b"chose alpha bravo one\r\n").is_empty(),
+        "the held query row must be dropped, not flushed: {:?}",
+        String::from_utf8_lossy(before(&tail, b"chose alpha bravo one\r\n"))
     );
 
     session.kill_if_alive(Duration::from_secs(2));
+}
+
+fn fruit() -> [&'static str; 3] {
+    ["apple", "apricot", "banana"]
+}
+
+/// Answer, then hand back the whole tail. The drain is long enough that
+/// a wrongly flushed row would have arrived.
+fn answer_and_drain(session: &PtySession, keys: &[u8]) -> Vec<u8> {
+    session.write_bytes(keys);
+    drain_for(session, SILENCE_WINDOW)
+}
+
+#[test]
+fn a_cursor_move_names_the_match_it_lands_on() {
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit"]);
+    let mut seen = wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+    seen.extend(press_and_hear(
+        &session,
+        &mut terminal,
+        b"\x1b[B",
+        b"apricot\r\n",
+    ));
+    seen.extend(press_and_hear(
+        &session,
+        &mut terminal,
+        b"\x1b[B",
+        b"banana\r\n",
+    ));
+    seen.extend(press_and_hear(
+        &session,
+        &mut terminal,
+        b"\x1b[A",
+        b"apricot\r\n",
+    ));
+    assert_eq!(
+        common::pty::first_unmatched_in_order(
+            &seen,
+            &[KEYS_ONE, b"apricot\r\n", b"banana\r\n", b"apricot\r\n"],
+        ),
+        None,
+        "{:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn a_cursor_move_that_cannot_happen_says_nothing() {
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit"]);
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    // Up at the top of the list.
+    session.write_bytes(b"\x1b[A");
+    assert_silent_then_alive(&session, &mut terminal, (b"\x1b[B", b"apricot\r\n"));
+
+    // Down at the bottom: settle there first, hearing each row, so the
+    // burst policy is empty when the drain starts.
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"banana\r\n");
+    session.write_bytes(b"\x1b[B");
+    assert_silent_then_alive(&session, &mut terminal, (b"\x1b[A", b"apricot\r\n"));
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn a_toggle_names_what_it_marked_and_what_it_unmarked() {
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit", "--no-limit"]);
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[KEYS_MULTI],
+        Duration::from_secs(5),
+    );
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"apricot\r\n");
+    press_and_hear(&session, &mut terminal, b"\t", b"selected apricot\r\n");
+    press_and_hear(&session, &mut terminal, b"\t", b"deselected apricot\r\n");
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn marking_a_second_item_in_single_select_names_the_one_it_marked() {
+    // Single-select clears the old mark as it sets the new one, and the
+    // row names what the reader DID. A rule that reported the first
+    // differing index would say `deselected apple` here.
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit"]);
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+    press_and_hear(&session, &mut terminal, b"\t", b"selected apple\r\n");
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"apricot\r\n");
+    press_and_hear(&session, &mut terminal, b"\t", b"selected apricot\r\n");
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn a_toggle_the_limit_refuses_says_nothing() {
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit", "--limit", "2"]);
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[KEYS_MULTI],
+        Duration::from_secs(5),
+    );
+    press_and_hear(&session, &mut terminal, b"\t", b"selected apple\r\n");
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"apricot\r\n");
+    press_and_hear(&session, &mut terminal, b"\t", b"selected apricot\r\n");
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"banana\r\n");
+
+    session.write_bytes(b"\t");
+    assert_silent_then_alive(&session, &mut terminal, (b"\x1b[A", b"apricot\r\n"));
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn the_closing_row_names_what_stdout_prints() {
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit"]);
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"apricot\r\n");
+
+    // Two writers on one device, told apart by content: the closing row
+    // is written inside the driver in raw mode, and the printed line
+    // after it. Their agreement is the shared accessor made visible.
+    let tail = answer_and_drain(&session, b"\r");
+    assert!(
+        contains(&tail, b"chose apricot\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(before(&tail, b"chose apricot\r\n").is_empty());
+    assert_eq!(after(&tail, b"chose apricot\r\n"), b"apricot\r\n");
+
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn a_multi_select_closing_names_them_in_the_order_stdout_prints() {
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit", "--no-limit"]);
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[KEYS_MULTI],
+        Duration::from_secs(5),
+    );
+    // Marked OUT of list order on purpose: what stdout prints is list
+    // order, so that is what the row must say.
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"apricot\r\n");
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"banana\r\n");
+    press_and_hear(&session, &mut terminal, b"\t", b"selected banana\r\n");
+    press_and_hear(&session, &mut terminal, b"\x1b[A", b"apricot\r\n");
+    press_and_hear(&session, &mut terminal, b"\t", b"selected apricot\r\n");
+
+    let tail = answer_and_drain(&session, b"\r");
+    assert!(
+        contains(&tail, b"chose apricot, banana\r\n"),
+        "list order, not selection order: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert_eq!(
+        after(&tail, b"chose apricot, banana\r\n"),
+        b"apricot\r\nbanana\r\n"
+    );
+
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn a_non_strict_run_speaks_the_query_it_prints() {
+    // The input where two independent derivations disagree: nothing
+    // matched, but a non-strict run prints the query, so a row derived
+    // from the selection alone would say `chose nothing` while stdout
+    // said `zz`. Read together with its strict twin below.
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit", "--no-strict"]);
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+    press_and_hear(&session, &mut terminal, b"zz", b"zz, no matches\r\n");
+
+    let tail = answer_and_drain(&session, b"\r");
+    assert!(
+        contains(&tail, b"chose zz\r\n"),
+        "the transcript must name what stdout prints: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(before(&tail, b"chose zz\r\n").is_empty());
+    assert_eq!(after(&tail, b"chose zz\r\n"), b"zz\r\n");
+
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn a_strict_run_says_it_chose_nothing_and_prints_nothing() {
+    // The same keystrokes one flag apart. A closing row derived from the
+    // selection alone passes THIS and fails its non-strict twin.
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit"]);
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+    press_and_hear(&session, &mut terminal, b"zz", b"zz, no matches\r\n");
+
+    let tail = answer_and_drain(&session, b"\r");
+    assert_eq!(
+        tail,
+        b"chose nothing\r\n",
+        "this run prints not one byte: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn pressing_escape_cancels_and_prints_nothing() {
+    let (session, mut terminal) = spawn_filter(&fruit(), &["--header", "Fruit"]);
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    // The empty tail after the row is also the proof that an aborted run
+    // prints nothing: the run propagates the driver's error and never
+    // reaches its print.
+    let tail = answer_and_drain(&session, b"\x1b");
+    assert_eq!(
+        tail,
+        b"cancelled\r\n",
+        "{:?}",
+        String::from_utf8_lossy(&tail)
+    );
 }
