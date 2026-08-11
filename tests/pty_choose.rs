@@ -28,6 +28,24 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+/// Everything ahead of the first occurrence of `needle`.
+fn before<'a>(haystack: &'a [u8], needle: &[u8]) -> &'a [u8] {
+    let at = haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("the needle must be present");
+    &haystack[..at]
+}
+
+/// Everything after the first occurrence of `needle`.
+fn after<'a>(haystack: &'a [u8], needle: &[u8]) -> &'a [u8] {
+    let at = haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("the needle must be present");
+    &haystack[at + needle.len()..]
+}
+
 /// The slice strictly between the first `open` and the first `close`
 /// after it — for counting rows inside a known span.
 fn between<'a>(haystack: &'a [u8], open: &[u8], close: &[u8]) -> &'a [u8] {
@@ -566,4 +584,209 @@ fn a_key_no_reducer_claims_says_nothing() {
 
     session.write_bytes(b"\x1b");
     assert!(!session.kill_if_alive(Duration::from_secs(5)));
+}
+
+#[test]
+fn the_closing_row_and_stdout_name_the_same_items_in_the_same_order() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "choose",
+            "--accessible",
+            "--no-limit",
+            "alpha",
+            "beta",
+            "gamma",
+            "delta",
+        ],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[KEYS_MULTI],
+        Duration::from_secs(5),
+    );
+
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"beta\r\n");
+    press_and_hear(&session, &mut terminal, b" ", b"selected beta\r\n");
+    press_and_hear(&session, &mut terminal, b"\x1b[A", b"alpha\r\n");
+    press_and_hear(&session, &mut terminal, b" ", b"selected alpha\r\n");
+
+    session.write_bytes(b"\r");
+    let tail = drain_for(&session, Duration::from_secs(1));
+    assert_eq!(
+        common::pty::first_unmatched_in_order(
+            &tail,
+            &[b"chose beta, alpha\r\n", b"beta\r\nalpha\r\n"]
+        ),
+        None,
+        "the transcript and stdout must agree, in order: {:?}",
+        String::from_utf8_lossy(&tail),
+    );
+
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn an_empty_submit_says_chose_nothing_and_prints_nothing() {
+    // `--no-limit` is load-bearing: under the default single-select
+    // limit, enter toggles the cursor item on the way out, so an empty
+    // submit cannot happen at all.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "choose",
+            "--accessible",
+            "--no-limit",
+            "alpha",
+            "beta",
+            "gamma",
+            "delta",
+        ],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[KEYS_MULTI],
+        Duration::from_secs(5),
+    );
+
+    session.write_bytes(b"\r");
+    let tail = drain_for(&session, Duration::from_secs(1));
+    assert!(
+        contains(&tail, b"chose nothing\r\n"),
+        "an empty submit must still say so: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    // Nothing is printed for an empty result, so the closing row is the
+    // last thing the session writes.
+    assert!(
+        after(&tail, b"chose nothing\r\n").is_empty(),
+        "stdout must stay empty: {:?}",
+        String::from_utf8_lossy(after(&tail, b"chose nothing\r\n"))
+    );
+
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn escape_says_cancelled() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "alpha", "beta", "gamma", "delta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    session.write_bytes(b"\x1b");
+    let tail = drain_for(&session, Duration::from_secs(1));
+    assert!(
+        contains(&tail, b"cancelled\r\n"),
+        "escape must say so: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(after(&tail, b"cancelled\r\n").is_empty());
+    assert!(!session.kill_if_alive(Duration::from_secs(5)));
+}
+
+#[test]
+fn ctrl_c_says_cancelled_the_same_way_escape_does() {
+    // A separate session from the escape arm on purpose: the two paths
+    // diverge inside the driver, and a shared session could not say
+    // which one broke.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "alpha", "beta", "gamma", "delta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    session.write_bytes(b"\x03");
+    let tail = drain_for(&session, Duration::from_secs(1));
+    assert!(
+        contains(&tail, b"cancelled\r\n"),
+        "raw mode makes this a keystroke rather than a signal, so the row \
+         is still written; a timeout here means the terminal kept its \
+         signal handling: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(!session.kill_if_alive(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_timeout_says_timed_out() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "choose",
+            "--accessible",
+            "--timeout",
+            "300ms",
+            "alpha",
+            "beta",
+            "gamma",
+            "delta",
+        ],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    let tail = drain_for(&session, SILENCE_WINDOW);
+    // Two writers say this, and they are byte-identical: the transcript
+    // row (raw mode, explicit terminator) and the shipped give-up line
+    // on stderr (after raw mode is off, so the terminal adds the return).
+    // Exactly two — one is the transcript missing, three is somebody
+    // writing it twice.
+    assert_eq!(
+        count(&tail, b"timed out\r\n"),
+        2,
+        "the transcript row and the stderr line must both be there: {:?}",
+        String::from_utf8_lossy(&tail),
+    );
+
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+#[test]
+fn a_move_inside_the_debounce_window_is_dropped_by_the_key_that_ends_it() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "alpha", "beta", "gamma", "delta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    // Down and enter back to back, inside one quiescence interval. The
+    // pending row is discarded at exit and only the closing row is
+    // written: the resting state at exit IS the result. This is the
+    // burst policy working as designed — do not "fix" it.
+    session.write_bytes(b"\x1b[B\r");
+    let tail = drain_for(&session, SILENCE_WINDOW);
+    assert!(
+        contains(&tail, b"chose beta\r\n"),
+        "the closing row must arrive: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    let middle = before(&tail, b"chose beta\r\n");
+    assert!(
+        middle.is_empty(),
+        "a row pending at exit must be discarded, not flushed: {:?}",
+        String::from_utf8_lossy(middle),
+    );
+
+    session.kill_if_alive(Duration::from_secs(5));
 }

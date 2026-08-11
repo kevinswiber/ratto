@@ -8,7 +8,7 @@ use ratatui::style::{Modifier, Style};
 use crate::cli::ChooseArgs;
 use crate::color::ColorProfile;
 use crate::core::duration::parse_interval;
-use crate::exit::AppResult;
+use crate::exit::{AppError, AppResult};
 use crate::theme::Palette;
 use crate::ui::choose::ChooseState;
 use crate::ui::echo::EchoSnapshot;
@@ -22,6 +22,10 @@ struct ChooseApp {
     selected_prefix: String,
     unselected_prefix: String,
     multi: bool,
+    /// `--ordered`, as given. The rule that a single choice also reads
+    /// list order lives in `results()`, not here, so the field's name
+    /// stays true to the flag.
+    ordered: bool,
     show_help: bool,
     palette: Palette,
 }
@@ -63,6 +67,18 @@ impl ChooseApp {
     /// announces the first as nothing and the second as a word, so the
     /// transcript spells the keys and separates them with the one
     /// punctuation the vocabulary allows.
+    /// The chosen items, in the order they will be printed. **The one
+    /// accessor**: stdout's line and the transcript's closing row are
+    /// the same list, computed once, so they cannot drift apart. Nothing
+    /// else may re-derive it — a second expression of the rule below is
+    /// the drift this method exists to prevent.
+    ///
+    /// A single choice reads list order because one choice has no
+    /// selection order worth preserving.
+    fn results(&self) -> Vec<String> {
+        self.state.results(self.ordered || !self.multi)
+    }
+
     fn keys_row(&self) -> String {
         if self.multi {
             "up and down move, space selects, enter confirms, escape cancels".to_string()
@@ -142,6 +158,34 @@ impl UiApp for ChooseApp {
         choose_transition(before, &self.echo_snapshot(), &self.state.items)
     }
 
+    fn speak_closing(&self, outcome: &AppResult) -> Vec<String> {
+        match outcome {
+            Ok(()) => {
+                let chosen = self.results();
+                vec![if chosen.is_empty() {
+                    "chose nothing".to_string()
+                } else {
+                    format!("chose {}", chosen.join(", "))
+                }]
+            }
+            // Two ways of declining to choose; the transcript has no
+            // reason to tell them apart. Raw mode makes the interrupt an
+            // ordinary keystroke, so this row still gets written.
+            Err(AppError::NoSelection) | Err(AppError::Aborted) => {
+                vec!["cancelled".to_string()]
+            }
+            // The one ending with no keystroke behind it. The detail a
+            // give-up may carry changes what stderr prints, never the
+            // outcome, so the row does not read it.
+            Err(AppError::Timeout(_)) => vec!["timed out".to_string()],
+            // Neither is a choice the reader made: a failure has said
+            // why on stderr already, and the child code belongs to
+            // another command. No catch-all arm — the next variant
+            // added should have to answer this question.
+            Err(AppError::Fail(_)) | Err(AppError::Child(_)) => Vec::new(),
+        }
+    }
+
     fn speak_opening(&self) -> Vec<String> {
         // There is no first of nothing. An empty slot is dropped by the
         // builder, so this is the whole of the empty-list rule here.
@@ -205,13 +249,14 @@ pub fn run(args: ChooseArgs, profile: ColorProfile, palette: Palette, mode: UiMo
         selected_prefix: args.selected_prefix.clone(),
         unselected_prefix: args.unselected_prefix.clone(),
         multi,
+        ordered: args.ordered,
         show_help: !args.no_show_help,
         palette,
     };
     let timeout = args.timeout.as_deref().map(parse_interval).transpose()?;
     run_ui_mode(&mut app, profile, timeout, mode)?;
 
-    let results = app.state.results(args.ordered || !multi);
+    let results = app.results();
     if !results.is_empty() {
         println!("{}", results.join(out_delim));
     }
@@ -313,21 +358,101 @@ mod tests {
         );
     }
 
-    fn app(items: &[&str], multi: bool, header: &str) -> ChooseApp {
+    fn app_with(state: ChooseState, multi: bool, ordered: bool, header: &str) -> ChooseApp {
         ChooseApp {
-            state: ChooseState::new(
-                items.iter().map(|s| s.to_string()).collect(),
-                if multi { None } else { Some(1) },
-                5,
-            ),
+            state,
             header: header.into(),
             cursor: "> ".into(),
             selected_prefix: "[x] ".into(),
             unselected_prefix: "[ ] ".into(),
             multi,
+            ordered,
             show_help: false,
             palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
         }
+    }
+
+    fn app(items: &[&str], multi: bool, header: &str) -> ChooseApp {
+        let limit = if multi { None } else { Some(1) };
+        let state = ChooseState::new(items.iter().map(|s| s.to_string()).collect(), limit, 5);
+        app_with(state, multi, false, header)
+    }
+
+    #[test]
+    fn the_closing_row_names_what_was_chosen_in_the_order_it_prints() {
+        let mut a = app(&["alpha", "beta", "gamma", "delta"], true, "Choose:");
+        a.state.cursor = 1;
+        a.state.on_key(Key::Space);
+        a.state.cursor = 0;
+        a.state.on_key(Key::Space);
+        assert_eq!(a.speak_closing(&Ok(())), ["chose beta, alpha"]);
+        assert_eq!(a.results(), ["beta", "alpha"]);
+
+        a.ordered = true;
+        assert_eq!(a.speak_closing(&Ok(())), ["chose alpha, beta"]);
+        assert_eq!(a.results(), ["alpha", "beta"]);
+
+        let mut one = app(&["alpha", "beta"], false, "Choose:");
+        one.state.cursor = 1;
+        one.state.on_key(Key::Space);
+        assert_eq!(one.speak_closing(&Ok(())), ["chose beta"]);
+
+        let empty = app(&["alpha", "beta"], true, "Choose:");
+        assert_eq!(empty.speak_closing(&Ok(())), ["chose nothing"]);
+    }
+
+    #[test]
+    fn every_way_the_session_can_end_answers_for_itself() {
+        let a = app(&["alpha", "beta"], true, "Choose:");
+        assert_eq!(a.speak_closing(&Err(AppError::NoSelection)), ["cancelled"]);
+        // Raw mode clears ISIG, so this arrives as a keystroke and not a
+        // signal: the loop breaks normally and the row is written on the
+        // way out.
+        assert_eq!(a.speak_closing(&Err(AppError::Aborted)), ["cancelled"]);
+        // The one ending with no keystroke behind it. Without this row
+        // the session simply stops.
+        assert_eq!(
+            a.speak_closing(&Err(AppError::Timeout(None))),
+            ["timed out"]
+        );
+        assert_eq!(
+            a.speak_closing(&Err(AppError::Timeout(Some(anyhow::anyhow!("waiting"))))),
+            ["timed out"]
+        );
+        // Neither is a choice the reader made; stderr has already said
+        // why, and the child code belongs to another command.
+        assert!(
+            a.speak_closing(&Err(anyhow::anyhow!("boom").into()))
+                .is_empty()
+        );
+        assert!(a.speak_closing(&Err(AppError::Child(7))).is_empty());
+    }
+
+    #[test]
+    fn a_single_choice_reads_list_order_whatever_the_selection_order_was() {
+        // DELIBERATELY unreachable through `run`, which derives
+        // `multi = limit != Some(1)`. It is the only construction in
+        // which the single-select half of the rule is observable: a
+        // state that keeps a real selection order (no limit) under an
+        // app that claims single-select. Under every reachable
+        // single-select state the two orders are equal — a toggle under
+        // a limit of one leaves at most one entry, and preselection
+        // builds in list order — so without this fixture that half of
+        // the rule could be deleted with the suite still green.
+        let state = ChooseState::new(
+            ["alpha", "beta", "gamma", "delta"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            None,
+            5,
+        );
+        let mut a = app_with(state, false, false, "Choose:");
+        a.state.cursor = 2;
+        a.state.on_key(Key::Space);
+        a.state.cursor = 0;
+        a.state.on_key(Key::Space);
+        assert_eq!(a.results(), ["alpha", "gamma"]);
     }
 
     #[test]
@@ -404,6 +529,7 @@ mod tests {
             selected_prefix: "[x] ".into(),
             unselected_prefix: "[ ] ".into(),
             multi: false,
+            ordered: false,
             show_help: false,
             palette,
         };
@@ -422,6 +548,7 @@ mod tests {
             selected_prefix: "[x] ".into(),
             unselected_prefix: "[ ] ".into(),
             multi: false,
+            ordered: false,
             show_help: false,
             palette,
         };

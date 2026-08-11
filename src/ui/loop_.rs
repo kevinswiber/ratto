@@ -91,8 +91,6 @@ pub trait UiApp {
     /// row that the painted mode cannot deliver at all: it erases itself
     /// on the way out, so the chosen value is printed into a region that
     /// has already been wiped.
-    // The driver writes this on the way out next.
-    #[allow(dead_code)]
     fn speak_closing(&self, _outcome: &AppResult) -> Vec<String> {
         Vec::new()
     }
@@ -265,7 +263,14 @@ pub fn run_ui_mode<A: UiApp>(
         // meant to stay. Push what it wrote out before the caller prints
         // the result to stdout, so an uncaptured run reads in the order
         // the two streams happened.
-        UiSink::Echo(out) => out.flush().context("flushing ui")?,
+        UiSink::Echo(out) => {
+            // A row still inside the quiescence window is dropped rather
+            // than flushed: the resting state at exit IS the result, and
+            // the closing row names it better than the step before it.
+            coalescer.discard();
+            echo_rows(out, &app.speak_closing(&outcome))?;
+            out.flush().context("flushing ui")?;
+        }
     }
     outcome
 }

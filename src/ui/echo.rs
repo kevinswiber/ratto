@@ -227,9 +227,6 @@ impl Coalescer {
     /// pressed inside the interval and followed straight by Enter
     /// contributes no transition row, because the resting state at exit
     /// IS the result and the closing row names it better.
-    // The driver drops the pending row on the way out next, where the
-    // closing row supersedes it.
-    #[allow(dead_code)]
     pub fn discard(&mut self) {
         self.pending = None;
     }
