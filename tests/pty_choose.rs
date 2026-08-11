@@ -999,3 +999,151 @@ fn a_timeout_exits_one_hundred_and_twenty_four_in_both_modes() {
         assert_eq!(exit_code(&session), 124, "transcript={transcript}");
     }
 }
+
+#[test]
+fn the_render_flags_have_nothing_to_act_on() {
+    // The same session shape twice, with no keystroke, so the comparison
+    // is deterministic: the burst policy makes a keystroke's row boundary
+    // a function of timing, and the opening block is where all three of
+    // these flags would show up if any of them were live.
+    //
+    // A painted run would draw three of four under the height flag; a
+    // transcript has no frame to fit.
+    let plain = transcript(&["alpha", "beta", "gamma", "delta"]);
+    let flagged = transcript(&[
+        "--cursor",
+        ">>>",
+        "--selected-prefix",
+        "X",
+        "--height",
+        "3",
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&plain),
+        String::from_utf8_lossy(&flagged)
+    );
+    assert!(
+        !contains(&flagged, b">>>"),
+        "the cursor marker has no row to sit on"
+    );
+    // Byte-identity alone would pass on two equally truncated runs.
+    for item in [&b"alpha\r\n"[..], b"beta\r\n", b"gamma\r\n", b"delta\r\n"] {
+        assert!(
+            contains(&flagged, item),
+            "all four are named whatever the height says: {:?}",
+            String::from_utf8_lossy(&flagged)
+        );
+    }
+}
+
+#[test]
+fn a_toggle_row_never_wears_the_selected_prefix() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "choose",
+            "--accessible",
+            "--no-limit",
+            "--cursor",
+            ">>>",
+            "--selected-prefix",
+            "X",
+            "alpha",
+            "beta",
+            "gamma",
+        ],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let mut seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[KEYS_MULTI],
+        Duration::from_secs(5),
+    );
+    seen.extend(press_and_hear(
+        &session,
+        &mut terminal,
+        b"\x1b[B",
+        b"beta\r\n",
+    ));
+    seen.extend(press_and_hear(
+        &session,
+        &mut terminal,
+        b" ",
+        b"selected beta\r\n",
+    ));
+    // Both spellings: the painted render joins the prefix without a
+    // separator, and a transcript that reached for the render fields
+    // would produce either.
+    for forged in [&b"Xbeta"[..], b"X beta"] {
+        assert!(
+            !contains(&seen, forged),
+            "a render prefix reached a row: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    session.write_bytes(b"\x1b");
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
+/// Drive a session whose stdout is a file rather than the terminal — the
+/// command-substitution shape, run under a terminal, which is where a
+/// user actually is. The transcript still lands on the pty, so the
+/// captured stream is pure transcript and the file is pure result.
+///
+/// `/bin/sh` by absolute path: the spawned child's environment is built
+/// from scratch and carries no search path, so nothing here may be found
+/// by name.
+fn run_capturing_stdout(envs: &[(&str, &str)], out: &std::path::Path) -> String {
+    let script = format!(
+        "{} choose alpha beta gamma delta > {}",
+        rat_bin(),
+        out.display()
+    );
+    let mut all = vec![("RAT_APPEARANCE", "dark")];
+    all.extend_from_slice(envs);
+    let session =
+        PtySession::spawn("/bin/sh", &["-c", &script], &all).expect("spawn a shell under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let transcript = envs.iter().any(|(k, _)| *k == "RAT_ACCESSIBLE");
+    if transcript {
+        wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+        press_and_hear(&session, &mut terminal, b"\x1b[B", b"beta\r\n");
+    } else {
+        wait_for_in_order(
+            &session,
+            &mut terminal,
+            &[b"\x1b[?25l"],
+            Duration::from_secs(5),
+        );
+        session.write_bytes(b"\x1b[B");
+    }
+    session.write_bytes(b"\r");
+    assert_eq!(session.wait_code(Duration::from_secs(5)), Some(0));
+    std::fs::read_to_string(out).expect("the redirect target exists")
+}
+
+#[test]
+fn the_result_reaches_a_command_substitution_in_both_modes() {
+    // The transcript rides the terminal directly and the result rides
+    // standard output, so the two never touch — and this is the arm that
+    // fails loudly if a row is ever written to the wrong one.
+    let dir = std::env::temp_dir().join(format!("rat-stdout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a place for the two redirects");
+    let painted_at = dir.join("painted");
+    let spoken_at = dir.join("spoken");
+
+    let painted = run_capturing_stdout(&[], &painted_at);
+    let spoken = run_capturing_stdout(&[("RAT_ACCESSIBLE", "1")], &spoken_at);
+    assert_eq!(painted, "beta\n");
+    assert_eq!(spoken, painted, "the mode must not move standard output");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
