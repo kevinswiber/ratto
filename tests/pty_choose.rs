@@ -48,6 +48,19 @@ fn between<'a>(haystack: &'a [u8], open: &[u8], close: &[u8]) -> &'a [u8] {
 /// row that means "the opening is over", and it carries its own row
 /// terminator so a capture stopped here leaves no `\r\n` behind for a
 /// later drain to read back as a phantom row.
+/// How long a silence proof must listen before it may believe the
+/// silence. A row noted into the burst policy is written one quiescence
+/// interval after the last input, and the driver notices it is due on
+/// its next turn of the poll loop — so the worst case a pending row can
+/// hide in is one quiescence plus one poll slice. Both are 250 ms today
+/// and the second is DEFINED as the first (in `src/ui/loop_.rs`), which
+/// makes the floor 500 ms; this doubles it for a loaded CI box.
+///
+/// There is no library target to import those constants from, so the
+/// relation lives here and must move when they do. A drain shorter than
+/// the sum does not measure silence — it measures a row still in flight.
+const SILENCE_WINDOW: Duration = Duration::from_millis(1000);
+
 const KEYS_ONE: &[u8] = b"up and down move, enter chooses, escape cancels\r\n";
 const KEYS_MULTI: &[u8] = b"up and down move, space selects, enter confirms, escape cancels\r\n";
 
@@ -426,6 +439,130 @@ fn a_cursor_move_names_the_item_and_a_toggle_names_the_mark() {
         "{:?}",
         String::from_utf8_lossy(&seen)
     );
+
+    session.write_bytes(b"\x1b");
+    assert!(!session.kill_if_alive(Duration::from_secs(5)));
+}
+
+/// Beats 3 and 4 of a silence proof: listen long enough to believe the
+/// silence, then prove the session could still have spoken.
+fn assert_silent_then_alive(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    then: (&[u8], &[u8]),
+) {
+    let quiet = drain_for(session, SILENCE_WINDOW);
+    assert!(
+        quiet.is_empty(),
+        "a key that changed nothing wrote {:?}",
+        String::from_utf8_lossy(&quiet),
+    );
+    // An empty drain and a dead process look identical. This is the
+    // difference.
+    press_and_hear(session, terminal, then.0, then.1);
+}
+
+#[test]
+fn an_up_at_the_top_of_the_list_says_nothing() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "alpha", "beta", "gamma", "delta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    session.write_bytes(b"\x1b[A");
+    assert_silent_then_alive(&session, &mut terminal, (b"\x1b[B", b"beta\r\n"));
+
+    session.write_bytes(b"\x1b");
+    assert!(!session.kill_if_alive(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_down_at_the_bottom_of_the_list_says_nothing() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "alpha", "beta", "gamma", "delta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    // Walked down rather than jumped with End: End reaches the wire as
+    // one byte sequence on some terminals and another elsewhere, and
+    // this suite has no precedent for either. Walking needs no such
+    // assumption and arrives at the clamp the way a reader does.
+    for row in [b"beta\r\n".as_slice(), b"gamma\r\n", b"delta\r\n"] {
+        press_and_hear(&session, &mut terminal, b"\x1b[B", row);
+    }
+
+    session.write_bytes(b"\x1b[B");
+    assert_silent_then_alive(&session, &mut terminal, (b"\x1b[A", b"gamma\r\n"));
+
+    session.write_bytes(b"\x1b");
+    assert!(!session.kill_if_alive(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_selection_the_limit_refuses_says_nothing() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "choose",
+            "--accessible",
+            "--limit",
+            "2",
+            "alpha",
+            "beta",
+            "gamma",
+            "delta",
+        ],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[KEYS_MULTI],
+        Duration::from_secs(5),
+    );
+
+    press_and_hear(&session, &mut terminal, b" ", b"selected alpha\r\n");
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"beta\r\n");
+    press_and_hear(&session, &mut terminal, b" ", b"selected beta\r\n");
+    press_and_hear(&session, &mut terminal, b"\x1b[B", b"gamma\r\n");
+
+    // The limit is met, so the toggle takes its empty arm. There is no
+    // vocabulary for a refusal, and inventing one here would invent it
+    // in the one place nobody would look for it.
+    session.write_bytes(b" ");
+    assert_silent_then_alive(&session, &mut terminal, (b"\x1b[B", b"delta\r\n"));
+
+    session.write_bytes(b"\x1b");
+    assert!(!session.kill_if_alive(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_key_no_reducer_claims_says_nothing() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["choose", "--accessible", "alpha", "beta", "gamma", "delta"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat choose under a pty");
+    let mut terminal = FakeTerminal::dark();
+    wait_for_in_order(&session, &mut terminal, &[KEYS_ONE], Duration::from_secs(5));
+
+    // The one arm where the reducer did nothing, rather than doing
+    // something that happened to land where it started: the mode is
+    // silent because the state did not change, not because the driver
+    // keeps a list of keys it answers.
+    session.write_bytes(b"x");
+    assert_silent_then_alive(&session, &mut terminal, (b"\x1b[B", b"beta\r\n"));
 
     session.write_bytes(b"\x1b");
     assert!(!session.kill_if_alive(Duration::from_secs(5)));
