@@ -25,7 +25,7 @@ use crate::core::child::{
     Rung, ShutdownGuard, TickEvent, not_started, run_tick, spawn_action, spawn_live_tick,
     spawn_tick,
 };
-use crate::core::dashboard_file::{BindingOutput, BindingProgram, KeyBinding};
+use crate::core::dashboard_file::{BindingOutput, BindingProgram, KeyBinding, Prompt, PromptKind};
 use crate::core::duration::{brief_duration, parse_interval};
 use crate::core::layout::{
     PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
@@ -1447,6 +1447,7 @@ pub(crate) fn run_registry(
                             binding: index,
                             vars,
                             selection,
+                            prompts: Vec::new(),
                         };
                         // A rung that needs the reader's attention may
                         // only be armed on a live frame: the paused
@@ -1476,6 +1477,22 @@ pub(crate) fn run_registry(
                                 &tx,
                                 width,
                                 &mut running,
+                                |binding, ctx| {
+                                    run_prompt_chain(
+                                        binding,
+                                        ctx,
+                                        &mut renderer,
+                                        fullscreen,
+                                        &mut mouse_guard,
+                                        #[cfg(unix)]
+                                        tap.as_ref(),
+                                        #[cfg(unix)]
+                                        &mut theme_sub,
+                                        #[cfg(unix)]
+                                        &mut verify,
+                                        palette.appearance,
+                                    )
+                                },
                             );
                             gate = next;
                             if let Some(line) = line {
@@ -1570,6 +1587,22 @@ pub(crate) fn run_registry(
                             &tx,
                             width,
                             &mut running,
+                            |binding, ctx| {
+                                run_prompt_chain(
+                                    binding,
+                                    ctx,
+                                    &mut renderer,
+                                    fullscreen,
+                                    &mut mouse_guard,
+                                    #[cfg(unix)]
+                                    tap.as_ref(),
+                                    #[cfg(unix)]
+                                    &mut theme_sub,
+                                    #[cfg(unix)]
+                                    &mut verify,
+                                    palette.appearance,
+                                )
+                            },
                         );
                         gate = next;
                         if let Some(line) = line {
@@ -2043,6 +2076,22 @@ pub(crate) fn run_registry(
                                                 &tx,
                                                 width,
                                                 &mut running,
+                                                |binding, ctx| {
+                                                    run_prompt_chain(
+                                                        binding,
+                                                        ctx,
+                                                        &mut renderer,
+                                                        fullscreen,
+                                                        &mut mouse_guard,
+                                                        #[cfg(unix)]
+                                                        tap.as_ref(),
+                                                        #[cfg(unix)]
+                                                        &mut theme_sub,
+                                                        #[cfg(unix)]
+                                                        &mut verify,
+                                                        palette.appearance,
+                                                    )
+                                                },
                                             );
                                             gate = next;
                                             line
@@ -3487,6 +3536,22 @@ pub(crate) fn run_registry(
                                             &tx,
                                             width,
                                             &mut running,
+                                            |binding, ctx| {
+                                                run_prompt_chain(
+                                                    binding,
+                                                    ctx,
+                                                    &mut renderer,
+                                                    fullscreen,
+                                                    &mut mouse_guard,
+                                                    #[cfg(unix)]
+                                                    tap.as_ref(),
+                                                    #[cfg(unix)]
+                                                    &mut theme_sub,
+                                                    #[cfg(unix)]
+                                                    &mut verify,
+                                                    palette.appearance,
+                                                )
+                                            },
                                         );
                                         gate = next;
                                         line
@@ -5949,30 +6014,55 @@ fn with_terminal_handoff<W: std::io::Write, T>(
 /// no alternate screen needs the same leave for the other half of the
 /// reason — it would otherwise paint into ours, and erase from its own
 /// origin downward on the way out.
+/// What the release achieved, for a payload that needs to know.
+///
+/// The pager tolerates a leave that did not land: it takes the
+/// alternate screen itself, so at worst its own buffer sits over ours.
+/// A child that paints INLINE cannot tolerate it — it would draw into
+/// our buffer and erase from its own origin downward on the way out,
+/// and in the echo mode its rows would land in a buffer the restore
+/// discards. Such a payload must decline rather than spawn.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct TerminalRelease {
+    /// Whether the alternate screen is ours no longer — trivially true
+    /// when we never held one.
+    left_alt_screen: bool,
+}
+
 fn with_released_terminal<W: std::io::Write, T>(
     renderer: &mut InlineRenderer<W>,
     fullscreen: bool,
-    payload: impl FnOnce() -> T,
+    payload: impl FnOnce(TerminalRelease) -> T,
 ) -> T {
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = renderer.finish();
+    let mut release = TerminalRelease {
+        left_alt_screen: true,
+    };
     if fullscreen {
         let mut out = std::io::stdout();
-        let _ = out.write_all(b"\x1b[?1049l");
-        let _ = out.flush();
+        release.left_alt_screen = out
+            .write_all(b"\x1b[?1049l")
+            .and_then(|()| out.flush())
+            .is_ok();
     }
     // The child inherits the console; keep it decoding UTF-8 while the
     // child owns the screen (more.com garbles the frame otherwise, and
     // a picker's own prefix glyphs fare no better).
     let _console_utf8 = ConsoleUtf8Guard::enable();
 
-    let out = payload();
+    let out = payload(release);
 
     let _ = crossterm::terminal::enable_raw_mode();
     if fullscreen {
         // Re-entered fresh: the alternate screen we left was
         // discarded, so there is no frame of ours to resume over —
         // the next draw starts from a blank buffer.
+        //
+        // Best-effort on purpose, and it is not the leave's asymmetry:
+        // a re-entry that failed is a stdout that is gone, so the very
+        // next frame fails too and the loop ends on it. There is no
+        // state to continue over.
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(b"\x1b[?1049h");
         let _ = stdout.flush();
@@ -5990,7 +6080,10 @@ fn page_frame(
 ) -> Option<String> {
     let pagers = resolve_pagers(&SystemEnv);
     let first = pagers.first().map(|p| p.bin.clone()).unwrap_or_default();
-    let (used, result) = with_released_terminal(renderer, fullscreen, || {
+    // The pager's own tolerance, unchanged: it takes the alternate
+    // screen itself, so a leave that did not land costs a buffer and
+    // not a corrupted frame.
+    let (used, result) = with_released_terminal(renderer, fullscreen, |_| {
         let mut used = first;
         let result = (|| -> std::io::Result<()> {
             let (bin, mut child) = spawn_first(&pagers)?;
@@ -6237,7 +6330,7 @@ fn launch_guard(
 /// start, the decline line to show — the caller owns the surface,
 /// because drain-time and input-time lines take different routes.
 #[allow(clippy::too_many_arguments)]
-fn advance(
+fn advance<P>(
     step: GateStep,
     binding: &KeyBinding,
     index: usize,
@@ -6247,8 +6340,34 @@ fn advance(
     tx: &std::sync::mpsc::Sender<TickEvent>,
     width: usize,
     running: &mut Vec<(ActivationId, usize)>,
-) -> (Option<Gate>, Option<String>) {
+    // The questions, as a parameter for the same reason
+    // `begin_activation` takes its spawner: a terminal handoff cannot
+    // be arranged on demand, and the rung that must NOT run on a
+    // declined path is exactly the one worth proving.
+    ask: P,
+) -> (Option<Gate>, Option<String>)
+where
+    P: FnOnce(&KeyBinding, &Activation) -> Result<Vec<PromptAnswer>, PromptStop>,
+{
+    // The one rung that completes inside this call: the board is off
+    // screen while it runs, so there is nothing to park and no
+    // completion to wait for. Resolved HERE so the match below stays
+    // exactly the three asynchronous steps it has always been.
+    let (step, ctx) = match step {
+        GateStep::Prompt => match ask(binding, &ctx) {
+            Ok(answers) => match next_step(binding, GateOutcome::Passed(Rung::Prompt)) {
+                Some(next) => (next, ctx.with_prompts(answers)),
+                None => return (None, None),
+            },
+            // No later question, no command, no partial application.
+            // The gate is dropped, so the reader's next press starts a
+            // NEW activation rather than resuming this one.
+            Err(stop) => return (None, prompt_stop_line(binding, &stop, width)),
+        },
+        step => (step, ctx),
+    };
     match step {
+        GateStep::Prompt => unreachable!("the questions are resolved before this match"),
         GateStep::Prepare => unreachable!("preparation is entered through begin_activation"),
         GateStep::Guard => match launch_guard(binding, index, &ctx, appearance, tx) {
             Ok(()) => (Some(Gate::Guarding(ctx)), None),
@@ -6544,7 +6663,6 @@ fn build_action_command(
 /// from the terminal itself, so there is nothing to forward and nothing
 /// to forget. `filter` is the one kind whose stdin carries a candidate
 /// list, and those bytes are attached by the runner below.
-#[allow(dead_code)] // The prompt chain calls this next; the allow comes off there.
 fn prompt_command(
     rat: &std::path::Path,
     prompt: &ResolvedPrompt,
@@ -6606,7 +6724,6 @@ fn prompt_command(
 /// the binding's own shell — the same pair, through the same branch, as
 /// an action's `command`. A source is an ORDINARY program: it draws
 /// nothing, owns no terminal, and its stdout is data.
-#[allow(dead_code)] // The prompt chain calls this next; the allow comes off there.
 fn filter_source_command(
     argv: &[String],
     shell: &ShellMode,
@@ -6648,7 +6765,6 @@ fn filter_source_command(
 /// which splits them itself — decoding here and re-encoding there would
 /// be two conversions to get back where we started, and on Windows the
 /// round trip is lossy.
-#[allow(dead_code)] // The prompt chain calls this next; the allow comes off there.
 fn run_filter_source(mut command: std::process::Command) -> Result<Vec<u8>, PromptStop> {
     let output = command
         .output()
@@ -6662,7 +6778,6 @@ fn run_filter_source(mut command: std::process::Command) -> Result<Vec<u8>, Prom
 /// Run one child and read two things back: what it printed, and how it
 /// exited. `candidates` is `Some` for exactly one kind — the picker
 /// that reads its rows from stdin.
-#[allow(dead_code)] // The prompt chain calls this next; the allow comes off there.
 fn run_prompt_child(
     mut command: std::process::Command,
     prompt: &ResolvedPrompt,
@@ -6725,7 +6840,6 @@ fn run_prompt_child(
 /// expands tabs, all three wrong for one answer — and its codepage arm
 /// exists for arbitrary console children, where this child is rat,
 /// whose stdout is UTF-8 by construction.
-#[allow(dead_code)] // The prompt chain calls this next; the allow comes off there.
 fn prompt_answer(
     prompt: &ResolvedPrompt,
     output: std::process::Output,
@@ -6746,6 +6860,154 @@ fn prompt_answer(
         name: prompt.name.clone(),
         value,
     })
+}
+
+/// Ask one binding's questions, in declaration order, inside ONE
+/// handoff.
+///
+/// ONE bracket for the whole chain rather than one per question: a
+/// resume between questions repaints a board the reader is about to
+/// lose again, the park handshake is not free, and — the reason that is
+/// not merely cost — a refusal at the second question would arrive
+/// AFTER the first was answered, which is a partial application by
+/// another name.
+///
+/// Any non-zero exit ends everything: no later question, no command, no
+/// partial application. `?` is the mechanism, deliberately, so the
+/// guarantee is the type's rather than each arm's to remember.
+#[allow(clippy::too_many_arguments)]
+fn run_prompt_chain<W: std::io::Write>(
+    binding: &KeyBinding,
+    ctx: &Activation,
+    renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
+    fullscreen: bool,
+    mouse_guard: &mut Option<MouseGuard<W>>,
+    #[cfg(unix)] tap: Option<&TtyTap>,
+    #[cfg(unix)] theme_sub: &mut Option<ThemeNotifyGuard<W>>,
+    #[cfg(unix)] verify: &mut VerifyState,
+    appearance: Appearance,
+) -> Result<Vec<PromptAnswer>, PromptStop> {
+    // Resolved ONCE per chain, not per question: three questions asking
+    // the OS the same thing is three chances for a different answer.
+    // The running binary rather than a PATH lookup — a board opened
+    // from one build must ask with that build.
+    let rat = std::env::current_exe()
+        .map_err(|err| PromptStop::Unavailable(format!("rat could not find itself ({err})")))?;
+    with_terminal_handoff(
+        mouse_guard,
+        #[cfg(unix)]
+        tap,
+        #[cfg(unix)]
+        theme_sub,
+        #[cfg(unix)]
+        verify,
+        || {
+            with_released_terminal(renderer, fullscreen, |release| {
+                // Fail closed, unlike the pager: a picker paints
+                // INLINE, so one spawned without the alternate screen
+                // having been left would draw into the board's own
+                // buffer — and in the spoken mode its rows would land
+                // where the restore discards them.
+                if !release.left_alt_screen {
+                    return Err(PromptStop::Unavailable(
+                        "the terminal would not give up the alternate screen; try again"
+                            .to_string(),
+                    ));
+                }
+                chain_over(&binding.prompts, |prompt| {
+                    // The expansion belongs HERE, at the one place a
+                    // child is built, against the SAME map the command
+                    // and its `when` expand from — which is what keeps
+                    // a guard and the question it precedes reading the
+                    // same bytes.
+                    let resolved = resolve_prompt(prompt, &ctx.vars)?;
+                    // A candidate picker is TWO children: the board's
+                    // source runs FIRST, and a source that failed — or
+                    // offered nothing — ends the action before a picker
+                    // is ever built. Every other kind has no source and
+                    // writes nothing to its child's stdin.
+                    let candidates = match &resolved.kind {
+                        ResolvedKind::Filter(argv) => Some(run_filter_source(
+                            filter_source_command(argv, &binding.shell, appearance),
+                        )?),
+                        _ => None,
+                    };
+                    run_prompt_child(
+                        prompt_command(&rat, &resolved, appearance),
+                        &resolved,
+                        candidates,
+                    )
+                })
+            })
+        },
+    )
+    // A reader that would not yield means nothing was asked — so the
+    // action declines, and is never run without having asked.
+    .unwrap_or_else(|| {
+        Err(PromptStop::Unavailable(
+            "the input reader did not yield; try again".to_string(),
+        ))
+    })
+}
+
+/// The chain's loop, and nothing else: ask each question in turn and
+/// stop at the first one that did not answer. Separate from the
+/// brackets because the brackets are the part no test can enter, and
+/// nothing else should hide behind them.
+fn chain_over<F>(prompts: &[Prompt], mut ask: F) -> Result<Vec<PromptAnswer>, PromptStop>
+where
+    F: FnMut(&Prompt) -> Result<PromptAnswer, PromptStop>,
+{
+    let mut answers = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        answers.push(ask(prompt)?);
+    }
+    Ok(answers)
+}
+
+/// One declared question with its author text expanded, against the
+/// activation's own map and through the one expansion entry point.
+///
+/// A failure here cannot be the reader's fault: every name was held to
+/// the declared set at load, so the message says what it means.
+fn resolve_prompt(prompt: &Prompt, vars: &Bindings) -> Result<ResolvedPrompt, PromptStop> {
+    let one = |text: &Template| {
+        text.expand(vars).map_err(|missing| {
+            PromptStop::Unavailable(format!(
+                "expanding this binding's question: {missing} — a load-validated \
+                 board cannot reach this, so load validation has regressed"
+            ))
+        })
+    };
+    let many = |values: &[Template]| values.iter().map(one).collect::<Result<Vec<_>, _>>();
+    Ok(ResolvedPrompt {
+        name: prompt.name.clone(),
+        kind: match &prompt.kind {
+            PromptKind::Choose(options) => ResolvedKind::Choose(many(options)?),
+            PromptKind::Confirm(text) => ResolvedKind::Confirm(one(text)?),
+            PromptKind::Input(text) => ResolvedKind::Input(one(text)?),
+            PromptKind::Filter(argv) => ResolvedKind::Filter(many(argv)?),
+        },
+    })
+}
+
+/// What the board says when a chain stopped short. Two lines, both
+/// through the one closed report kind — and the split matters in the
+/// one situation that generates bug reports: the reader pressed a key,
+/// the board flickered, and nothing happened. One line says they did
+/// it; the other says the program did.
+fn prompt_stop_line(binding: &KeyBinding, stop: &PromptStop, width: usize) -> Option<String> {
+    match stop {
+        PromptStop::Cancelled => action_line(binding, ActionReport::Cancelled, width),
+        PromptStop::Unavailable(reason) => action_line(
+            binding,
+            ActionReport::Declined {
+                rung: Rung::Prompt,
+                detail: Some(reason),
+            },
+            width,
+        ),
+    }
 }
 
 /// Exactly one trailing line terminator comes off an answer, and
@@ -7344,14 +7606,12 @@ fn pane_body(
 /// templates left. Built at the chain, once per prompt, so this module
 /// holds no expansion machinery and cannot grow a second one.
 #[derive(Clone, PartialEq, Debug)]
-#[allow(dead_code)] // The prompt chain constructs these next; the allow comes off there.
 struct ResolvedPrompt {
     name: String,
     kind: ResolvedKind,
 }
 
 #[derive(Clone, PartialEq, Debug)]
-#[allow(dead_code)] // The prompt chain constructs these next; the allow comes off there.
 enum ResolvedKind {
     Choose(Vec<String>),
     Confirm(String),
@@ -7368,7 +7628,6 @@ enum ResolvedKind {
 /// text lives in the one-shot child, and the dashboard only ever holds
 /// it in flight.
 #[derive(Clone, PartialEq, Debug)]
-#[allow(dead_code)] // The prompt chain constructs these next; the allow comes off there.
 struct PromptAnswer {
     /// The declared name, as written. Uppercasing it into the
     /// environment belongs to the command builder, and doing it here
@@ -7381,7 +7640,6 @@ struct PromptAnswer {
 /// thing to the action — it does not run — and they differ only in what
 /// the status row says.
 #[derive(Clone, PartialEq, Debug)]
-#[allow(dead_code)] // The prompt chain constructs these next; the allow comes off there.
 enum PromptStop {
     /// The child ran and exited non-zero: Esc, a negative confirm,
     /// Ctrl-C, a deadline, or a candidate source that failed.
@@ -7409,6 +7667,22 @@ struct Activation {
     /// command judge the same line however long the rungs between them
     /// take — and a pane's child re-running on its timer cannot move it.
     selection: Option<Selection>,
+    /// This activation's answers, collected between the prompt rung and
+    /// the command's spawn — and existing nowhere else. Not stored, not
+    /// remembered between presses, not defaulted from last time. Ratto
+    /// still never owns the state a keypress mutates: the typed text
+    /// lived in a one-shot child, and this vector dies with the
+    /// activation.
+    // The command builder reads these next; the allow comes off there.
+    #[allow(dead_code)]
+    prompts: Vec<PromptAnswer>,
+}
+
+impl Activation {
+    fn with_prompts(mut self, answers: Vec<PromptAnswer>) -> Activation {
+        self.prompts = answers;
+        self
+    }
 }
 
 /// The ONE activation currently in its gate — see the loop-local
@@ -7485,13 +7759,30 @@ enum GateStep {
     /// Arm the pending question on the status row. A key re-enters
     /// `next_step`.
     Confirm,
+    /// Ask this binding's questions, in declaration order, inside ONE
+    /// terminal handoff. The only step that completes inside
+    /// `advance`: the board is off screen while it runs, so there is
+    /// no worker and no completion event.
+    Prompt,
     /// Spawn the binding's own command (`ActionRung::Command`) and
     /// LEAVE the gate — launched and forgotten from here.
     Command,
 }
 
-/// THE GATE ORDER — `when` → `confirm` → command — in one function,
-/// and the only place it exists.
+/// After every gate that can precede them: the questions, then the
+/// command. One expression, because three copies of a two-branch tail
+/// is three places for the order to drift — and the order IS the
+/// contract.
+fn after_gates(binding: &KeyBinding) -> Option<GateStep> {
+    if binding.prompts.is_empty() {
+        Some(GateStep::Command)
+    } else {
+        Some(GateStep::Prompt)
+    }
+}
+
+/// THE GATE ORDER — `when` → `confirm` → prompts → command — in one
+/// function, and the only place it exists.
 ///
 /// **`None` is the whole point.** A declined rung has no next step,
 /// and the return type is what says so — a signature that always
@@ -7514,20 +7805,18 @@ fn next_step(binding: &KeyBinding, outcome: GateOutcome) -> Option<GateStep> {
             } else if binding.confirm.is_some() {
                 Some(GateStep::Confirm)
             } else {
-                Some(GateStep::Command)
+                after_gates(binding)
             }
         }
         GateOutcome::Passed(Rung::When) => {
             if binding.confirm.is_some() {
                 Some(GateStep::Confirm)
             } else {
-                Some(GateStep::Command)
+                after_gates(binding)
             }
         }
-        // The prompts plan inserts its rung HERE, between Confirm and
-        // Command — one variant, one row, and the Declined arm below
-        // covers it without anyone remembering to extend it.
-        GateOutcome::Passed(Rung::Confirm) => Some(GateStep::Command),
+        GateOutcome::Passed(Rung::Confirm) => after_gates(binding),
+        GateOutcome::Passed(Rung::Prompt) => Some(GateStep::Command),
         GateOutcome::Passed(Rung::Command) => None,
         // ONE arm for every rung, no exceptions — a rung added later
         // inherits the decline guarantee for free.
@@ -7550,8 +7839,13 @@ fn gate_claims(gate: &Option<Gate>, id: ActivationId) -> bool {
 }
 
 /// The union of `Template::refs` over one binding's spawn-typed
-/// strings — `when`, and the `command`/`script` program — the names
-/// this activation's map must cover.
+/// strings — `when`, the `command`/`script` program, and every value
+/// its questions hold — the names this activation's map must cover.
+///
+/// A question's value is a spawn site like the program: it is handed
+/// to a child at the keypress and expanded there. Leaving it out would
+/// send a binding down the no-worker fast path and then fail to expand
+/// a name the board legitimately declared.
 fn needed_names(binding: &KeyBinding) -> Vec<&str> {
     let mut sources: Vec<&Template> = Vec::new();
     match &binding.program {
@@ -7560,6 +7854,14 @@ fn needed_names(binding: &KeyBinding) -> Vec<&str> {
     }
     if let Some(when) = &binding.when {
         sources.push(when);
+    }
+    for prompt in &binding.prompts {
+        match &prompt.kind {
+            PromptKind::Confirm(text) | PromptKind::Input(text) => sources.push(text),
+            PromptKind::Choose(values) | PromptKind::Filter(values) => {
+                sources.extend(values.iter());
+            }
+        }
     }
     let mut needed: Vec<&str> = Vec::new();
     for template in sources {
@@ -7653,6 +7955,7 @@ where
                 binding,
                 vars: map,
                 selection,
+                prompts: Vec::new(),
             }),
             Err(err) => ActivationStart::Declined(declined(&err)),
         };
@@ -7818,6 +8121,7 @@ fn action_line(binding: &KeyBinding, report: ActionReport<'_>, width: usize) -> 
                 Rung::Prepare => "prepare",
                 Rung::When => "when",
                 Rung::Confirm => "confirm",
+                Rung::Prompt => "prompt",
                 Rung::Command => "command",
             };
             match detail {
@@ -16141,6 +16445,7 @@ mod tests {
             binding: 0,
             vars: Bindings::new(),
             selection: Some(sel),
+            prompts: Vec::new(),
         };
         let mut binding = declared_binding(Key::Char('r'));
         binding.when = Some(Template::extract("true"));
@@ -17124,6 +17429,7 @@ mod tests {
                 binding: 0,
                 vars: crate::core::template::Bindings::new(),
                 selection: None,
+                prompts: Vec::new(),
             },
             question: "confirm `e`: Really? [y/N]".to_string(),
         };
@@ -17184,6 +17490,7 @@ mod tests {
                 GateStep::Prepare => Rung::Prepare,
                 GateStep::Guard => Rung::When,
                 GateStep::Confirm => Rung::Confirm,
+                GateStep::Prompt => Rung::Prompt,
                 GateStep::Command => Rung::Command,
             });
         }
@@ -17372,8 +17679,9 @@ mod tests {
         // make assertable at all.
         let (scripts, tx) = advance_fixture();
         let mut binding = asking(with_when(declared_binding(Key::Char('a'))), 1);
-        binding.when = Some(Template::extract("/rat-no-such-guard-xyz"));
-        binding.when_shell = Some(crate::core::registry::ShellMode::Direct);
+        // A guard that cannot even be built: its own text names a
+        // variable this activation's map does not carry.
+        binding.when = Some(Template::extract("test {{nope}}"));
         let asked = std::cell::Cell::new(0);
         let mut running = Vec::new();
         let (gate, line) = advance(
@@ -17556,6 +17864,7 @@ mod tests {
             binding,
             vars: crate::core::template::Bindings::new(),
             selection: None,
+            prompts: Vec::new(),
         };
         let arrived = ActivationId(9);
         assert!(!gate_claims(&None, arrived), "no gate claims nothing");
@@ -18048,7 +18357,7 @@ mod tests {
         let mut renderer = InlineRenderer::new(sink.clone());
         renderer.draw(&frame, 80).expect("first frame");
         sink.take();
-        assert_eq!(with_released_terminal(&mut renderer, false, || 7), 7);
+        assert_eq!(with_released_terminal(&mut renderer, false, |_| 7), 7);
         renderer.draw(&frame, 80).expect("resumed frame");
         assert!(
             saw(&sink.take(), b"\x1b[3A"),
@@ -18062,7 +18371,7 @@ mod tests {
         let mut renderer = InlineRenderer::new(sink.clone()).with_clear_screen(true);
         renderer.draw(&frame, 80).expect("first frame");
         sink.take();
-        with_released_terminal(&mut renderer, true, || ());
+        with_released_terminal(&mut renderer, true, |_| ());
         renderer.draw(&frame, 80).expect("resumed frame");
         let bytes = sink.take();
         assert!(

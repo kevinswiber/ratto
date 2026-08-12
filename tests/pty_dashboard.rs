@@ -9355,7 +9355,12 @@ fn every_cancel_route_leaves_the_command_unrun() {
         );
         session.write_bytes(keys);
         assert!(
-            wait_for(&session, &mut terminal, b"cancelled", Duration::from_secs(8)),
+            wait_for(
+                &session,
+                &mut terminal,
+                b"cancelled",
+                Duration::from_secs(8)
+            ),
             "the cancel never reached the status row"
         );
         assert!(!out.exists(), "the command ran after a cancel");
@@ -9385,7 +9390,12 @@ fn every_cancel_route_leaves_the_command_unrun() {
         );
         session.write_bytes(b"n");
         assert!(
-            wait_for(&session, &mut terminal, b"cancelled", Duration::from_secs(8)),
+            wait_for(
+                &session,
+                &mut terminal,
+                b"cancelled",
+                Duration::from_secs(8)
+            ),
             "a negative answer never reached the status row"
         );
         assert!(!out.exists(), "the command ran after a negative answer");
@@ -9424,7 +9434,12 @@ fn every_cancel_route_leaves_the_command_unrun() {
         );
         session.write_bytes(b"\x1b");
         assert!(
-            wait_for(&session, &mut terminal, b"cancelled", Duration::from_secs(8)),
+            wait_for(
+                &session,
+                &mut terminal,
+                b"cancelled",
+                Duration::from_secs(8)
+            ),
             "the later cancel never reached the status row"
         );
         assert!(!out.exists(), "the command ran after a later cancel");
@@ -9483,12 +9498,7 @@ fn a_candidate_source_that_offers_nothing_never_becomes_a_picker() {
         session.write_bytes(b"r");
         // The positive anchor first: the status row speaks. Only then
         // is the picker's absence a fact about this capture.
-        let seen = wait_for_in_order(
-            &session,
-            &mut terminal,
-            &[b"`r`"],
-            Duration::from_secs(8),
-        );
+        let seen = wait_for_in_order(&session, &mut terminal, &[b"`r`"], Duration::from_secs(8));
         assert!(
             !contains(&seen, b"rev"),
             "a source that offered nothing still opened a picker: {:?}",
@@ -9530,10 +9540,7 @@ fn a_declined_guard_never_shows_a_prompt() {
     let out = dir.path().join("out");
     let decl = write_dashboard(
         dir.path(),
-        &asking_board(
-            &out,
-            &format!("    when \"false\"\n{ONE_CHOOSE}"),
-        ),
+        &asking_board(&out, &format!("    when \"false\"\n{ONE_CHOOSE}")),
     );
     let (session, mut terminal) = asking_session(&decl);
     session.write_bytes(b"r");
@@ -9580,12 +9587,22 @@ fn a_prompt_gives_back_a_focused_zoomed_pane_and_its_cursor() {
     );
     session.write_bytes(b"z");
     assert!(
-        wait_for(&session, &mut terminal, b"zoomed 1/1", Duration::from_secs(3)),
+        wait_for(
+            &session,
+            &mut terminal,
+            b"zoomed 1/1",
+            Duration::from_secs(3)
+        ),
         "the pane never zoomed"
     );
     session.write_bytes(b"s");
     assert!(
-        wait_for(&session, &mut terminal, b"cursor 1/", Duration::from_secs(3)),
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 1/",
+            Duration::from_secs(3)
+        ),
         "the cursor never appeared"
     );
     session.write_bytes(b"r");
@@ -9602,7 +9619,10 @@ fn a_prompt_gives_back_a_focused_zoomed_pane_and_its_cursor() {
     wait_for_in_order(
         &session,
         &mut terminal,
-        &[b"focus a", b"zoomed 1/1", b"cursor 1/"],
+        // The pane's own segment paints above the board's row, so
+        // this is the order the three needles reach the stream in —
+        // what is asserted is that all three came back.
+        &[b"zoomed 1/1", b"focus a", b"cursor 1/"],
         Duration::from_secs(8),
     );
     session.write_bytes(b"q");
@@ -9677,7 +9697,12 @@ fn a_cancelled_binding_asks_again_on_the_next_press_and_still_runs_nothing() {
         );
         session.write_bytes(b"\x1b");
         assert!(
-            wait_for(&session, &mut terminal, b"cancelled", Duration::from_secs(8)),
+            wait_for(
+                &session,
+                &mut terminal,
+                b"cancelled",
+                Duration::from_secs(8)
+            ),
             "round {round}: the cancel never reached the status row"
         );
     }

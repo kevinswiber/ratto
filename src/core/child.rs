@@ -515,6 +515,9 @@ pub enum Rung {
     Prepare,
     When,
     Confirm,
+    /// The questions a binding asks — all of them, inside one terminal
+    /// handoff.
+    Prompt,
     Command,
 }
 
