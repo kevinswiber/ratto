@@ -189,6 +189,8 @@ pub struct KeyBindingDecl {
     /// the same reason: it is a string site like any other.
     pub output: Option<Template>,
     pub confirm: Option<Template>,
+    /// The questions this binding asks first, in declaration order.
+    pub prompts: Vec<Prompt>,
 }
 
 /// One binding **as loaded** — what the board runs and every surface
@@ -234,6 +236,11 @@ pub struct KeyBinding {
     pub when_shell: Option<ShellMode>,
     pub output: BindingOutput,
     pub confirm: Option<String>,
+    /// The questions this binding asks first, in declaration order.
+    /// Cloned through from the declaration: a prompt's question is
+    /// asked at the keypress, so there is no load site to expand and
+    /// nothing between the two forms to differ.
+    pub prompts: Vec<Prompt>,
 }
 
 /// The two program forms a binding may take — the pane's own two
@@ -244,6 +251,44 @@ pub struct KeyBinding {
 pub enum BindingProgram {
     Argv(Vec<Template>),
     Script(Template),
+}
+
+/// One question a binding asks before its command runs. The name is
+/// identity: the command reads the answer under it, so it is decided
+/// by reading the file and never computed.
+///
+/// ONE type for the declared binding and the loaded one, deliberately.
+/// Every other field here splits into a declared and a resolved form
+/// because something happens to it at load; nothing happens to a
+/// prompt. Its question is handed to a child process at the keypress,
+/// which makes it a spawn site like `command` and `when` — expanded
+/// there, against the map that exists then — and its name is not a
+/// template at all. Two types differing in nothing would be two names
+/// for one fact.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Prompt {
+    pub name: String,
+    pub kind: PromptKind,
+}
+
+/// Which shipped picker asks the question. Four kinds, one per
+/// command, and no fifth: those programs already own the terminal for
+/// their lifetime and already refuse a non-tty, which is the whole
+/// reason a binding can ask anything at all.
+///
+/// `Choose` and `Filter` both select, and they differ in where the
+/// candidates come from — which is why one holds a list and the other
+/// a single value. A `choose`'s options are split at LOAD, on the
+/// template's own bytes, and re-recorded under its flavor: an
+/// expansion lands inside the option that held it and can never add
+/// one, exactly as a command's argv words behave. So a static short
+/// list is `choose`'s job, and a computed one is `filter`'s.
+#[derive(Clone, PartialEq, Debug)]
+pub enum PromptKind {
+    Choose(Vec<Template>),
+    Confirm(Template),
+    Input(Template),
+    Filter(Template),
 }
 
 /// What the board does with an action's output.
@@ -1218,6 +1263,7 @@ fn resolve_binding(
         when_shell,
         output,
         confirm,
+        prompts: decl.prompts.clone(),
     })
 }
 

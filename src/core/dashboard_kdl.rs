@@ -45,7 +45,7 @@
 use anyhow::{Context, anyhow, bail};
 
 use crate::core::dashboard_file::{
-    BindingProgram, DashboardFile, KeyBindingDecl, LayoutDecl, PaneDecl,
+    BindingProgram, DashboardFile, KeyBindingDecl, LayoutDecl, PaneDecl, Prompt, PromptKind,
 };
 use crate::core::key_spelling::parse_key;
 use crate::core::registry::ShellDecl;
@@ -847,22 +847,6 @@ struct BindingDraft {
     confirm: Option<Template>,
 }
 
-/// `prompt` is not an unknown node — it is a node that is coming, and
-/// the generic miss would tell the author to pick a different key,
-/// which is the wrong advice. Reserving the name here is what keeps
-/// the later work from touching this grammar at all: it replaces this
-/// refusal with a real row rather than widening the node. NOT a
-/// `BINDING_KEYS` row, so the accepted-set lists never advertise it.
-fn refuse_reserved(name: &str, at: &str) -> anyhow::Result<()> {
-    if name == "prompt" {
-        bail!(
-            "{at}: `prompt` is reserved — a binding cannot ask a question yet. \
-             Use `confirm` for a yes/no gate, or read the answer inside the command"
-        );
-    }
-    Ok(())
-}
-
 /// A binding's key: exactly one unannotated string, and NOT a
 /// template. The spelling is identity — it is the key a reader
 /// presses, and the conflict check decides at LOAD whether it
@@ -933,6 +917,7 @@ fn key_block(
     };
     let mut draft = BindingDraft::default();
     let mut seen: Vec<&'static str> = Vec::new();
+    let mut prompts: Vec<Prompt> = Vec::new();
 
     for entry in node.entries() {
         let Some(prop) = entry.name() else {
@@ -945,7 +930,15 @@ fn key_block(
                 ty.value()
             );
         }
-        refuse_reserved(prop, &at)?;
+        // A property holds exactly one value and a prompt carries two,
+        // so there is no property spelling that could express one —
+        // the same shape advice `Set::List` gives a few lines down.
+        if prop == "prompt" {
+            bail!(
+                "{at}: a `prompt` carries a name and a kind, so it must be a child \
+                 node — write `prompt \"verdict\" choose=\"a,b\"` inside the block"
+            );
+        }
         let Some(k) = lookup(BINDING_KEYS, prop) else {
             bail!(
                 "{at}: unknown property {prop:?} — a binding's keys with a property spelling are {}",
@@ -972,10 +965,18 @@ fn key_block(
         .unwrap_or_default()
     {
         let name = child.name().value();
-        refuse_reserved(name, &at)?;
+        if name == "prompt" {
+            prompts.push(prompt_node(child, prompts.len(), &at, load)?);
+            continue;
+        }
         let Some(k) = lookup(BINDING_KEYS, name) else {
+            // `prompt` is written out because it is not a table row and
+            // cannot become one — a row is declared once, and a binding
+            // asks as many questions as it has. Tidying it into
+            // `BINDING_KEYS` would cost the node its shape.
             bail!(
-                "{at}: unknown node {name:?} — a binding's keys are {}",
+                "{at}: unknown node {name:?} — a binding's keys are {}, and `prompt` \
+                 asks a question before the command runs",
                 setting_list(BINDING_KEYS, false)
             );
         };
@@ -989,7 +990,132 @@ fn key_block(
             Set::FlagOrText(set) => set(&mut draft, one_mode(child, k, &at, load)?),
         }
     }
-    checked(key, spelling, draft, &at)
+    checked(key, spelling, draft, prompts, &at)
+}
+
+/// One `prompt "verdict" choose="accepting,requesting-changes"` inside
+/// a `key` block.
+///
+/// NOT a `BINDING_KEYS` row, and the reason is structural rather than
+/// stylistic: a table row is declared ONCE, and a binding asks as many
+/// questions as it has; a row's value is one thing, and this node
+/// carries a name and a kind. Both of those are what the table
+/// machinery is for, so joining it would cost the node its shape.
+fn prompt_node(
+    node: &kdl::KdlNode,
+    index: usize,
+    at: &str,
+    load: &Load<'_>,
+) -> anyhow::Result<Prompt> {
+    let mut here = format!("{at} > prompt #{}", index + 1);
+    refuse_annotation(node.ty(), "prompt", &here)?;
+    if node.children().is_some() {
+        bail!(
+            "{here}: `prompt` names a variable and a kind and holds no block — \
+             write `prompt \"verdict\" choose=\"accepting,requesting-changes\"`"
+        );
+    }
+    let name = prompt_name(node, &here)?;
+    here = format!("{at} > prompt {name:?}");
+    let mut kinds: Vec<(&str, PromptKind)> = Vec::new();
+    for entry in node.entries() {
+        let Some(prop) = entry.name() else {
+            continue; // positional: the prompt's own name
+        };
+        let prop = prop.value();
+        refuse_annotation(entry.ty(), prop, &here)?;
+        if !matches!(prop, "choose" | "confirm" | "input" | "filter") {
+            bail!(
+                "{here}: unknown property {prop:?} — a prompt's kinds are \
+                 choose, confirm, input, filter"
+            );
+        }
+        let text = entry
+            .value()
+            .as_string()
+            .ok_or_else(|| anyhow!("{here}: `{prop}` takes one string — write `{prop}=\"…\"`"))?;
+        // The one extraction site, so the raw-string flavor rule and
+        // the unknown-variable refusal reach a prompt's question with
+        // nothing written here to make them.
+        let template = template_of(text, entry, load)?;
+        kinds.push((
+            prop,
+            match prop {
+                "choose" => PromptKind::Choose(choose_options(&template, &here)?),
+                "confirm" => PromptKind::Confirm(template),
+                "input" => PromptKind::Input(template),
+                _ => PromptKind::Filter(template),
+            },
+        ));
+    }
+    if kinds.len() != 1 {
+        bail!(
+            "{here}: a prompt asks one question — give it exactly one of \
+             choose, confirm, input, or filter"
+        );
+    }
+    Ok(Prompt {
+        name,
+        kind: kinds.remove(0).1,
+    })
+}
+
+/// A prompt's name: exactly one unannotated string, and NOT a
+/// template. Identity, the same argument the binding's key makes one
+/// function up — the command reads the answer under this name, so a
+/// computed one would make "what does this board export" unanswerable
+/// by reading the board.
+fn prompt_name(node: &kdl::KdlNode, at: &str) -> anyhow::Result<String> {
+    match positional_entries(node).as_slice() {
+        [entry] => {
+            refuse_annotation(entry.ty(), "prompt", at)?;
+            let text = entry.value().as_string().ok_or_else(|| {
+                anyhow!(
+                    "{at}: a prompt's name is a string — write `prompt \"verdict\" choose=\"a,b\"`"
+                )
+            })?;
+            if !Template::extract(text).refs().is_empty() {
+                bail!(
+                    "{at}: a prompt's name is not substitutable — it is the name \
+                     the command reads the answer under. The question the reader \
+                     sees belongs in the kind's own value"
+                );
+            }
+            Ok(text.to_string())
+        }
+        [] => bail!("{at}: this prompt needs a name — write `prompt \"verdict\" choose=\"a,b\"`"),
+        [first, ..] => bail!(
+            "{at}: a prompt names one variable — write `prompt {:?} choose=\"a,b\"`",
+            first.value().as_string().unwrap_or_default()
+        ),
+    }
+}
+
+/// A `choose` prompt's options. Split at LOAD on the template's own
+/// bytes and re-recorded under its flavor, so an expansion lands
+/// INSIDE the option that held it and never adds one — the same
+/// promise `split_command` makes about argv words, for the one other
+/// list-shaped value this grammar has.
+///
+/// Trimmed, because a comma list reads with spaces after the commas
+/// and an option's leading space is invisible in the picker while
+/// still changing the string a command branches on. An empty option
+/// is refused for the same reason from the other side: a row that
+/// names nothing, whose value is the empty string.
+fn choose_options(value: &Template, at: &str) -> anyhow::Result<Vec<Template>> {
+    let options: Vec<String> = value
+        .as_str()
+        .split(',')
+        .map(|option| option.trim().to_string())
+        .collect();
+    if options.iter().any(String::is_empty) {
+        bail!(
+            "{at}: `choose` has an empty option — remove the extra comma, or \
+             write the option. A row that names nothing is one a reader can \
+             select and no command can tell apart"
+        );
+    }
+    Ok(value.reslice(options))
 }
 
 /// The draft's decisions, made where the author wrote the lines. None
@@ -999,6 +1125,7 @@ fn checked(
     key: Key,
     spelling: String,
     draft: BindingDraft,
+    prompts: Vec<Prompt>,
     at: &str,
 ) -> anyhow::Result<KeyBindingDecl> {
     let Some(description) = draft.description else {
@@ -1030,6 +1157,7 @@ fn checked(
         when: draft.when,
         output: draft.output,
         confirm: draft.confirm,
+        prompts,
     })
 }
 
@@ -4597,7 +4725,8 @@ key "r" {{
                 "key \"r\" {{ description \"x\"\ncommand \"y\"\ninterval \"5s\" }}\n{ONE_PANE}"
             )),
             "key \"r\": unknown node \"interval\" — a binding's keys are \
-             description, when, command, script, shell, output, confirm"
+             description, when, command, script, shell, output, confirm, and \
+             `prompt` asks a question before the command runs"
         );
         assert_eq!(
             binding_err(&format!(
@@ -4905,35 +5034,6 @@ key "r" {{
             ))
             .len(),
             2
-        );
-    }
-
-    #[test]
-    fn prompt_is_reserved_and_says_so_rather_than_bailing_generically() {
-        // The spelling a real board uses: a positional name plus a kind
-        // property.
-        for body in [
-            "description \"x\"\ncommand \"y\"\nprompt \"title\" input=\"What?\"",
-            "description \"x\"\ncommand \"y\"\nprompt \"verdict\" choose=\"a,b\"",
-        ] {
-            let err = binding_err(&format!("key \"a\" {{ {body} }}\n{ONE_PANE}"));
-            assert_eq!(
-                err,
-                "key \"a\": `prompt` is reserved — a binding cannot ask a question yet. \
-                 Use `confirm` for a yes/no gate, or read the answer inside the command"
-            );
-            // NOT the generic miss, whose advice — pick one of these
-            // instead — is exactly wrong for a name that is coming.
-            assert!(!err.contains("a binding's keys are"), "{err}");
-        }
-        // The property spelling reaches the same sentence: the house
-        // accepts both positions, so a reservation that covered one would
-        // leave a hole for the later work to trip on.
-        assert!(
-            binding_err(&format!(
-                "key \"a\" prompt=\"x\" {{ description \"d\"\ncommand \"y\" }}\n{ONE_PANE}"
-            ))
-            .contains("`prompt` is reserved")
         );
     }
 

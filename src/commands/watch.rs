@@ -14853,6 +14853,7 @@ mod tests {
             when_shell: None,
             output: crate::core::dashboard_file::BindingOutput::Status,
             confirm: None,
+            prompts: Vec::new(),
         }
     }
 
@@ -15402,6 +15403,7 @@ mod tests {
             when_shell: None,
             output: crate::core::dashboard_file::BindingOutput::Status,
             confirm: None,
+            prompts: Vec::new(),
         }
     }
 
