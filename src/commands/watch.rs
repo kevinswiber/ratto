@@ -6530,6 +6530,238 @@ fn build_action_command(
     }
 }
 
+/// The child ONE question runs: rat's own picker, owning the terminal
+/// for its lifetime exactly as the pager does.
+///
+/// Deliberately NOT a second `build_action_command`. That builder makes
+/// the process a board's keypress CAUSES; this one makes the process
+/// that ASKS. They share nothing but the appearance hand-down, and
+/// merging them would put a picker's argv inside the function whose
+/// comment promises later work extends only its environment.
+///
+/// No stdin, and that is the wire-level rule as a property of the type
+/// rather than a rule to remember: the child reads the reader's keys
+/// from the terminal itself, so there is nothing to forward and nothing
+/// to forget. `filter` is the one kind whose stdin carries a candidate
+/// list, and those bytes are attached by the runner below.
+#[allow(dead_code)] // The prompt chain calls this next; the allow comes off there.
+fn prompt_command(
+    rat: &std::path::Path,
+    prompt: &ResolvedPrompt,
+    appearance: Appearance,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(rat);
+    match &prompt.kind {
+        ResolvedKind::Choose(options) => {
+            // No question slot in the grammar, so the header is the
+            // question's own name — unique inside the binding, and the
+            // same word the command reads the answer back under. Two
+            // questions must never show the same header.
+            command.args(["choose", "--header", &prompt.name]);
+            // Board-author text, and the separator is what keeps an
+            // option spelled like a flag from becoming one — on a
+            // terminal the board has already left, where a usage error
+            // has nowhere to be read.
+            command.arg("--").args(options);
+        }
+        ResolvedKind::Confirm(question) => {
+            // No `--show-output`: the value is the exit status, and
+            // parsing a label would tie the contract to display text
+            // and to a flag meant for humans.
+            command.args(["confirm", "--"]).arg(question);
+        }
+        ResolvedKind::Input(question) => {
+            // `--header`, not the caret marker and not the placeholder,
+            // which vanishes the moment the reader starts answering.
+            command.args(["input", "--header"]).arg(question);
+        }
+        ResolvedKind::Filter(_) => {
+            command.args(["filter", "--header", &prompt.name]);
+            // The source itself is spawned by the CALLER, before this
+            // child exists — a picker must never be built for a source
+            // that failed. Its bytes arrive on the stdin the tail below
+            // opens for this kind alone.
+        }
+    }
+    // Null for three of the four kinds, and a pipe for the one whose
+    // shipped command reads its candidates from stdin. The branch is
+    // HERE rather than at the spawn, so "which kind may be written to"
+    // is a match arm the compiler checks and not a rule to remember.
+    command.stdin(match &prompt.kind {
+        ResolvedKind::Filter(_) => std::process::Stdio::piped(),
+        _ => std::process::Stdio::null(),
+    });
+    command.stdout(std::process::Stdio::piped());
+    // Inherited on purpose: a picker that cannot run says so here, and
+    // the board is off screen. Swallowing it leaves a status line that
+    // names a binding and explains nothing.
+    command.stderr(std::process::Stdio::inherit());
+    // The reader is PARKED while this runs, so a child resolving its
+    // own appearance would query a terminal nobody is listening to.
+    command.env("RAT_APPEARANCE", appearance.as_str());
+    command
+}
+
+/// The board's candidate source: an argv split at load, spawned under
+/// the binding's own shell — the same pair, through the same branch, as
+/// an action's `command`. A source is an ORDINARY program: it draws
+/// nothing, owns no terminal, and its stdout is data.
+#[allow(dead_code)] // The prompt chain calls this next; the allow comes off there.
+fn filter_source_command(
+    argv: &[String],
+    shell: &ShellMode,
+    appearance: Appearance,
+) -> std::process::Command {
+    let mut command = match shell_invocation(shell) {
+        Some((program, flags)) => shell_command(&program, flags, &argv.join(" ")),
+        None => {
+            let mut cmd = std::process::Command::new(&argv[0]);
+            cmd.args(&argv[1..]);
+            cmd
+        }
+    };
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::inherit());
+    // A source may render, and the reader is parked — same hand-down,
+    // same reason, as every other child this program spawns.
+    command.env("RAT_APPEARANCE", appearance.as_str());
+    // The scrub the PICKER does not need and a source does: rat's own
+    // pickers read no cursor variable, but a source is board-author
+    // code that may launch a board of its own, and it must not read an
+    // outer board's marked line as its own. Same three names, same
+    // argument, as the action builder above.
+    command.env_remove("RAT_CURSOR");
+    command.env_remove("RAT_CURSOR_PANE");
+    command.env_remove("RAT_CURSOR_LINE");
+    command
+}
+
+/// The candidate list, or the end of the action.
+///
+/// A source that FAILED must never become an empty picker, and a source
+/// that succeeded with nothing to offer must not either: the only thing
+/// a picker could do with an empty list is present it. Both are
+/// `Cancelled`; turning that into a status line belongs to the chain.
+///
+/// The bytes are NOT decoded. They go straight to the picker's stdin,
+/// which splits them itself — decoding here and re-encoding there would
+/// be two conversions to get back where we started, and on Windows the
+/// round trip is lossy.
+#[allow(dead_code)] // The prompt chain calls this next; the allow comes off there.
+fn run_filter_source(mut command: std::process::Command) -> Result<Vec<u8>, PromptStop> {
+    let output = command
+        .output()
+        .map_err(|err| PromptStop::Unavailable(err.to_string()))?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Err(PromptStop::Cancelled);
+    }
+    Ok(output.stdout)
+}
+
+/// Run one child and read two things back: what it printed, and how it
+/// exited. `candidates` is `Some` for exactly one kind — the picker
+/// that reads its rows from stdin.
+#[allow(dead_code)] // The prompt chain calls this next; the allow comes off there.
+fn run_prompt_child(
+    mut command: std::process::Command,
+    prompt: &ResolvedPrompt,
+    candidates: Option<Vec<u8>>,
+) -> Result<PromptAnswer, PromptStop> {
+    let mut child = command
+        .spawn()
+        .map_err(|err| PromptStop::Unavailable(err.to_string()))?;
+    if let Some(bytes) = candidates {
+        // The ONE deliberate write to a child's stdin in this program,
+        // and it is not the thing the wire-level rule forbids. That
+        // clause is about PANES: rat never writes to a pane's child,
+        // and no keystroke ever reaches one. These bytes are a
+        // candidate list rat produced, handed to a picker rat spawned —
+        // no key was forwarded, and the picker still reads the reader's
+        // keys from the terminal itself.
+        //
+        // A picker that exits before reading — the non-tty refusal does
+        // exactly that — breaks the pipe mid-write, and the default
+        // disposition would kill rat itself with the board's terminal
+        // still released. Same guard, same reason, as the pager's own
+        // write.
+        #[cfg(unix)]
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
+        if let Some(mut stdin) = child.stdin.take() {
+            // Dropped at the end of this block so the picker sees EOF
+            // and renders: a pipe left open is a picker waiting forever
+            // on a board that is already off screen.
+            let _ = stdin.write_all(&bytes);
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| PromptStop::Unavailable(err.to_string()))?;
+    prompt_answer(prompt, output)
+}
+
+/// One child's result as an answer, or as the end of the chain.
+///
+/// ANY non-zero exit stops it — including codes no shipped picker
+/// produces, because a malformed argv is a usage error and a killed
+/// child has no code at all.
+///
+/// On success the value comes from ONE of two places, and which one is
+/// a property of the KIND rather than of the bytes: three kinds print
+/// their answer, and `confirm` prints nothing at all — its answer IS
+/// the exit status. That is why this takes the question and not just
+/// its name; classifying on stdout alone would hand a passed confirm an
+/// empty string, and every board branching on the documented value
+/// would silently stop matching.
+///
+/// Stdout is decoded lossily rather than through the shared line
+/// decoder: that decoder strips every trailing newline, splits, and
+/// expands tabs, all three wrong for one answer — and its codepage arm
+/// exists for arbitrary console children, where this child is rat,
+/// whose stdout is UTF-8 by construction.
+#[allow(dead_code)] // The prompt chain calls this next; the allow comes off there.
+fn prompt_answer(
+    prompt: &ResolvedPrompt,
+    output: std::process::Output,
+) -> Result<PromptAnswer, PromptStop> {
+    if !output.status.success() {
+        return Err(PromptStop::Cancelled);
+    }
+    let value = match &prompt.kind {
+        // The canonical string, from the STATUS, never the label — and
+        // it only ever exists as `true`, because a negative answer
+        // exited non-zero and returned above. The child's stdout is not
+        // read here, and `--show-output` is not passed, so there is
+        // nothing to read.
+        ResolvedKind::Confirm(_) => "true".to_string(),
+        _ => trim_answer(&String::from_utf8_lossy(&output.stdout)).to_string(),
+    };
+    Ok(PromptAnswer {
+        name: prompt.name.clone(),
+        value,
+    })
+}
+
+/// Exactly one trailing line terminator comes off an answer, and
+/// nothing else.
+///
+/// One `\n` rather than all of them: every shipped picker prints with
+/// one, and a multi-select joins its rows with more — so a greedy strip
+/// would silently drop a chosen line that happened to be empty. A `\r`
+/// before it if present, for the day these bytes come from a console
+/// child. And nothing else: an answer may legitimately end in a space,
+/// and a picked line may legitimately begin with one.
+fn trim_answer(text: &str) -> &str {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    text.strip_suffix('\r').unwrap_or(text)
+}
+
 /// Write one activation's templated `#!` body, through the same
 /// classification seam the materializer uses — `script_file` supplies
 /// the platform suffix Windows execution needs and the `cmd` body
@@ -7108,6 +7340,58 @@ fn pane_body(
 /// of "ratto never owns the state a keypress mutates" is the WORLD —
 /// this holds the keypress's own in-flight context and nothing else,
 /// no result, no output, no memory of what the command did.
+/// One question with its author text resolved: the same four kinds, no
+/// templates left. Built at the chain, once per prompt, so this module
+/// holds no expansion machinery and cannot grow a second one.
+#[derive(Clone, PartialEq, Debug)]
+#[allow(dead_code)] // The prompt chain constructs these next; the allow comes off there.
+struct ResolvedPrompt {
+    name: String,
+    kind: ResolvedKind,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+#[allow(dead_code)] // The prompt chain constructs these next; the allow comes off there.
+enum ResolvedKind {
+    Choose(Vec<String>),
+    Confirm(String),
+    Input(String),
+    /// Resolved exactly the way `Choose`'s options are, and meaning
+    /// something else entirely: these are not candidates, they are the
+    /// PROGRAM whose stdout becomes the candidates.
+    Filter(Vec<String>),
+}
+
+/// One question's answer, alive ONLY between the child's exit and the
+/// action's spawn. Not stored, not remembered between presses, not
+/// defaulted from last time, and never exposed to a pane — the typed
+/// text lives in the one-shot child, and the dashboard only ever holds
+/// it in flight.
+#[derive(Clone, PartialEq, Debug)]
+#[allow(dead_code)] // The prompt chain constructs these next; the allow comes off there.
+struct PromptAnswer {
+    /// The declared name, as written. Uppercasing it into the
+    /// environment belongs to the command builder, and doing it here
+    /// would put the contract's spelling in two places.
+    name: String,
+    value: String,
+}
+
+/// Why a chain of questions stopped short. Every variant means the same
+/// thing to the action — it does not run — and they differ only in what
+/// the status row says.
+#[derive(Clone, PartialEq, Debug)]
+#[allow(dead_code)] // The prompt chain constructs these next; the allow comes off there.
+enum PromptStop {
+    /// The child ran and exited non-zero: Esc, a negative confirm,
+    /// Ctrl-C, a deadline, or a candidate source that failed.
+    Cancelled,
+    /// Nothing was asked at all: the child never launched, rat could
+    /// not find its own binary, or the terminal was never handed over.
+    /// The string is the reason, already worded.
+    Unavailable(String),
+}
+
 struct Activation {
     /// Minted when the keypress is accepted, NOT when preparation
     /// completes — the preparation event has to be matched by it too.
@@ -16289,7 +16573,11 @@ mod tests {
     fn each_prompt_kind_builds_the_command_its_shipped_cli_accepts() {
         let rat = std::path::Path::new("/opt/rat");
 
-        let cmd = prompt_command(rat, &choose_prompt("verdict", ["accepting", "-x"]), Appearance::Dark);
+        let cmd = prompt_command(
+            rat,
+            &choose_prompt("verdict", ["accepting", "-x"]),
+            Appearance::Dark,
+        );
         assert_eq!(cmd.get_program(), rat.as_os_str());
         assert_eq!(
             args(&cmd),
@@ -16318,8 +16606,16 @@ mod tests {
         // Two question-less prompts in one chain must not present the
         // same header — which is what taking the shipped default would
         // do, and what this whole mapping exists to avoid.
-        let a = prompt_command(rat, &choose_prompt("verdict", ["yes", "no"]), Appearance::Dark);
-        let b = prompt_command(rat, &choose_prompt("reviewer", ["kim", "sam"]), Appearance::Dark);
+        let a = prompt_command(
+            rat,
+            &choose_prompt("verdict", ["yes", "no"]),
+            Appearance::Dark,
+        );
+        let b = prompt_command(
+            rat,
+            &choose_prompt("reviewer", ["kim", "sam"]),
+            Appearance::Dark,
+        );
         assert_ne!(header_of(&a), header_of(&b));
     }
 
@@ -16421,35 +16717,45 @@ mod tests {
         ));
     }
 
+    /// A stand-in for a picker, wearing the stdio the builder gives a
+    /// question with no candidates. It is not a real picker on purpose:
+    /// the driver refuses a non-tty outright, so `rat input` here would
+    /// exit 1 with a message and every arm below would pass for the
+    /// wrong reason.
+    #[cfg(unix)]
+    fn stand_in(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_stand_in_child_round_trips_through_the_runner() {
-        // NOT a real picker: the driver refuses a non-tty outright, so
-        // `rat input` here would exit 1 with a message and this test
-        // would pass for the wrong reason.
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", "printf 'picked\\n'"]);
         assert_eq!(
-            run_prompt_child(cmd, &input_prompt("verdict", "Q"), None).expect("a zero exit answers"),
+            run_prompt_child(
+                stand_in("printf 'picked\\n'"),
+                &input_prompt("verdict", "Q"),
+                None
+            )
+            .expect("a zero exit answers"),
             PromptAnswer {
                 name: "verdict".to_string(),
                 value: "picked".to_string(),
             }
         );
 
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", "exit 130"]);
         assert!(matches!(
-            run_prompt_child(cmd, &input_prompt("verdict", "Q"), None),
+            run_prompt_child(stand_in("exit 130"), &input_prompt("verdict", "Q"), None),
             Err(PromptStop::Cancelled)
         ));
 
-        // The null stdin, observed where it is observable: a child that
+        // Nothing is written to a child with no candidates: one that
         // reads stdin sees EOF rather than the reader's keys.
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", "cat"]);
         assert_eq!(
-            run_prompt_child(cmd, &input_prompt("v", "Q"), None)
+            run_prompt_child(stand_in("cat"), &input_prompt("v", "Q"), None)
                 .expect("EOF is not a failure")
                 .value,
             ""
@@ -16480,7 +16786,11 @@ mod tests {
             Appearance::Dark,
         );
         assert_ne!(cmd.get_program(), "pb", "a shell spec spawns the shell");
-        assert!(args(&cmd).iter().any(|a| a == "pb list"), "{:?}", args(&cmd));
+        assert!(
+            args(&cmd).iter().any(|a| a == "pb list"),
+            "{:?}",
+            args(&cmd)
+        );
 
         // The scrub a picker does not need and a source does: a source
         // is board-author code and may launch a board of its own.
@@ -16509,7 +16819,10 @@ mod tests {
         assert!(matches!(run_filter_source(cmd), Err(PromptStop::Cancelled)));
 
         let cmd = std::process::Command::new("/rat-no-such-source-xyz");
-        assert!(matches!(run_filter_source(cmd), Err(PromptStop::Unavailable(_))));
+        assert!(matches!(
+            run_filter_source(cmd),
+            Err(PromptStop::Unavailable(_))
+        ));
 
         // The anchor, without which the three above pass against a
         // function that always cancels.
