@@ -10094,11 +10094,16 @@ fn seeded_board(dir: &std::path::Path) -> (std::path::PathBuf, String) {
     (out, board)
 }
 
-/// The field opens on the marked line — from a frame-scrolled board,
-/// with the cursor moved off the first line, so a seed that always
-/// showed line one fails.
+/// The field opens on the marked line, with the cursor moved off the
+/// first line so a seed that always showed line one fails — and the
+/// view comes back.
+///
+/// Pressed well off live rest: the frame is scrolled, then a cursor is
+/// raised (which focuses the pane and re-homes the viewport, so the
+/// scrolled notice is gone by the time the key is pressed — the focus
+/// and cursor needles are what encode the state at that moment).
 #[test]
-fn a_seeded_prompt_opens_on_the_marked_line_from_a_frame_scrolled_board() {
+fn a_seeded_prompt_opens_on_the_marked_line_and_gives_the_view_back() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (out, board) = seeded_board(dir.path());
     let decl = write_dashboard(dir.path(), &board);
@@ -10143,14 +10148,22 @@ fn a_seeded_prompt_opens_on_the_marked_line_from_a_frame_scrolled_board() {
         "the question never painted"
     );
     session.write_bytes(b"\r");
+    // The resume is waited for FIRST: reading the probe file takes
+    // long enough that the repaint would already have gone past, and a
+    // wait only sees what arrives after it starts.
+    // The resume is waited for FIRST: reading the probe file takes long
+    // enough that the repaint would already have gone past, and a wait
+    // only sees what arrives after it starts.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"focus a", b"cursor 2/20"],
+        Duration::from_secs(8),
+    );
     let probed = read_answer_probe_named(&out, "S=[").expect("the binding never probed");
     assert!(
         probed.contains("S=[A02]"),
         "the field opened elsewhere: {probed}"
-    );
-    assert!(
-        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(8)),
-        "the board never came back to the offset it left"
     );
     session.write_bytes(b"q");
     session.kill_if_alive(Duration::from_secs(2));

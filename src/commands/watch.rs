@@ -6783,10 +6783,13 @@ fn prompt_command(
             // and to a flag meant for humans.
             command.args(["confirm", "--"]).arg(question);
         }
-        ResolvedKind::Input(question) => {
+        ResolvedKind::Input { question, seed } => {
             // `--header`, not the caret marker and not the placeholder,
             // which vanishes the moment the reader starts answering.
             command.args(["input", "--header"]).arg(question);
+            if let Some(text) = seed {
+                command.arg("--value").arg(text);
+            }
         }
         ResolvedKind::Filter(_) => {
             command.args(["filter", "--header", &prompt.name]);
@@ -7019,7 +7022,7 @@ fn run_prompt_chain<W: std::io::Write>(
                     // and its `when` expand from — which is what keeps
                     // a guard and the question it precedes reading the
                     // same bytes.
-                    let resolved = resolve_prompt(prompt, &ctx.vars)?;
+                    let resolved = resolve_prompt(prompt, &ctx.vars, ctx.selection.as_ref())?;
                     // A candidate picker is TWO children: the board's
                     // source runs FIRST, and a source that failed — or
                     // offered nothing — ends the action before a picker
@@ -7069,7 +7072,17 @@ where
 ///
 /// A failure here cannot be the reader's fault: every name was held to
 /// the declared set at load, so the message says what it means.
-fn resolve_prompt(prompt: &Prompt, vars: &Bindings) -> Result<ResolvedPrompt, PromptStop> {
+fn resolve_prompt(
+    prompt: &Prompt,
+    vars: &Bindings,
+    // The line the reader was looking at when they pressed the key.
+    // Resolved HERE, with the rest of this question's author text, and
+    // never re-read later: a question runs seconds after the press,
+    // inside the suspend ritual, and a pane re-runs its child on a
+    // timer with no keypress involved — a value read at the spawn would
+    // open the field on a line the reader never saw.
+    selection: Option<&Selection>,
+) -> Result<ResolvedPrompt, PromptStop> {
     let one = |text: &Template| {
         text.expand(vars).map_err(|missing| {
             PromptStop::Unavailable(format!(
@@ -7084,7 +7097,19 @@ fn resolve_prompt(prompt: &Prompt, vars: &Bindings) -> Result<ResolvedPrompt, Pr
         kind: match &prompt.kind {
             PromptKind::Choose(options) => ResolvedKind::Choose(many(options)?),
             PromptKind::Confirm(text) => ResolvedKind::Confirm(one(text)?),
-            PromptKind::Input(text) => ResolvedKind::Input(one(text)?),
+            PromptKind::Input(text) => ResolvedKind::Input {
+                question: one(text)?,
+                // Absent rather than empty when no cursor is up: a
+                // board that asks for the line and gets nothing opens
+                // an EMPTY field, because declining would make the
+                // attribute a trap. A blank marked line still seeds
+                // `Some("")` — "the line is empty" and "there is no
+                // line" are different facts here as everywhere.
+                seed: prompt
+                    .from_cursor
+                    .then(|| selection.map(|sel| sel.text.clone()))
+                    .flatten(),
+            },
             PromptKind::Filter(argv) => ResolvedKind::Filter(many(argv)?),
         },
     })
@@ -7714,7 +7739,18 @@ struct ResolvedPrompt {
 enum ResolvedKind {
     Choose(Vec<String>),
     Confirm(String),
-    Input(String),
+    Input {
+        question: String,
+        /// The text the field opens with, resolved from the
+        /// activation's snapshot at the same moment the question was.
+        /// `None` covers two upstream facts with one behavior: the
+        /// board did not ask, or it asked and no cursor was up.
+        ///
+        /// Only this variant has it, and that is the point — a seed on
+        /// a list of options is unrepresentable rather than merely
+        /// refused.
+        seed: Option<String>,
+    },
     /// Resolved exactly the way `Choose`'s options are, and meaning
     /// something else entirely: these are not candidates, they are the
     /// PROGRAM whose stdout becomes the candidates.
@@ -17306,7 +17342,10 @@ mod tests {
     fn input_prompt(name: &str, question: &str) -> ResolvedPrompt {
         ResolvedPrompt {
             name: name.to_string(),
-            kind: ResolvedKind::Input(question.to_string()),
+            kind: ResolvedKind::Input {
+                question: question.to_string(),
+                seed: None,
+            },
         }
     }
 
