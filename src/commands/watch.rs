@@ -16221,6 +16221,321 @@ mod tests {
         let out = spawn.command.output().expect("the child spawns");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "eof");
     }
+    // ─── One prompt child ───────────────────────────────────────────
+
+    fn args(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// What the picker will show above its rows.
+    fn header_of(cmd: &std::process::Command) -> Option<String> {
+        let args = args(cmd);
+        let at = args.iter().position(|a| a == "--header")?;
+        args.get(at + 1).cloned()
+    }
+
+    fn choose_prompt(name: &str, options: [&str; 2]) -> ResolvedPrompt {
+        ResolvedPrompt {
+            name: name.to_string(),
+            kind: ResolvedKind::Choose(options.iter().map(|o| (*o).to_string()).collect()),
+        }
+    }
+
+    fn confirm_prompt(name: &str, question: &str) -> ResolvedPrompt {
+        ResolvedPrompt {
+            name: name.to_string(),
+            kind: ResolvedKind::Confirm(question.to_string()),
+        }
+    }
+
+    fn input_prompt(name: &str, question: &str) -> ResolvedPrompt {
+        ResolvedPrompt {
+            name: name.to_string(),
+            kind: ResolvedKind::Input(question.to_string()),
+        }
+    }
+
+    fn filter_prompt(name: &str) -> ResolvedPrompt {
+        ResolvedPrompt {
+            name: name.to_string(),
+            kind: ResolvedKind::Filter(vec!["pb".to_string(), "list".to_string()]),
+        }
+    }
+
+    fn output(code: i32, stdout: &str) -> std::process::Output {
+        // `code << 8` is not decoration: on unix the raw form is a
+        // `wait` status, where the exit code lives in the high byte —
+        // `from_raw(1)` is death by signal, whose `.code()` is None.
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.into(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn each_prompt_kind_builds_the_command_its_shipped_cli_accepts() {
+        let rat = std::path::Path::new("/opt/rat");
+
+        let cmd = prompt_command(rat, &choose_prompt("verdict", ["accepting", "-x"]), Appearance::Dark);
+        assert_eq!(cmd.get_program(), rat.as_os_str());
+        assert_eq!(
+            args(&cmd),
+            ["choose", "--header", "verdict", "--", "accepting", "-x"],
+            "no question slot, so the name is the header — and the separator \
+             is what keeps an option spelled like a flag from becoming one"
+        );
+
+        let cmd = prompt_command(rat, &confirm_prompt("sure", "Record it?"), Appearance::Dark);
+        assert_eq!(args(&cmd), ["confirm", "--", "Record it?"]);
+        assert!(
+            !args(&cmd).iter().any(|a| a == "--show-output"),
+            "a confirm's value comes from its exit status, never from its label"
+        );
+
+        let cmd = prompt_command(rat, &input_prompt("summary", "Summary"), Appearance::Dark);
+        assert_eq!(
+            args(&cmd),
+            ["input", "--header", "Summary"],
+            "not the placeholder: a question that disappears when it is being answered"
+        );
+
+        let cmd = prompt_command(rat, &filter_prompt("rev"), Appearance::Dark);
+        assert_eq!(args(&cmd), ["filter", "--header", "rev"]);
+
+        // Two question-less prompts in one chain must not present the
+        // same header — which is what taking the shipped default would
+        // do, and what this whole mapping exists to avoid.
+        let a = prompt_command(rat, &choose_prompt("verdict", ["yes", "no"]), Appearance::Dark);
+        let b = prompt_command(rat, &choose_prompt("reviewer", ["kim", "sam"]), Appearance::Dark);
+        assert_ne!(header_of(&a), header_of(&b));
+    }
+
+    #[test]
+    fn a_prompt_child_gets_the_boards_appearance_and_no_stdin() {
+        let rat = std::path::Path::new("/opt/rat");
+        let cmd = prompt_command(rat, &input_prompt("summary", "Summary"), Appearance::Light);
+        assert_eq!(
+            action_envs(&cmd).get("RAT_APPEARANCE").map(String::as_str),
+            Some("light"),
+            "a child that resolved its own appearance would query a terminal \
+             whose reader is parked"
+        );
+        // The null stdin has no getter on `Command`, so it is asserted
+        // where it is observable: in the round trip below, by a child
+        // that reads stdin and sees EOF.
+    }
+
+    #[test]
+    fn an_answer_keeps_everything_but_its_own_last_newline() {
+        for (printed, answer) in [
+            ("accepting\n", "accepting"),
+            ("accepting", "accepting"),
+            ("accepting\r\n", "accepting"),
+            // A multi-select keeps its interior newlines.
+            ("a\nb\n", "a\nb"),
+            // ONE terminator comes off, not all of them.
+            ("a\n\n", "a\n"),
+            // Not a trim: an answer may legitimately end in a space.
+            ("trailing \n", "trailing "),
+            // Exit 0 with nothing printed is an empty ANSWER.
+            ("", ""),
+            ("\n", ""),
+        ] {
+            assert_eq!(
+                prompt_answer(&input_prompt("v", "Q"), output(0, printed))
+                    .expect("a zero exit answers")
+                    .value,
+                answer,
+                "{printed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_non_zero_exit_stops_the_chain_and_zero_never_does() {
+        // Enumerated, and deliberately including a code no shipped
+        // picker produces: a malformed argv is a clap usage error at 2,
+        // and a matcher written against the three known codes would let
+        // it through to the command.
+        for code in [1, 124, 130, 2] {
+            assert!(
+                matches!(
+                    prompt_answer(&input_prompt("v", "Q"), output(code, "ignored\n")),
+                    Err(PromptStop::Cancelled)
+                ),
+                "exit {code} must stop the chain"
+            );
+        }
+        assert!(prompt_answer(&input_prompt("v", "Q"), output(0, "kept\n")).is_ok());
+        // A child killed by a signal has no code at all, and it stops
+        // the chain for the same reason.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let killed = std::process::Output {
+                status: std::process::ExitStatus::from_raw(9),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+            assert!(matches!(
+                prompt_answer(&input_prompt("v", "Q"), killed),
+                Err(PromptStop::Cancelled)
+            ));
+        }
+        // An affirmative confirm prints NOTHING, so its answer comes
+        // from the STATUS. Classifying on stdout would hand a passed
+        // confirm an empty string, and a board branching on the
+        // documented value would silently stop matching.
+        assert_eq!(
+            prompt_answer(&confirm_prompt("sure", "Record it?"), output(0, ""))
+                .expect("yes answers")
+                .value,
+            "true"
+        );
+        // Never the label, even if one somehow reached stdout: the
+        // value is derived, not parsed.
+        assert_eq!(
+            prompt_answer(&confirm_prompt("sure", "Record it?"), output(0, "Ship\n"))
+                .expect("yes answers")
+                .value,
+            "true"
+        );
+        // And there is no negative value to represent — a no exited 1
+        // and never reaches the value at all.
+        assert!(matches!(
+            prompt_answer(&confirm_prompt("sure", "Record it?"), output(1, "")),
+            Err(PromptStop::Cancelled)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stand_in_child_round_trips_through_the_runner() {
+        // NOT a real picker: the driver refuses a non-tty outright, so
+        // `rat input` here would exit 1 with a message and this test
+        // would pass for the wrong reason.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "printf 'picked\\n'"]);
+        assert_eq!(
+            run_prompt_child(cmd, &input_prompt("verdict", "Q"), None).expect("a zero exit answers"),
+            PromptAnswer {
+                name: "verdict".to_string(),
+                value: "picked".to_string(),
+            }
+        );
+
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "exit 130"]);
+        assert!(matches!(
+            run_prompt_child(cmd, &input_prompt("verdict", "Q"), None),
+            Err(PromptStop::Cancelled)
+        ));
+
+        // The null stdin, observed where it is observable: a child that
+        // reads stdin sees EOF rather than the reader's keys.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "cat"]);
+        assert_eq!(
+            run_prompt_child(cmd, &input_prompt("v", "Q"), None)
+                .expect("EOF is not a failure")
+                .value,
+            ""
+        );
+
+        let cmd = std::process::Command::new("/rat-no-such-binary-xyz");
+        assert!(matches!(
+            run_prompt_child(cmd, &input_prompt("v", "Q"), None),
+            Err(PromptStop::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn a_candidate_source_spawns_the_way_an_action_command_does() {
+        let cmd = filter_source_command(
+            &["pb".to_string(), "list".to_string(), "--limit".to_string()],
+            &ShellMode::Direct,
+            Appearance::Dark,
+        );
+        assert_eq!(cmd.get_program(), "pb");
+        assert_eq!(args(&cmd), ["list", "--limit"]);
+
+        // Under a shell: one joined line, the same way an action's
+        // command spells the same board text.
+        let cmd = filter_source_command(
+            &["pb".to_string(), "list".to_string()],
+            &ShellMode::Platform,
+            Appearance::Dark,
+        );
+        assert_ne!(cmd.get_program(), "pb", "a shell spec spawns the shell");
+        assert!(args(&cmd).iter().any(|a| a == "pb list"), "{:?}", args(&cmd));
+
+        // The scrub a picker does not need and a source does: a source
+        // is board-author code and may launch a board of its own.
+        let entries = action_env_entries(&cmd);
+        for name in ["RAT_CURSOR", "RAT_CURSOR_PANE", "RAT_CURSOR_LINE"] {
+            assert!(entries.contains(&(name.to_string(), None)), "{name}");
+        }
+        assert_eq!(
+            action_envs(&cmd).get("RAT_APPEARANCE").map(String::as_str),
+            Some("dark")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_source_cancels_before_any_picker_is_built() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "echo nope >&2; exit 3"]);
+        assert!(matches!(run_filter_source(cmd), Err(PromptStop::Cancelled)));
+
+        // A source that succeeded with nothing to offer. NOT an empty
+        // answer — this is the candidate channel, and the only thing a
+        // picker could do with an empty list is present it.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "true"]);
+        assert!(matches!(run_filter_source(cmd), Err(PromptStop::Cancelled)));
+
+        let cmd = std::process::Command::new("/rat-no-such-source-xyz");
+        assert!(matches!(run_filter_source(cmd), Err(PromptStop::Unavailable(_))));
+
+        // The anchor, without which the three above pass against a
+        // function that always cancels.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "printf 'r1\\nr2\\n'"]);
+        assert_eq!(run_filter_source(cmd).expect("candidates"), b"r1\nr2\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_candidates_reach_the_picker_on_its_stdin_and_the_pipe_closes() {
+        // A stand-in picker that reads stdin and prints what it got. If
+        // the pipe were left open, `cat` would never see EOF and this
+        // test would HANG rather than fail — so it guards the drop as
+        // well as the write.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "cat"]);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        let answer = run_prompt_child(cmd, &filter_prompt("rev"), Some(b"r1\nr2\n".to_vec()))
+            .expect("answered");
+        assert_eq!(
+            answer.value, "r1\nr2",
+            "the candidates arrive, and one trailing newline comes off"
+        );
+    }
     // ─── action_line ────────────────────────────────────────────────
 
     #[cfg(unix)]
