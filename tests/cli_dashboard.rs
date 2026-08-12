@@ -3105,6 +3105,56 @@ fn a_panes_command_never_inherits_a_selection_from_rats_own_environment() {
     );
 }
 
+/// A pane's command never sees an ANSWER either, and the hazard has
+/// the same shape as the cursor's: a value already in rat's own
+/// environment, inherited by every child. The family is open — its
+/// names come from a board's own declarations — so the removal is a
+/// sweep rather than a list, and this is the pane-side witness that
+/// the sweep runs at all.
+///
+/// Both shells can say "absent", and neither says it the other's way,
+/// for the reasons the cursor's twin above records.
+#[test]
+fn a_panes_command_never_inherits_an_answer_from_rats_own_environment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    #[cfg(unix)]
+    let probe = "echo ANS=[${RAT_PROMPT_VERDICT-unset}]";
+    #[cfg(windows)]
+    let probe = "echo ANS=[%RAT_PROMPT_VERDICT%]";
+    #[cfg(unix)]
+    let absent = "ANS=[unset]";
+    #[cfg(windows)]
+    let absent = "ANS=[%RAT_PROMPT_VERDICT%]";
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "row-gap 0\n\npane \"probe\" {{\n    height 3\n    border \"none\"\n    chrome #false\n    shell #true\n    interval \"1h\"\n    \
+             command \"{probe}\"\n}}\n",
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "80")
+        .env("RAT_HEIGHT", "12")
+        .env("RAT_PROMPT_VERDICT", "XYZZY-LEAKED-ANSWER")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    // Removed, not blanked: a child must be able to tell "nothing was
+    // asked" from "the answer was empty", which is the distinction the
+    // contract makes everywhere else.
+    assert!(
+        stdout.contains(absent),
+        "a pane inherited an answer: {stdout}"
+    );
+    assert!(
+        !stdout.contains("XYZZY"),
+        "an inherited value leaked into a pane: {stdout}"
+    );
+}
+
 /// The same board twice, differing only in one pane declaration: the
 /// one that asks for a line cursor. The helper asserts that the pair
 /// differs in nothing else, so the comparison below is about the

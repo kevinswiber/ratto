@@ -16299,6 +16299,191 @@ mod tests {
         );
     }
 
+    // ─── Two surfaces, one answer ───────────────────────────────────
+
+    fn answer(name: &str, value: &str) -> PromptAnswer {
+        PromptAnswer {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// The command a completed activation spawns, through the same
+    /// merge-then-expand the loop performs.
+    fn spawn_for_test(binding: &KeyBinding, ctx: Activation) -> ActionSpawn {
+        let ctx = merge_answers(ctx);
+        expand_action(binding, 0, &ctx, &ScriptFiles::default(), Appearance::Dark)
+            .expect("the command expands")
+    }
+
+    fn built_with(answers: &[PromptAnswer]) -> ActionSpawn {
+        build_action_command(
+            &ResolvedProgram::Argv(vec!["true".into()]),
+            &ShellMode::Direct,
+            ActionScript::None,
+            Appearance::Dark,
+            None,
+            answers,
+        )
+    }
+
+    #[test]
+    fn each_answer_reaches_the_command_as_an_uppercased_variable() {
+        let spawn = built_with(&[
+            answer("verdict", "accepting"),
+            answer("summary", "ships as is"),
+        ]);
+        let envs = action_envs(&spawn.command);
+        assert_eq!(
+            envs.get("RAT_PROMPT_VERDICT").map(String::as_str),
+            Some("accepting")
+        );
+        assert_eq!(
+            envs.get("RAT_PROMPT_SUMMARY").map(String::as_str),
+            Some("ships as is")
+        );
+        // The guard against a tail that REPLACED the shipped
+        // environment instead of joining it.
+        assert!(envs.contains_key("RAT_APPEARANCE"));
+    }
+
+    #[test]
+    fn an_empty_answer_is_set_and_empty_rather_than_absent() {
+        // A reader who pressed Enter on an empty field has answered,
+        // and only the entries view can tell "set and empty" from
+        // "never set".
+        let entries = action_env_entries(&built_with(&[answer("note", "")]).command);
+        assert!(
+            entries.contains(&("RAT_PROMPT_NOTE".to_string(), Some(String::new()))),
+            "an answered-empty question must be set and empty: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn the_environment_and_the_template_map_carry_the_same_answer() {
+        for (value, expanded) in [
+            ("requesting-changes", "record requesting-changes"),
+            // Inserted LITERALLY: the substitution scans the original
+            // text once and never rescans what it pushed.
+            ("{{verdict}}", "record {{verdict}}"),
+            ("", "record "),
+        ] {
+            let mut binding = declared_binding(Key::Char('a'));
+            binding.program = crate::core::dashboard_file::BindingProgram::Argv(vec![
+                Template::extract("record"),
+                Template::extract("{{verdict}}"),
+            ]);
+            let mut ctx = activation_for(0);
+            ctx.prompts = vec![answer("verdict", value)];
+            let spawn = spawn_for_test(&binding, ctx);
+            assert_eq!(argv_of(&spawn.command).join(" "), expanded, "{value:?}");
+            assert_eq!(
+                action_envs(&spawn.command)
+                    .get("RAT_PROMPT_VERDICT")
+                    .map(String::as_str),
+                Some(value),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_accepted_prompt_name_becomes_a_variable_a_shell_can_read() {
+        // The cross-check between the load-time rule and the
+        // environment spelling: two expressions of one fact drift the
+        // moment one is corrected, so this asks where they would
+        // disagree rather than trusting them to agree.
+        for candidate in ["a", "verdict", "_x", "x9", "code-review", "cøde", "9x", ""] {
+            if !crate::core::dashboard_file::is_prompt_name(candidate) {
+                continue;
+            }
+            let name = crate::core::dashboard_file::env_name(candidate);
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+                "{candidate:?} is accepted but yields {name:?}, which no shell can reference"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inherited_answer_is_removed_before_this_activations_answers_are_set() {
+        let mut command = std::process::Command::new("true");
+        scrub_inherited_prompts(
+            &mut command,
+            // The last two are the hazard rows, not filler: an
+            // environment is arbitrary bytes, and this predicate runs
+            // over every name in it on every command build.
+            [
+                "RAT_PROMPT_STALE",
+                "RAT_PROMPT_VERDICT",
+                "PATH",
+                "RAT_CURSOR",
+                "RAT_PROMPTé",
+                "RAT_PROM",
+            ]
+            .map(str::to_string),
+        );
+        let entries = action_env_entries(&command);
+        assert!(entries.contains(&("RAT_PROMPT_STALE".to_string(), None)));
+        assert!(entries.contains(&("RAT_PROMPT_VERDICT".to_string(), None)));
+        // The falsification arm: a sweep that removed everything would
+        // pass the two assertions above and break every board.
+        assert!(
+            !entries
+                .iter()
+                .any(|(k, _)| k == "PATH" || k == "RAT_CURSOR")
+        );
+        assert!(!entries.iter().any(|(k, _)| k == "RAT_PROM"));
+
+        // Case: the environment itself is case-insensitive on Windows,
+        // so a lowercase spelling IS the same variable there and a
+        // different one here.
+        assert_eq!(is_prompt_env("rat_prompt_x"), cfg!(windows));
+
+        // And the ordering: an inherited name that this activation also
+        // answers must arrive SET, not removed. An environment is a map
+        // rather than a log, so this holds only if the sweep precedes
+        // the sets.
+        let spawn = built_with(&[answer("verdict", "accepting")]);
+        let entries = action_env_entries(&spawn.command);
+        assert!(!entries.contains(&("RAT_PROMPT_VERDICT".to_string(), None)));
+        assert!(
+            entries
+                .iter()
+                .any(|(k, v)| k == "RAT_PROMPT_VERDICT" && v.is_some())
+        );
+    }
+
+    #[test]
+    fn the_guard_runs_before_any_prompt_and_carries_no_answer() {
+        // The ladder fact that makes the emptiness true, asserted where
+        // the ladder is.
+        let binding = asking(with_when(declared_binding(Key::Char('a'))), 1);
+        assert_eq!(
+            next_step(&binding, GateOutcome::Passed(Rung::Prepare)),
+            Some(GateStep::Guard)
+        );
+        // And the environment: the family's removals are present, and
+        // nothing in it is set. An inherited answer must not reach a
+        // precondition either.
+        let spawn = build_action_command(
+            &ResolvedProgram::Script("test -n x".to_string()),
+            &ShellMode::Platform,
+            ActionScript::None,
+            Appearance::Dark,
+            None,
+            &[],
+        );
+        let entries = action_env_entries(&spawn.command);
+        assert!(
+            !entries
+                .iter()
+                .any(|(k, v)| k.starts_with("RAT_PROMPT_") && v.is_some()),
+            "a precondition carried an answer: {entries:?}"
+        );
+    }
+
     #[test]
     fn a_selection_overwrites_a_removal_rather_than_racing_it() {
         // A command's environment is a map rather than a log, so this

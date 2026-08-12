@@ -9710,3 +9710,288 @@ fn a_cancelled_binding_asks_again_on_the_next_press_and_still_runs_nothing() {
     session.write_bytes(b"q");
     session.kill_if_alive(Duration::from_secs(2));
 }
+
+// ─── The answers a command receives ─────────────────────────────────
+
+/// A binding body that probes the answer family the way `PROBE_SH`
+/// probes the cursor's: what the value is, and whether the name is set
+/// at all. The colon-less forms are the point — `:-` would treat an
+/// empty answer as no answer, which is precisely the distinction the
+/// contract makes.
+const ANSWER_PROBE_SH: &str = "\
+printf 'ANS=[%s] PRESENT=[%s]\\n' \\
+    \"${RAT_PROMPT_VERDICT-<unset>}\" \"${RAT_PROMPT_VERDICT+present}\" > @OUT@
+";
+
+fn read_answer_probe(out: &std::path::Path) -> Option<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(out)
+            && text.contains("PRESENT=[")
+        {
+            return Some(text.trim_end().to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
+/// A board with two bindings: `x` probes without asking anything, and
+/// `r` asks first. One fixture serves both halves of the leak witness.
+fn answer_probe_board(dir: &std::path::Path) -> (std::path::PathBuf, String) {
+    let out = dir.join("answer-probe.txt");
+    let script = dir.join("answer-probe.sh");
+    write_script(&script, ANSWER_PROBE_SH, &out);
+    let board = format!(
+        "row-gap 0\n\n\
+         key \"x\" {{\n    description \"probe\"\n    shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+         key \"r\" {{\n    description \"ask then probe\"\n    prompt \"verdict\" choose=\"accepting,requesting-changes\"\n    \
+         shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+         pane \"steady\" {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
+         command \"echo steady-content\"\n}}\n",
+        script = script.display(),
+    );
+    (out, board)
+}
+
+/// An answer already in rat's own environment reaches nothing: not a
+/// binding that asked nothing, and not one that asked and got its own.
+/// The second half is what distinguishes a sweep from a builder that
+/// simply never sets the family.
+#[test]
+fn an_inherited_answer_never_reaches_an_action() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (out, board) = answer_probe_board(dir.path());
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_PROMPT_VERDICT", "XYZZY-LEAKED-ANSWER")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"x");
+    let absent = read_answer_probe(&out).expect("the binding never probed its environment");
+    assert!(
+        !absent.contains("XYZZY"),
+        "an inherited value leaked: {absent}"
+    );
+    // Removed, not blanked: a command must be able to tell "nothing was
+    // asked" from "the answer was empty".
+    assert!(
+        absent.contains("ANS=[<unset>]") && absent.contains("PRESENT=[]"),
+        "{absent}"
+    );
+
+    std::fs::remove_file(&out).expect("clear the probe");
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"accepting",
+            Duration::from_secs(8)
+        ),
+        "the question never painted"
+    );
+    session.write_bytes(b"\r");
+    let real = read_answer_probe(&out).expect("the binding never probed its environment");
+    assert!(!real.contains("XYZZY"), "an inherited value leaked: {real}");
+    assert!(
+        real.contains("ANS=[accepting]") && real.contains("PRESENT=[present]"),
+        "{real}"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A candidate source is board-author code and inherits rat's
+/// environment exactly as a pane's command does — the third surface,
+/// and the one that never had a scrub of any kind.
+#[test]
+fn an_inherited_answer_never_reaches_a_candidate_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("source-probe.txt");
+    let script = dir.path().join("source.sh");
+    // The probe goes to a FILE: the source's stdout is the candidate
+    // list, so a probe written there becomes a picker entry and the
+    // test would start asserting on a menu.
+    write_script(
+        &script,
+        "printf 'ANS=[%s] PRESENT=[%s]\\n' \\\n    \"${RAT_PROMPT_VERDICT-<unset>}\" \
+         \"${RAT_PROMPT_VERDICT+present}\" > @OUT@\nprintf 'r-one\\n'\n",
+        &out,
+    );
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\n\
+             key \"r\" {{\n    description \"pick\"\n    prompt \"rev\" filter=\"sh {script}\"\n    \
+             shell #true\n    output \"hide\"\n    command \"true\"\n}}\n\n\
+             pane \"steady\" {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
+             command \"echo steady-content\"\n}}\n",
+            script = script.display(),
+        ),
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_PROMPT_VERDICT", "XYZZY-LEAKED-ANSWER")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(&session, &mut terminal, b"r-one", Duration::from_secs(8)),
+        "the candidates never reached the picker"
+    );
+    session.write_bytes(b"\r");
+    let probed = read_answer_probe(&out).expect("the source never probed its environment");
+    assert!(
+        !probed.contains("XYZZY"),
+        "an inherited value leaked into a candidate source: {probed}"
+    );
+    assert!(
+        probed.contains("ANS=[<unset>]") && probed.contains("PRESENT=[]"),
+        "removed, not emptied: {probed}"
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// Nothing carries over between presses: the second command's
+/// environment holds the second activation's answer and nothing of the
+/// first. There is no field to store one in, and this says so from
+/// outside.
+#[test]
+fn a_second_press_carries_only_its_own_answers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (out, board) = answer_probe_board(dir.path());
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"accepting",
+            Duration::from_secs(8)
+        ),
+        "the question never painted"
+    );
+    session.write_bytes(b"\r");
+    let first = read_answer_probe(&out).expect("the binding never probed its environment");
+    assert!(first.contains("ANS=[accepting]"), "{first}");
+
+    std::fs::remove_file(&out).expect("clear the probe");
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"requesting-changes",
+            Duration::from_secs(8)
+        ),
+        "the question never painted a second time"
+    );
+    // Down one row, then accept: a different answer from the same
+    // question, which is what makes the carry-over visible.
+    session.write_bytes(b"j\r");
+    let second = read_answer_probe(&out).expect("the binding never probed its environment");
+    assert!(
+        second.contains("ANS=[requesting-changes]"),
+        "the second answer never arrived: {second}"
+    );
+    assert!(
+        !second.contains("accepting]"),
+        "the first press's answer survived into the second: {second}"
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// The non-rest arm for the answer's arrival: pressed on a
+/// frame-scrolled board, and the board resumes its live frame after.
+#[test]
+fn an_answer_reaches_a_command_from_a_frame_scrolled_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("answer-probe.txt");
+    let script = dir.path().join("answer-probe.sh");
+    write_script(&script, ANSWER_PROBE_SH, &out);
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"ask then probe\"\n    prompt \"verdict\" choose=\"accepting,requesting-changes\"\n    \
+             output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+             pane \"a\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n\
+             pane \"b\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}}\n",
+            script = script.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(3)),
+        "the frame never scrolled — the binding would press at live rest"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"accepting",
+            Duration::from_secs(8)
+        ),
+        "the question never painted"
+    );
+    session.write_bytes(b"\r");
+    let probed = read_answer_probe(&out).expect("the binding never probed its environment");
+    assert!(probed.contains("ANS=[accepting]"), "{probed}");
+    assert!(
+        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(8)),
+        "the board never came back to the offset it left"
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}
