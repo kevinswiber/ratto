@@ -5050,7 +5050,7 @@ key "r" {{
 
     // ─── The `prompt` node ──────────────────────────────────────────
 
-    use crate::core::dashboard_file::PromptKind;
+    use crate::core::dashboard_file::{PromptKind, is_prompt_name};
 
     #[test]
     fn a_binding_declares_its_prompts_in_the_order_they_are_written() {
@@ -5196,6 +5196,236 @@ key "r" {{
         ));
         assert_eq!(loaded[0].prompts.len(), 1);
         assert!(matches!(loaded[0].prompts[0].kind, PromptKind::Input(_)));
+    }
+
+    /// `ONE_PANE`, plus the one flag that lets a cursor exist. Every
+    /// `from-cursor` fixture needs it: a seed is refused on a board
+    /// where no pane asked for a marked line, so a board built from
+    /// `ONE_PANE` would be refused for the wrong reason.
+    const SELECTABLE_PANE: &str = "\npane \"a\" { command \"true\"\nheight 3\nselectable #true }\n";
+
+    #[test]
+    fn a_prompt_name_is_one_a_command_can_read() {
+        for name in ["verdict", "_scratch", "rev2"] {
+            let decls = declared(&format!(
+                "key \"a\" {{ description \"d\"\nprompt \"{name}\" input=\"?\"\ncommand \"y\" }}\n{ONE_PANE}"
+            ));
+            assert_eq!(decls[0].prompts[0].name, name);
+        }
+        for name in ["code-review", "2nd", "", "sómmaire", "my name"] {
+            let err = binding_err(&format!(
+                "key \"a\" {{ description \"d\"\nprompt \"{name}\" input=\"?\"\ncommand \"y\" }}\n{ONE_PANE}"
+            ));
+            assert!(err.starts_with("key \"a\" > prompt"), "{name:?}: {err}");
+            assert!(err.contains("starts with a letter"), "{name:?}: {err}");
+        }
+        // The hyphen row's reason is the one not visible from the
+        // grammar: `$RAT_PROMPT_CODE-REVIEW` is not an error in `sh`,
+        // it is an unset variable followed by the text `-REVIEW`.
+        let err = binding_err(&format!(
+            "key \"a\" {{ description \"d\"\nprompt \"code-review\" input=\"?\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("environment variable"), "{err}");
+        assert!(err.contains("code_review"), "{err}");
+    }
+
+    #[test]
+    fn every_name_a_prompt_accepts_is_also_one_a_command_body_can_reference() {
+        // Enumerated over the byte space, not sampled: a prompt name is
+        // bound as `{{name}}` as well, so a byte this rule admits and
+        // the reference rule refuses would be an answer nothing could
+        // interpolate. Three positions, because a first byte and a
+        // later byte obey different halves of both rules.
+        for byte in 0u8..=127 {
+            let ch = char::from(byte).to_string();
+            for candidate in [ch.clone(), format!("a{ch}"), format!("{ch}a")] {
+                assert!(
+                    !is_prompt_name(&candidate) || is_reference_name(&candidate),
+                    "{candidate:?} is a prompt name and not a reference name"
+                );
+            }
+        }
+        // And the one byte where they differ ON PURPOSE, named rather
+        // than left as the gap between two loops.
+        assert!(is_reference_name("a-b") && !is_prompt_name("a-b"));
+    }
+
+    #[test]
+    fn two_prompts_that_reach_the_command_as_one_name_are_refused() {
+        // The case difference is the test: an exact-match check passes
+        // this board and ships a binding whose second answer silently
+        // overwrites the first.
+        for second in ["SUMMARY", "summary"] {
+            let err = binding_err(&format!(
+                "key \"a\" {{ description \"d\"\n\
+                 prompt \"summary\" input=\"?\"\n\
+                 prompt \"{second}\" input=\"?\"\n\
+                 command \"y\" }}\n{ONE_PANE}"
+            ));
+            assert!(err.contains("RAT_PROMPT_SUMMARY"), "{second}: {err}");
+        }
+        // Two bindings never run together, so their prompts cannot
+        // collide — a board-wide rule would refuse a board for a
+        // collision that cannot happen.
+        assert_eq!(
+            declared(&format!(
+                "key \"a\" {{ description \"d\"\nprompt \"summary\" input=\"?\"\ncommand \"y\" }}\n\
+                 key \"e\" {{ description \"d\"\nprompt \"summary\" input=\"?\"\ncommand \"y\" }}\n\
+                 {ONE_PANE}"
+            ))
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_prompt_may_not_take_a_declared_variables_name() {
+        let err = binding_err(&format!(
+            "variables {{\n    store \"/tmp/x\"\n}}\n\
+             key \"a\" {{ description \"d\"\nprompt \"store\" input=\"?\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("already a declared variable"), "{err}");
+        // Exact, not case-folded: `{{STORE}}` is a reference nothing
+        // else claims, and a variable never reaches the environment
+        // under its own name at all.
+        let decls = declared(&format!(
+            "variables {{\n    store \"/tmp/x\"\n}}\n\
+             key \"a\" {{ description \"d\"\nprompt \"STORE\" input=\"?\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(decls[0].prompts[0].name, "STORE");
+    }
+
+    #[test]
+    fn a_prompt_needs_a_kind_and_takes_only_one() {
+        let err = binding_err(&format!(
+            "key \"a\" {{ description \"d\"\nprompt \"v\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("needs a kind"), "{err}");
+        let err = binding_err(&format!(
+            "key \"a\" {{ description \"d\"\nprompt \"v\" choose=\"a,b\" input=\"?\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        // Which two, named — the case that happens is an author editing
+        // a `choose` into an `input` and leaving the old property.
+        assert!(err.contains("`choose`"), "{err}");
+        assert!(err.contains("`input`"), "{err}");
+    }
+
+    #[test]
+    fn a_command_may_reference_this_bindings_own_prompt() {
+        let decls = declared(&format!(
+            "key \"a\" {{ description \"d\"\n\
+             prompt \"verdict\" choose=\"a,b\"\n\
+             command \"pb assessment add --verdict {{{{verdict}}}}\" }}\n{ONE_PANE}"
+        ));
+        let BindingProgram::Argv(argv) = &decls[0].program else {
+            panic!("the binding runs an argv")
+        };
+        // Recorded as a reference, not flattened: the substitution
+        // happens at the keypress, against the map the answers join.
+        assert!(argv.iter().any(|word| word.refs() == ["verdict"]));
+        let decls = declared(&format!(
+            "key \"a\" {{ description \"d\"\n\
+             prompt \"verdict\" choose=\"a,b\"\n\
+             script \"echo {{{{verdict}}}}\" }}\n{ONE_PANE}"
+        ));
+        let BindingProgram::Script(body) = &decls[0].program else {
+            panic!("the binding runs a script")
+        };
+        assert_eq!(body.refs(), ["verdict"]);
+        // And the widening did not leak: a reference to a prompt that
+        // does not exist is still the ordinary miss.
+        let err = binding_err(&format!(
+            "key \"a\" {{ description \"d\"\ncommand \"pb add {{{{verdict}}}}\" }}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("unknown variable `verdict`"), "{err}");
+    }
+
+    #[test]
+    fn an_answer_cannot_be_read_before_it_is_given() {
+        for site in [
+            "when \"test {{verdict}}\"",
+            "confirm \"Record {{verdict}}?\"",
+            "description \"assess {{verdict}}\"",
+            "prompt \"summary\" input=\"Summary for {{verdict}}\"",
+        ] {
+            let body = if site.starts_with("description") {
+                format!("{site}\nprompt \"verdict\" choose=\"a,b\"\ncommand \"y\"")
+            } else {
+                format!("description \"d\"\nprompt \"verdict\" choose=\"a,b\"\n{site}\ncommand \"y\"")
+            };
+            let err = binding_err(&format!("key \"a\" {{ {body} }}\n{ONE_PANE}"));
+            assert!(err.contains("is this binding's prompt"), "{site}: {err}");
+            assert!(err.contains("does not exist here"), "{site}: {err}");
+            // Never the generic miss: the name is written six lines up,
+            // and being told it is unknown sends the author hunting for
+            // a typo that is not there.
+            assert!(!err.contains("unknown variable"), "{site}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_input_prompt_may_start_from_the_marked_line() {
+        let decls = declared(&format!(
+            "key \"a\" {{ description \"d\"\n\
+             prompt \"summary\" input=\"Summary\" from-cursor=#true\n\
+             command \"y\" }}\n{SELECTABLE_PANE}"
+        ));
+        assert!(decls[0].prompts[0].from_cursor);
+        // The default, which is what leaves every board that ships
+        // today unchanged.
+        let decls = declared(&format!(
+            "key \"a\" {{ description \"d\"\nprompt \"s\" input=\"?\"\ncommand \"y\" }}\n{SELECTABLE_PANE}"
+        ));
+        assert!(!decls[0].prompts[0].from_cursor);
+    }
+
+    #[test]
+    fn a_seed_is_refused_where_there_is_nothing_to_seed() {
+        for kind in ["choose=\"a,b\"", "confirm=\"Sure?\"", "filter=\"pb list\""] {
+            let err = binding_err(&format!(
+                "key \"a\" {{ description \"d\"\nprompt \"v\" {kind} from-cursor=#true\ncommand \"y\" }}\n{SELECTABLE_PANE}"
+            ));
+            assert!(err.contains("`from-cursor`"), "{kind}: {err}");
+            assert!(err.contains("input"), "{kind}: {err}");
+        }
+        // The filter row names the query, because it is the row
+        // somebody will later "fix" by reaching for its own initial
+        // text — which hides candidates rather than filling a line.
+        let err = binding_err(&format!(
+            "key \"a\" {{ description \"d\"\nprompt \"rev\" filter=\"pb list\" from-cursor=#true\ncommand \"y\" }}\n{SELECTABLE_PANE}"
+        ));
+        assert!(err.contains("query"), "{err}");
+        // And a board with no cursor to read: plain, then the pane that
+        // asked for a cursor but opted out of navigation — which can
+        // never be reached to receive one.
+        for pane in [
+            ONE_PANE.to_string(),
+            "\npane \"a\" { command \"true\"\nheight 3\nselectable #true\nfocusable #false }\n"
+                .to_string(),
+        ] {
+            let err = binding_err(&format!(
+                "key \"a\" {{ description \"d\"\nprompt \"s\" input=\"?\" from-cursor=#true\ncommand \"y\" }}\n{pane}"
+            ));
+            assert!(err.contains("no pane on this board asked"), "{pane}: {err}");
+        }
+    }
+
+    #[test]
+    fn prompts_keep_their_written_order_even_with_other_keys_between_them() {
+        let decls = declared(&format!(
+            "key \"a\" {{ description \"d\"\n\
+             prompt \"one\" input=\"?\"\n\
+             when \"test -s ./x\"\n\
+             prompt \"two\" input=\"?\"\n\
+             confirm \"Sure?\"\n\
+             prompt \"three\" input=\"?\"\n\
+             command \"y\" }}\n{ONE_PANE}"
+        ));
+        let names: Vec<&str> = decls[0].prompts.iter().map(|p| p.name.as_str()).collect();
+        // A "collect the prompt children first, then the rest" walk
+        // would still produce these three names and would produce them
+        // in the wrong places on a board that interleaves.
+        assert_eq!(names, ["one", "two", "three"]);
     }
 
     #[test]

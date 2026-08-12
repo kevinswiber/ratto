@@ -2207,6 +2207,26 @@ fn check_refuses_an_unknown_variable_with_its_place() {
 }
 
 #[test]
+fn check_refuses_a_prompt_name_a_command_could_not_read() {
+    // One arm, not a matrix: every prompt refusal is raised in the same
+    // walk, so this proves the route reaches it and the rest stay unit
+    // tests that cost no process.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "key \"a\" {\n    description \"assess\"\n    prompt \"code-review\" input=\"What?\"\n    command \"true\"\n}\n\npane \"p\" {\n    height 3\n    command \"true\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("starts with a letter"))
+        .stderr(predicates::str::contains("code_review"));
+}
+
+#[test]
 fn check_reports_a_variable_cycle_as_a_path() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = fixture(
