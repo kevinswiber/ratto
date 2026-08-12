@@ -5851,14 +5851,57 @@ fn page_with_handoff(
     #[cfg(unix)] theme_sub: &mut Option<ThemeNotifyGuard<std::io::Stdout>>,
     #[cfg(unix)] verify: &mut VerifyState,
 ) -> Option<String> {
-    // The pager reads the same terminal. Stop the pushes first, then
+    with_terminal_handoff(
+        mouse_guard,
+        #[cfg(unix)]
+        tap,
+        #[cfg(unix)]
+        theme_sub,
+        #[cfg(unix)]
+        verify,
+        || page_frame(content, renderer, fullscreen),
+    )
+    // The handoff answers whether anything ran; the sentence is ours.
+    .unwrap_or_else(|| Some(pager_unavailable()))
+}
+
+/// What a caller says when the terminal was never handed over. The
+/// pager's words, kept whole and kept here, because a sentence a
+/// reader has met is not a detail of the bracket that failed to run.
+fn pager_unavailable() -> String {
+    "pager unavailable: the input reader did not yield; try again".to_string()
+}
+
+/// Hand the terminal to a child, and take it back. Theme pushes
+/// suspended, mouse capture suspended, the input reader parked and its
+/// confirmation REQUIRED before anything is spawned, then the reader
+/// and pushes resumed in that order (a report always has someone to
+/// read it).
+///
+/// ONE implementation, and what runs in the middle is the caller's:
+/// the frame pager, the key reference, an action's `output "pager"`,
+/// and a binding's questions. A second copy of a seven-step terminal
+/// handoff would drift, and the symptom of divergence is a terminal
+/// the reader has to `reset`.
+///
+/// `None` means the reader would not confirm its park, so the terminal
+/// was never handed over and **the payload never ran**. Every caller
+/// answers it in its own words; no caller may run its payload anyway.
+fn with_terminal_handoff<W: std::io::Write, T>(
+    mouse_guard: &mut Option<MouseGuard<W>>,
+    #[cfg(unix)] tap: Option<&TtyTap>,
+    #[cfg(unix)] theme_sub: &mut Option<ThemeNotifyGuard<W>>,
+    #[cfg(unix)] verify: &mut VerifyState,
+    payload: impl FnOnce() -> T,
+) -> Option<T> {
+    // The child reads the same terminal. Stop the pushes first, then
     // park our reader, so a report can never land in a foreign
     // reader's input.
     #[cfg(unix)]
     if let Some(sub) = theme_sub.as_mut() {
         let _ = sub.suspend();
     }
-    // The pager doesn't speak SGR mouse reports; leaving tracking on
+    // A child doesn't speak SGR mouse reports; leaving tracking on
     // sprays bytes into its command line. Remember whether capture was
     // ours to restore — an m-released mouse must stay released across
     // the round trip.
@@ -5873,11 +5916,7 @@ fn page_with_handoff(
     let handed_off = tap.is_none_or(|tap| tap.pause());
     #[cfg(windows)]
     let handed_off = true;
-    let pager_notice = if handed_off {
-        page_frame(content, renderer, fullscreen)
-    } else {
-        Some("pager unavailable: the input reader did not yield; try again".to_string())
-    };
+    let out = handed_off.then(payload);
     // Reader first, then pushes: a report always has someone to read
     // it.
     #[cfg(unix)]
@@ -5895,7 +5934,53 @@ fn page_with_handoff(
     if mouse_was_active && let Some(guard) = mouse_guard.as_mut() {
         let _ = guard.resume();
     }
-    pager_notice
+    out
+}
+
+/// Release the terminal for a child that will draw on it, then take it
+/// back. Raw mode off, this renderer finished, the alternate screen
+/// left if we hold it — and the console kept decoding UTF-8 for the
+/// child's lifetime.
+///
+/// `?1049` is not a nesting counter: a child may take the alternate
+/// screen itself, and its leave would drop the terminal to the normal
+/// buffer with rat's content gone. Leave first; the child runs on the
+/// normal screen like the inline mode always had. A child that takes
+/// no alternate screen needs the same leave for the other half of the
+/// reason — it would otherwise paint into ours, and erase from its own
+/// origin downward on the way out.
+fn with_released_terminal<W: std::io::Write, T>(
+    renderer: &mut InlineRenderer<W>,
+    fullscreen: bool,
+    payload: impl FnOnce() -> T,
+) -> T {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = renderer.finish();
+    if fullscreen {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[?1049l");
+        let _ = out.flush();
+    }
+    // The child inherits the console; keep it decoding UTF-8 while the
+    // child owns the screen (more.com garbles the frame otherwise, and
+    // a picker's own prefix glyphs fare no better).
+    let _console_utf8 = ConsoleUtf8Guard::enable();
+
+    let out = payload();
+
+    let _ = crossterm::terminal::enable_raw_mode();
+    if fullscreen {
+        // Re-entered fresh: the alternate screen we left was
+        // discarded, so there is no frame of ours to resume over —
+        // the next draw starts from a blank buffer.
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(b"\x1b[?1049h");
+        let _ = stdout.flush();
+        renderer.restart_on_blank_screen();
+    } else {
+        renderer.resume_over_own_frame();
+    }
+    out
 }
 
 fn page_frame(
@@ -5904,64 +5989,38 @@ fn page_frame(
     fullscreen: bool,
 ) -> Option<String> {
     let pagers = resolve_pagers(&SystemEnv);
-    let mut used = pagers.first().map(|p| p.bin.clone()).unwrap_or_default();
-    let _ = crossterm::terminal::disable_raw_mode();
-    let _ = renderer.finish();
-    // `?1049` is not a nesting counter: the default pager takes the
-    // alternate screen itself, and its leave would drop the terminal
-    // to the normal buffer with rat's content gone. Leave first; the
-    // pager runs on the normal screen like the inline mode always had.
-    if fullscreen {
-        use std::io::Write;
-        let mut out = std::io::stdout();
-        let _ = out.write_all(b"\x1b[?1049l");
-        let _ = out.flush();
-    }
-    // The pager inherits the console; keep it decoding UTF-8 while the
-    // pager owns the screen (more.com garbles the frame otherwise).
-    let _console_utf8 = ConsoleUtf8Guard::enable();
-
-    let result = (|| -> std::io::Result<()> {
-        let (bin, mut child) = spawn_first(&pagers)?;
-        used = bin;
-        // Quitting the pager before it reads everything is normal; do not
-        // let the default SIGPIPE disposition kill the watch for it.
-        #[cfg(unix)]
-        unsafe {
-            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-        }
-        let write_result = (|| -> std::io::Result<()> {
-            let mut stdin = child.stdin.take().expect("stdin piped");
-            for line in lines {
-                writeln!(stdin, "{line}")?;
+    let first = pagers.first().map(|p| p.bin.clone()).unwrap_or_default();
+    let (used, result) = with_released_terminal(renderer, fullscreen, || {
+        let mut used = first;
+        let result = (|| -> std::io::Result<()> {
+            let (bin, mut child) = spawn_first(&pagers)?;
+            used = bin;
+            // Quitting the pager before it reads everything is normal; do not
+            // let the default SIGPIPE disposition kill the watch for it.
+            #[cfg(unix)]
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_IGN);
             }
+            let write_result = (|| -> std::io::Result<()> {
+                let mut stdin = child.stdin.take().expect("stdin piped");
+                for line in lines {
+                    writeln!(stdin, "{line}")?;
+                }
+                Ok(())
+            })();
+            #[cfg(unix)]
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
+            match write_result {
+                Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => return Err(err),
+                _ => {}
+            }
+            child.wait()?;
             Ok(())
         })();
-        #[cfg(unix)]
-        unsafe {
-            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-        }
-        match write_result {
-            Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => return Err(err),
-            _ => {}
-        }
-        child.wait()?;
-        Ok(())
-    })();
-
-    let _ = crossterm::terminal::enable_raw_mode();
-    if fullscreen {
-        // Re-entered fresh: the alternate screen we left was
-        // discarded, so there is no frame of ours to resume over —
-        // the next draw starts from a blank buffer.
-        use std::io::Write;
-        let mut out = std::io::stdout();
-        let _ = out.write_all(b"\x1b[?1049h");
-        let _ = out.flush();
-        renderer.restart_on_blank_screen();
-    } else {
-        renderer.resume_over_own_frame();
-    }
+        (used, result)
+    });
     match result {
         Ok(()) => None,
         Err(err) => Some(format!(
