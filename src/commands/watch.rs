@@ -25,7 +25,9 @@ use crate::core::child::{
     Rung, ShutdownGuard, TickEvent, not_started, run_tick, spawn_action, spawn_live_tick,
     spawn_tick,
 };
-use crate::core::dashboard_file::{BindingOutput, BindingProgram, KeyBinding, Prompt, PromptKind};
+use crate::core::dashboard_file::{
+    BindingOutput, BindingProgram, KeyBinding, Prompt, PromptKind, env_name,
+};
 use crate::core::duration::{brief_duration, parse_interval};
 use crate::core::layout::{
     PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
@@ -6245,6 +6247,20 @@ fn resolve_spawn<'a>(
 /// plan merges prompt answers into the map first), builds through the
 /// one construction point, launches, forgets. A failure to even start
 /// reaches the reader through the disposition path rather than
+/// The answers join the map the command expands against.
+///
+/// Here rather than at the preparation rung, where no answer exists
+/// yet, and not inside the expander, which resolves nothing by design.
+/// `insert` rather than insert-if-vacant: load already refuses a
+/// question that shadows a declared variable, so a check here would be
+/// a weaker second copy of a decision already made.
+fn merge_answers(mut ctx: Activation) -> Activation {
+    for answer in &ctx.prompts {
+        ctx.vars.insert(answer.name.clone(), answer.value.clone());
+    }
+    ctx
+}
+
 /// vanishing.
 fn launch_command(
     binding: &KeyBinding,
@@ -6254,6 +6270,7 @@ fn launch_command(
     appearance: Appearance,
     tx: &std::sync::mpsc::Sender<TickEvent>,
 ) {
+    let ctx = merge_answers(ctx);
     let spawned = expand_action(binding, index, &ctx, scripts, appearance).and_then(|spawn| {
         spawn_action(
             spawn,
@@ -6314,6 +6331,12 @@ fn launch_guard(
         ActionScript::None,
         appearance,
         ctx.selection.as_ref(),
+        // The same expression the command gets, never an empty
+        // literal: the emptiness here is the LADDER's guarantee — a
+        // guard runs two rungs before any question — and a special case
+        // at this one site is what the next thing added to the builder
+        // would have to remember.
+        &ctx.prompts,
     );
     spawn_action(
         spawn,
@@ -6461,6 +6484,7 @@ fn expand_action(
         script,
         appearance,
         ctx.selection.as_ref(),
+        &ctx.prompts,
     ))
 }
 
@@ -6536,7 +6560,63 @@ fn build_source_command(
     command.env_remove("RAT_CURSOR");
     command.env_remove("RAT_CURSOR_PANE");
     command.env_remove("RAT_CURSOR_LINE");
+    // A pane's command never sees an ANSWER either, for the same
+    // reason — swept rather than listed, because that family's names
+    // come from a board's own declarations.
+    scrub_inherited_prompts(&mut command, inherited_env_names());
     command
+}
+
+/// Whether an inherited name belongs to the answer family.
+///
+/// A prefix rather than a list, because the family is OPEN — the names
+/// come from a board's own declarations, so a nested board's cannot be
+/// written down in advance the way the cursor's three can.
+fn is_prompt_env(name: &str) -> bool {
+    const PREFIX: &str = "RAT_PROMPT_";
+    // Case-insensitive where the ENVIRONMENT is: on Windows
+    // `rat_prompt_x` is the same variable, so leaving it would leave
+    // the value. On unix it is a different variable this feature never
+    // sets, and removing it would reach past what we own.
+    #[cfg(windows)]
+    {
+        // `get`, never a fixed-offset slice. This runs once per
+        // inherited name on EVERY command build, and slicing at a byte
+        // offset panics when that offset falls inside a multi-byte
+        // character — one such name in anyone's environment would take
+        // the whole board down. `None` on a non-boundary is the right
+        // answer anyway: such a name is not in the family.
+        name.get(..PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+    }
+    #[cfg(not(windows))]
+    {
+        name.starts_with(PREFIX)
+    }
+}
+
+/// Remove every inherited answer from a child's environment.
+///
+/// The names are a PARAMETER rather than a read of the environment
+/// inside, so the rule is unit-testable without mutating a process
+/// environment — which this repo does nowhere.
+fn scrub_inherited_prompts<I: IntoIterator<Item = String>>(
+    command: &mut std::process::Command,
+    inherited: I,
+) {
+    for name in inherited {
+        if is_prompt_env(&name) {
+            command.env_remove(&name);
+        }
+    }
+}
+
+/// The inherited names, from the real environment. One expression,
+/// three callers — the action builder, the pane builder, and the
+/// candidate-source builder: every process a board author's text
+/// becomes.
+fn inherited_env_names() -> impl Iterator<Item = String> {
+    std::env::vars_os().map(|(k, _)| k.to_string_lossy().into_owned())
 }
 
 /// The child ONE key-action runs, fully configured on the loop thread.
@@ -6570,6 +6650,12 @@ fn build_action_command(
     // caller that could forget is a `when` that judges a different line
     // from the command it guards.
     selection: Option<&Selection>,
+    // This activation's answers, in declaration order. REQUIRED rather
+    // than a setter, for the reason the selection above is: both routes
+    // into this function must answer, and a caller that could forget is
+    // a `when` judging a world the command will not see. Empty is the
+    // ordinary case and means the binding asked nothing.
+    prompts: &[PromptAnswer],
 ) -> ActionSpawn {
     // The command and the file's owner are produced TOGETHER, because
     // they leave together: `ActionSpawn` is one value precisely so the
@@ -6638,6 +6724,14 @@ fn build_action_command(
         command.env("RAT_CURSOR", &sel.text);
         command.env("RAT_CURSOR_PANE", &sel.pane);
         command.env("RAT_CURSOR_LINE", sel.line.to_string());
+    }
+    // Removed before set, like the cursor's three above — and swept
+    // rather than listed, because these names come from a board's own
+    // declarations. A board nested inside another board would otherwise
+    // read the outer board's answers as its own.
+    scrub_inherited_prompts(&mut command, inherited_env_names());
+    for answer in prompts {
+        command.env(env_name(&answer.name), &answer.value);
     }
     // All three fields from the ONE construction point — no caller
     // attaches anything afterwards, because a caller that forgets is a
@@ -6751,6 +6845,10 @@ fn filter_source_command(
     command.env_remove("RAT_CURSOR");
     command.env_remove("RAT_CURSOR_PANE");
     command.env_remove("RAT_CURSOR_LINE");
+    // And the answers, for the same reason plus one of its own: a
+    // source runs DURING the chain, so an earlier answer must not reach
+    // it either.
+    scrub_inherited_prompts(&mut command, inherited_env_names());
     command
 }
 
@@ -7673,8 +7771,6 @@ struct Activation {
     /// still never owns the state a keypress mutates: the typed text
     /// lived in a one-shot child, and this vector dies with the
     /// activation.
-    // The command builder reads these next; the allow comes off there.
-    #[allow(dead_code)]
     prompts: Vec<PromptAnswer>,
 }
 
@@ -16274,6 +16370,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             None,
+            &[],
         );
         let entries = action_env_entries(&spawn.command);
         for name in ["RAT_CURSOR", "RAT_CURSOR_PANE", "RAT_CURSOR_LINE"] {
@@ -16369,7 +16466,11 @@ mod tests {
             ("", "record "),
         ] {
             let mut binding = declared_binding(Key::Char('a'));
+            // `true` is the program; the two words after it are what
+            // the expansion is read from (`argv_of` yields arguments
+            // only).
             binding.program = crate::core::dashboard_file::BindingProgram::Argv(vec![
+                Template::extract("true"),
                 Template::extract("record"),
                 Template::extract("{{verdict}}"),
             ]);
@@ -16501,6 +16602,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             Some(&sel),
+            &[],
         );
         let entries = action_env_entries(&spawn.command);
         for name in ["RAT_CURSOR", "RAT_CURSOR_PANE", "RAT_CURSOR_LINE"] {
@@ -16528,6 +16630,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             Some(&sel),
+            &[],
         );
         let envs = action_envs(&spawn.command);
         assert_eq!(
@@ -16555,6 +16658,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             None,
+            &[],
         );
         let envs = action_envs(&spawn.command);
         assert!(!envs.contains_key("RAT_CURSOR"));
@@ -16646,6 +16750,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             ctx.selection.as_ref(),
+            &ctx.prompts,
         );
         let (a, b) = (action_envs(&command.command), action_envs(&guard.command));
         for name in ["RAT_CURSOR", "RAT_CURSOR_PANE", "RAT_CURSOR_LINE"] {
@@ -16664,6 +16769,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             None,
+            &[],
         );
         assert_eq!(program_of(&spawn.command), "some-tool");
         assert_eq!(argv_of(&spawn.command), ["--flag", "value"]);
@@ -16681,6 +16787,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             None,
+            &[],
         );
         assert_eq!(program_of(&spawn.command), "fish");
         assert_eq!(argv_of(&spawn.command), ["-c", "echo hi"]);
@@ -16708,6 +16815,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             None,
+            &[],
         );
         assert_eq!(program_of(&spawn.command), "fish");
         let own = resolve(
@@ -16719,6 +16827,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             None,
+            &[],
         );
         assert_eq!(program_of(&spawn.command), "sh");
     }
@@ -16732,6 +16841,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             None,
+            &[],
         );
         assert_eq!(program_of(&spawn.command), "sh");
         assert_eq!(argv_of(&spawn.command), ["-c", "echo hi"]);
@@ -16751,6 +16861,7 @@ mod tests {
             },
             Appearance::Dark,
             None,
+            &[],
         );
         match SHEBANG_ARM {
             ShebangArm::Kernel => assert_eq!(spawn.command.get_program(), path.as_os_str()),
@@ -16783,6 +16894,7 @@ mod tests {
             script,
             Appearance::Dark,
             None,
+            &[],
         );
         let out = spawn.command.output().expect("the child spawns");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
@@ -16839,6 +16951,7 @@ mod tests {
             },
             Appearance::Dark,
             None,
+            &[],
         );
         let owned_script =
             activation_script(&dir, "key-0-7", "#!/bin/sh\necho owned-ran").expect("write");
@@ -16848,6 +16961,7 @@ mod tests {
             owned_script,
             Appearance::Dark,
             None,
+            &[],
         );
         drop(scripts);
         drop(dir);
@@ -16894,6 +17008,7 @@ mod tests {
             first,
             Appearance::Dark,
             None,
+            &[],
         );
         let child_one = first
             .command
@@ -16907,6 +17022,7 @@ mod tests {
             second,
             Appearance::Dark,
             None,
+            &[],
         );
         let child_two = second
             .command
@@ -16957,6 +17073,7 @@ mod tests {
             ActionScript::None,
             Appearance::Light,
             None,
+            &[],
         );
         let envs = action_envs(&spawn.command);
         assert_eq!(
@@ -16991,6 +17108,7 @@ mod tests {
             ActionScript::None,
             Appearance::Dark,
             None,
+            &[],
         );
         let out = spawn.command.output().expect("the child spawns");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "eof");
