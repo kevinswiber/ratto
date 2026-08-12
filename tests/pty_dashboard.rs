@@ -9995,3 +9995,203 @@ fn an_answer_reaches_a_command_from_a_frame_scrolled_board() {
     session.write_bytes(b"q");
     session.kill_if_alive(Duration::from_secs(2));
 }
+
+/// Two questions, one command, and the order is observable exactly
+/// once: in the sequence the questions appear on screen.
+#[test]
+fn two_prompts_answer_one_command_in_declaration_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("both.txt");
+    let script = dir.path().join("both.sh");
+    write_script(
+        &script,
+        "printf 'V=[%s] N=[%s]\\n' \"${RAT_PROMPT_VERDICT-<unset>}\" \
+         \"${RAT_PROMPT_NOTE-<unset>}\" > @OUT@\n",
+        &out,
+    );
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\n\
+             key \"r\" {{\n    description \"assess\"\n    \
+             prompt \"verdict\" choose=\"accepting,requesting-changes\"\n    \
+             prompt \"note\" choose=\"ships,holds\"\n    \
+             shell #true\n    output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+             pane \"steady\" {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n    interval \"1h\"\n    \
+             command \"echo steady-content\"\n}}\n",
+            script = script.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    // The first question's header is the first question's NAME, which
+    // is how the two are told apart on screen.
+    assert!(
+        wait_for(&session, &mut terminal, b"verdict", Duration::from_secs(8)),
+        "the first question never painted"
+    );
+    session.write_bytes(b"\r");
+    assert!(
+        wait_for(&session, &mut terminal, b"ships", Duration::from_secs(8)),
+        "the second question never painted"
+    );
+    session.write_bytes(b"\r");
+    let probed = read_answer_probe_named(&out, "N=[").expect("the binding never probed");
+    assert!(
+        probed.contains("V=[accepting]") && probed.contains("N=[ships]"),
+        "{probed}"
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// Like `read_answer_probe`, for a probe whose completion marker is its
+/// own.
+fn read_answer_probe_named(out: &std::path::Path, marker: &str) -> Option<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(out)
+            && text.contains(marker)
+        {
+            return Some(text.trim_end().to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
+/// A board whose `r` binding asks one seeded question and probes the
+/// answer. `selectable` so a cursor can exist at all.
+fn seeded_board(dir: &std::path::Path) -> (std::path::PathBuf, String) {
+    let out = dir.join("seeded.txt");
+    let script = dir.join("seeded.sh");
+    write_script(
+        &script,
+        "printf 'S=[%s]\\n' \"${RAT_PROMPT_SUMMARY-<unset>}\" > @OUT@\n",
+        &out,
+    );
+    let board = format!(
+        "row-gap 0\n\ndefaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n    selectable #true\n}}\n\n\
+         key \"r\" {{\n    description \"summarize\"\n    \
+         prompt \"summary\" input=\"Summary\" from-cursor=#true\n    \
+         output \"hide\"\n    command \"sh {script}\"\n}}\n\n\
+         pane \"a\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n\
+         pane \"b\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}}\n",
+        script = script.display(),
+    );
+    (out, board)
+}
+
+/// The field opens on the marked line — from a frame-scrolled board,
+/// with the cursor moved off the first line, so a seed that always
+/// showed line one fails.
+#[test]
+fn a_seeded_prompt_opens_on_the_marked_line_from_a_frame_scrolled_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (out, board) = seeded_board(dir.path());
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(3)),
+        "the frame never scrolled — the binding would press at live rest"
+    );
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 1/",
+            Duration::from_secs(3)
+        ),
+        "the cursor never appeared"
+    );
+    // Off the first line, so a seed that always showed A01 fails.
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 2/",
+            Duration::from_secs(3)
+        ),
+        "the cursor never moved"
+    );
+    session.write_bytes(b"r");
+    // The prompt's own chrome first: the marked line's text is on
+    // screen for a different reason before the press.
+    assert!(
+        wait_for(&session, &mut terminal, b"Summary", Duration::from_secs(8)),
+        "the question never painted"
+    );
+    session.write_bytes(b"\r");
+    let probed = read_answer_probe_named(&out, "S=[").expect("the binding never probed");
+    assert!(
+        probed.contains("S=[A02]"),
+        "the field opened elsewhere: {probed}"
+    );
+    assert!(
+        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(8)),
+        "the board never came back to the offset it left"
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// The same board with no cursor raised: the field opens EMPTY and a
+/// typed answer still reaches the command. The arm that keeps the
+/// attribute from being a trap.
+#[test]
+fn a_prompt_with_no_cursor_opens_empty_rather_than_declining() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (out, board) = seeded_board(dir.path());
+    let decl = write_dashboard(dir.path(), &board);
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(&session, &mut terminal, b"Summary", Duration::from_secs(8)),
+        "the question never painted"
+    );
+    session.write_bytes(b"typed-by-hand");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"typed-by-hand",
+            Duration::from_secs(5)
+        ),
+        "the typing never reached the field"
+    );
+    session.write_bytes(b"\r");
+    let probed = read_answer_probe_named(&out, "S=[").expect("the binding never probed");
+    assert!(
+        probed.contains("S=[typed-by-hand]"),
+        "an unseeded field did not open empty: {probed}"
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}

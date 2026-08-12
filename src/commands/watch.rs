@@ -16586,6 +16586,166 @@ mod tests {
         );
     }
 
+    /// The argument after a flag, or `None` when the flag is absent —
+    /// position-then-index, so a flag carrying the WRONG value cannot
+    /// pass a `contains` check.
+    fn value_after(argv: &[String], flag: &str) -> Option<String> {
+        let at = argv.iter().position(|a| a == flag)?;
+        argv.get(at + 1).cloned()
+    }
+
+    /// An activation answering two questions, declared in an order the
+    /// sort would change and answered with values that are not in
+    /// sorted order either — so a builder that zipped a sorted name
+    /// list against a declaration-ordered value list fails.
+    fn two_answer_activation() -> (crate::core::dashboard_file::KeyBinding, Activation) {
+        let mut binding = declared_binding(Key::Char('a'));
+        binding.program = crate::core::dashboard_file::BindingProgram::Argv(vec![
+            Template::extract("true"),
+            Template::extract("record"),
+            Template::extract("{{verdict}}"),
+            Template::extract("{{note}}"),
+        ]);
+        let mut ctx = activation_for(0);
+        ctx.prompts = vec![answer("verdict", "z-first"), answer("note", "a-second")];
+        (binding, ctx)
+    }
+
+    #[test]
+    fn each_answer_lands_under_its_own_name_when_several_prompts_run() {
+        let (binding, ctx) = two_answer_activation();
+        let spawn = spawn_for_test(&binding, ctx);
+        let envs = action_envs(&spawn.command);
+        // Both in one test: a swap satisfies neither, but a test
+        // asserting one name would pass against a builder that dropped
+        // the other.
+        assert_eq!(
+            envs.get("RAT_PROMPT_VERDICT").map(String::as_str),
+            Some("z-first")
+        );
+        assert_eq!(
+            envs.get("RAT_PROMPT_NOTE").map(String::as_str),
+            Some("a-second")
+        );
+    }
+
+    #[test]
+    fn both_surfaces_agree_for_every_prompt_in_a_chain() {
+        // The failure this adds to the one-answer witness: a map that
+        // got declaration order beside an environment that got sorted
+        // order.
+        let (binding, ctx) = two_answer_activation();
+        let spawn = spawn_for_test(&binding, ctx);
+        assert_eq!(argv_of(&spawn.command).join(" "), "record z-first a-second");
+    }
+
+    #[test]
+    fn a_resolved_seed_becomes_the_fields_initial_value() {
+        let rat = std::path::Path::new("/opt/rat");
+        let seeded = ResolvedPrompt {
+            name: "summary".to_string(),
+            kind: ResolvedKind::Input {
+                question: "Summary".to_string(),
+                seed: Some("L02 green".to_string()),
+            },
+        };
+        let argv = argv_of(&prompt_command(rat, &seeded, Appearance::Dark));
+        assert_eq!(value_after(&argv, "--value").as_deref(), Some("L02 green"));
+
+        // The flag's ABSENCE is the other half of the contract, and it
+        // is what a tidy-up to `unwrap_or_default()` would erase.
+        let plain = ResolvedPrompt {
+            name: "summary".to_string(),
+            kind: ResolvedKind::Input {
+                question: "Summary".to_string(),
+                seed: None,
+            },
+        };
+        let argv = argv_of(&prompt_command(rat, &plain, Appearance::Dark));
+        assert!(!argv.iter().any(|a| a == "--value"), "{argv:?}");
+    }
+
+    fn seeding_prompt(from_cursor: bool) -> crate::core::dashboard_file::Prompt {
+        crate::core::dashboard_file::Prompt {
+            name: "summary".to_string(),
+            kind: crate::core::dashboard_file::PromptKind::Input(Template::extract("Summary")),
+            from_cursor,
+        }
+    }
+
+    fn marked(text: &str) -> Selection {
+        Selection {
+            pane: "a".to_string(),
+            line: 2,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_seed_matrix() {
+        let seed_of = |prompt: &crate::core::dashboard_file::Prompt, sel: Option<&Selection>| {
+            match resolve_prompt(prompt, &Bindings::new(), sel)
+                .expect("resolves")
+                .kind
+            {
+                ResolvedKind::Input { seed, .. } => seed,
+                other => panic!("not an input: {other:?}"),
+            }
+        };
+        // No cursor is EMPTY INITIAL TEXT, not an error — a board that
+        // wants the line usually has one, and refusing would make the
+        // attribute a trap.
+        assert_eq!(seed_of(&seeding_prompt(true), None), None);
+        assert_eq!(
+            seed_of(&seeding_prompt(true), Some(&marked("L02 green"))),
+            Some("L02 green".to_string())
+        );
+        // A blank marked line still seeds: "the line is empty" and
+        // "there is no line" are different facts here as everywhere.
+        assert_eq!(
+            seed_of(&seeding_prompt(true), Some(&marked(""))),
+            Some(String::new())
+        );
+        // The falsification arm: without it every row above passes
+        // against a resolver that seeds unconditionally.
+        assert_eq!(
+            seed_of(&seeding_prompt(false), Some(&marked("L02 green"))),
+            None
+        );
+    }
+
+    #[test]
+    fn the_seeded_field_and_the_exported_line_are_the_same_string() {
+        let sel = marked("L02 green");
+        let mut ctx = activation_for(0);
+        ctx.selection = Some(sel.clone());
+        let resolved = resolve_prompt(&seeding_prompt(true), &ctx.vars, ctx.selection.as_ref())
+            .expect("resolves");
+        let child = prompt_command(
+            std::path::Path::new("/opt/rat"),
+            &resolved,
+            Appearance::Dark,
+        );
+        let seeded = value_after(&argv_of(&child), "--value");
+        let spawn = build_action_command(
+            &ResolvedProgram::Argv(vec!["true".into()]),
+            &ShellMode::Direct,
+            ActionScript::None,
+            Appearance::Dark,
+            ctx.selection.as_ref(),
+            &ctx.prompts,
+        );
+        let exported = action_envs(&spawn.command).get("RAT_CURSOR").cloned();
+        assert!(
+            exported.is_some(),
+            "a fixture with no cursor makes this vacuous"
+        );
+        assert_eq!(
+            seeded, exported,
+            "the field and the export are one snapshot"
+        );
+    }
+
     #[test]
     fn a_selection_overwrites_a_removal_rather_than_racing_it() {
         // A command's environment is a map rather than a log, so this
