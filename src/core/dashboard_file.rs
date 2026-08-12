@@ -299,6 +299,13 @@ pub(crate) fn is_prompt_name(name: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// The family every answer's environment name belongs to. Written
+/// once, because the name that SETS a variable and the sweep that
+/// removes an inherited one are two expressions of one fact, and the
+/// day one is corrected they would disagree — silently, since a sweep
+/// that misses looks exactly like a sweep that had nothing to do.
+pub(crate) const PROMPT_ENV_PREFIX: &str = "RAT_PROMPT_";
+
 /// The environment name a command reads this answer under. The ONE
 /// derivation: the load-time uniqueness check compares these, and the
 /// action builder sets them, so a name that two prompts would share is
@@ -308,7 +315,7 @@ pub(crate) fn is_prompt_name(name: &str) -> bool {
 /// ASCII, and a locale-aware uppercasing of `ß` is `SS` — two bytes
 /// for one, and a name that is not the name.
 pub(crate) fn env_name(name: &str) -> String {
-    format!("RAT_PROMPT_{}", name.to_ascii_uppercase())
+    format!("{PROMPT_ENV_PREFIX}{}", name.to_ascii_uppercase())
 }
 
 /// Which shipped picker asks the question. Four kinds, one per

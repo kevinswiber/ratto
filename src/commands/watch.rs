@@ -6573,7 +6573,8 @@ fn build_source_command(
 /// come from a board's own declarations, so a nested board's cannot be
 /// written down in advance the way the cursor's three can.
 fn is_prompt_env(name: &str) -> bool {
-    const PREFIX: &str = "RAT_PROMPT_";
+    // The setter's own prefix, not a second spelling of it.
+    const PREFIX: &str = crate::core::dashboard_file::PROMPT_ENV_PREFIX;
     // Case-insensitive where the ENVIRONMENT is: on Windows
     // `rat_prompt_x` is the same variable, so leaving it would leave
     // the value. On unix it is a different variable this feature never
