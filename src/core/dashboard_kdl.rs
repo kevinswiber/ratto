@@ -204,8 +204,9 @@ fn set_command(decl: &mut PaneDecl, argv: Vec<Template>, ctx: &Ctx<'_>) -> anyho
 
 /// One word under a shell stays one word; anything else is split, and
 /// an unbalanced string is a parse error naming the block — never a
-/// one-word fallback that survives to a spawn. ONE rule, two callers:
-/// `set_command` (a pane's) and `BINDING_KEYS`' `command` row.
+/// one-word fallback that survives to a spawn. ONE rule, three callers:
+/// `set_command` (a pane's), `BINDING_KEYS`' `command` row, and
+/// `filter_source` (a prompt's candidate command).
 fn split_command(argv: Vec<Template>, ctx: &Ctx<'_>) -> anyhow::Result<Vec<Template>> {
     Ok(match argv.as_slice() {
         // One word under `shell` stays one word.
