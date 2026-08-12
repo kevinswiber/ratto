@@ -8,7 +8,8 @@
 // Focus the `changed` pane, press `s` to put a cursor in it, walk the
 // cursor with j/k, and press `x`. The path under the cursor lands in a
 // handoff file: a small file the `x` binding writes and the panes below
-// trigger on. The choice lives in that file, in the filesystem — the
+// trigger on. Then press `a` to record a verdict on it — the board asks
+// before it writes. The choice lives in that file, in the filesystem — the
 // panes only read it, which is also why it can still be driven by hand
 // from another terminal:
 //
@@ -30,6 +31,12 @@
 //    why the guard below asks which PANE the cursor is in rather
 //    than whether the marked text is empty — and `x` writes it, leaving
 //    the console in its empty state. Edit a file and the board fills.
+// 5. The guard runs before the questions, so a binding that cannot do
+//    its job asks nothing: press `a` with nothing selected and one
+//    line says so.
+// 6. Cancel at any of `a`'s three interruptions — the confirm, the
+//    verdict, the summary — and nothing happens. No line is written,
+//    and the next press starts over.
 
 title "review"
 
@@ -56,6 +63,11 @@ variables {
     // it cannot be raw — the inner quotes are escaped instead, because
     // a literal can be raw or interpolating, never both.
     cur "test -s \"{{sel}}\" && cat \"{{sel}}\" || echo -" shell=#true defer=#true
+
+    // Where a verdict lands. Beside the handoff file rather than in the
+    // working tree — same store, same reasoning, and nothing to clean
+    // up out of a checkout.
+    log "{{store}}/review.notes"
 }
 
 defaults {
@@ -72,7 +84,7 @@ row {
     // index mean a file. Nothing here is derived — this pane is what
     // the reader points at.
     pane "changed" {
-        title "changed files — s, then j/k, then x"
+        title "changed files"
         height 8
         interval "10s"
         shell #true
@@ -93,6 +105,19 @@ row {
         trigger "file:{{sel}}"
         shell #true
         command "echo {{cur}}"
+    }
+
+    // Joined to this row rather than stacked below it: a row takes its
+    // tallest pane's height, so a third pane costs width and leaves the
+    // board's 80x24 fit alone. Without it the write's effect would be
+    // invisible, and the example would teach nothing the status row did
+    // not already say.
+    pane "notes" {
+        title "verdicts"
+        interval "never"
+        trigger "file:{{log}}"
+        shell #true
+        command "test -s \"{{log}}\" && tail -n 5 \"{{log}}\" || echo 'no verdicts yet'"
     }
 }
 
@@ -127,6 +152,28 @@ key "x" {
     shell #true
     output "hide"
     command "printf '%s' \"$RAT_CURSOR\" > \"{{sel}}\""
+}
+
+// The binding this console is for: it asks before it writes. `when`
+// runs first, so pressing it with nothing selected declines in one line
+// and asks nothing at all — which is the whole reason the guard is a
+// `when` and not the first line of the command.
+//
+// The verdict is about the file that was SELECTED — what is in the
+// handoff file, which is what the diff pane is showing — not about
+// wherever the cursor happens to be sitting when the key is pressed.
+//
+// `>>` rather than `>`: the log is a history a reader can look at, and
+// it shows that the board keeps nothing itself.
+key "a" {
+    description "record a verdict on the selected file"
+    when "test -s \"{{sel}}\""
+    confirm "Record a verdict?"
+    prompt "verdict" choose="looks-good,needs-changes,question"
+    prompt "summary" input="One line, please"
+    shell #true
+    output "hide"
+    command "printf '%s\\t%s\\t%s\\n' \"{{cur}}\" \"$RAT_PROMPT_VERDICT\" \"$RAT_PROMPT_SUMMARY\" >> \"{{log}}\""
 }
 
 key "X" {

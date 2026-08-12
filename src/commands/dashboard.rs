@@ -263,6 +263,13 @@ fn binding_help(bindings: &[KeyBinding]) -> Vec<String> {
         if binding.confirm.is_some() {
             notes.push("asks before running");
         }
+        // In execution order: the confirm runs before the questions do,
+        // so the two notes read in the order the reader meets the
+        // interruptions. No count — the number of questions is in the
+        // board file, and `?` says that there are some.
+        if !binding.prompts.is_empty() {
+            notes.push("asks for input");
+        }
         let body = if notes.is_empty() {
             binding.description.clone()
         } else {
@@ -285,6 +292,11 @@ fn binding_help(bindings: &[KeyBinding]) -> Vec<String> {
         ));
     }
     lines.extend(BINDING_HELP_TAIL.iter().map(|l| (*l).to_string()));
+    // Conditional, like the cursor's rows: a board where no binding
+    // asks must gain nothing at all.
+    if bindings.iter().any(|b| !b.prompts.is_empty()) {
+        lines.extend(PROMPT_HELP_TAIL.iter().map(|l| (*l).to_string()));
+    }
     lines
 }
 
@@ -303,6 +315,21 @@ const BINDING_HELP_TAIL: &[&str] = &[
     "    on their intervals and their triggers, not the instant the key",
     "    is pressed. An action can also decline before it runs; the",
     "    status row names the key that declined.",
+];
+
+/// What a binding that asks costs the reader, said once for the board
+/// rather than per row: the questions own the screen while they are
+/// up, and abandoning one abandons the whole action.
+///
+/// Conditional, like the cursor rows: a board where no binding asks
+/// must gain nothing at all.
+const PROMPT_HELP_TAIL: &[&str] = &[
+    "",
+    "    A binding that asks takes the screen to ask it: the frame goes",
+    "    away, the questions arrive in the order the board declares",
+    "    them, and the board comes back to the view it left. Cancel any",
+    "    one of them and nothing runs — no later question, no command,",
+    "    nothing half-recorded.",
 ];
 
 /// The gestures every board answers, up to the `Esc` row — which is
@@ -511,7 +538,7 @@ const TEMPLATES: &[BoardTemplate] = &[
     },
     BoardTemplate {
         name: "review",
-        summary: "a review console: derived paths, the handoff file, event triggers",
+        summary: "a review console that asks before it writes: pick, confirm, record",
         body: include_str!("../../examples/review.kdl"),
     },
     BoardTemplate {
@@ -1342,6 +1369,36 @@ mod tests {
         }
     }
 
+    /// Inspected through the RESOLVED board, never the bytes: the
+    /// example's header comment names every keyword the grammar has,
+    /// so a substring check would pass on a board with no binding at
+    /// all.
+    #[test]
+    fn the_review_example_declares_a_prompting_binding() {
+        use crate::core::dashboard_file::PromptKind;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/review.kdl");
+        let board = validated(std::path::Path::new(path), false, &Bindings::new())
+            .expect("the example loads: parses, binds no claimed key, and resolves");
+        let asking = board
+            .bindings
+            .iter()
+            .find(|b| !b.prompts.is_empty())
+            .expect("the review console asks before it writes");
+        // All four rungs, because the order is the contract and only a
+        // binding carrying every rung can show it.
+        assert!(asking.when.is_some(), "{asking:?}");
+        assert!(asking.confirm.is_some(), "{asking:?}");
+        assert_eq!(asking.prompts.len(), 2, "{asking:?}");
+        assert!(
+            matches!(asking.prompts[0].kind, PromptKind::Choose(_)),
+            "{asking:?}"
+        );
+        assert!(
+            matches!(asking.prompts[1].kind, PromptKind::Input(_)),
+            "{asking:?}"
+        );
+    }
+
     #[test]
     fn the_report_shape_is_pinned() {
         use crate::core::variables::resolve_partial;
@@ -1649,6 +1706,79 @@ mod tests {
         assert!(
             !line_for("advance the queue").contains('('),
             "a `when` earns no annotation: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_prompting_binding_says_it_asks_for_input() {
+        let mut asking = shown('a', "assess this change");
+        asking.prompts = vec![crate::core::dashboard_file::Prompt {
+            name: "verdict".to_string(),
+            kind: crate::core::dashboard_file::PromptKind::Input(
+                crate::core::template::Template::extract("Summary"),
+            ),
+            from_cursor: false,
+        }];
+        let mut both = asking.clone();
+        both.confirm = Some("Really?".to_string());
+        both.description = "record".to_string();
+        let plain = shown('n', "advance the queue");
+        let lines = pane_help(&registry(false), &[asking, both, plain]);
+        let line_for = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?} in {lines:?}"))
+        };
+        assert!(
+            line_for("assess this change").ends_with("(asks for input)"),
+            "{lines:?}"
+        );
+        // Both notes, in the order the reader meets the interruptions:
+        // the confirm runs before the questions do.
+        assert!(
+            line_for("record").ends_with("(asks before running, asks for input)"),
+            "{lines:?}"
+        );
+        assert!(
+            !line_for("advance the queue").contains('('),
+            "a binding that asks nothing earns no annotation: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_reference_grows_the_prompt_paragraph_only_where_a_binding_asks() {
+        let plain = shown('n', "advance the queue");
+        let mut asking = shown('a', "assess this change");
+        asking.prompts = vec![crate::core::dashboard_file::Prompt {
+            name: "verdict".to_string(),
+            kind: crate::core::dashboard_file::PromptKind::Input(
+                crate::core::template::Template::extract("Summary"),
+            ),
+            from_cursor: false,
+        }];
+        let without = pane_help(&registry(false), std::slice::from_ref(&plain));
+        let with = pane_help(&registry(false), &[plain, asking]);
+        assert!(
+            !without.iter().any(|l| l.contains("takes the screen")),
+            "a board where nothing asks must gain nothing: {without:?}"
+        );
+        // The DIFFERENCE, never a second copy of the whole reference:
+        // a literal here would go stale against the one above without
+        // either failing.
+        let added: Vec<&String> = with
+            .iter()
+            .filter(|l| !without.contains(l) && !l.contains("assess this change"))
+            .collect();
+        assert_eq!(
+            added,
+            [
+                "    A binding that asks takes the screen to ask it: the frame goes",
+                "    away, the questions arrive in the order the board declares",
+                "    them, and the board comes back to the view it left. Cancel any",
+                "    one of them and nothing runs — no later question, no command,",
+                "    nothing half-recorded.",
+            ]
         );
     }
 

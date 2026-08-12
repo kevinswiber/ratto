@@ -5766,15 +5766,21 @@ key "r" {{
     }
 
     #[test]
-    fn no_shipped_board_asks_a_question_yet() {
-        // The default path: every board that ships today declares no
-        // prompts, so the grammar's arrival changes nothing a reader
-        // can see — and the day one of them does ask, this is where the
-        // change is announced.
-        for text in SHIPPED_EXAMPLES {
-            for binding in parse(text).expect("the example parses").bindings {
-                assert!(binding.prompts.is_empty(), "{}", binding.spelling);
-            }
-        }
+    fn exactly_one_shipped_board_asks_a_question() {
+        // The default path, from the other side: one shipped board
+        // demonstrates the feature and every other one is untouched by
+        // its arrival. Counted rather than sampled, so a board that
+        // starts asking announces itself here.
+        let asking: usize = SHIPPED_EXAMPLES
+            .iter()
+            .filter(|text| {
+                parse(text)
+                    .expect("the example parses")
+                    .bindings
+                    .iter()
+                    .any(|binding| !binding.prompts.is_empty())
+            })
+            .count();
+        assert_eq!(asking, 1, "exactly one shipped board asks");
     }
 }

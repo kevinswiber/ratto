@@ -752,7 +752,8 @@ a raw string that stays literal — and
 paths derive at load, so the same file works in a primary checkout, a
 linked worktree, or a clone; it is also where the line cursor and a
 handoff file compose — mark a changed file with `s`, press `x`, and
-the panes below pick it up on their own triggers.
+the panes below pick it up on their own triggers; press `a` and the
+board asks for a verdict and a summary before it writes one.
 [`examples/keys.kdl`](examples/keys.kdl) is a board that acts — three
 key bindings, one guarded, one confirmed, each `output` disposition
 shown once. Every one of these ships inside the binary too:
@@ -812,14 +813,102 @@ a key that looks broken. `pager` hands the command's output to the
 pager, the way `v` hands it a pane's body.
 
 **`when` decides before anything else happens.** The order is fixed:
-`when`, then `confirm`, then the command. A non-zero exit from `when`
-declines the binding — no question is asked, no command is spawned,
-and one status line names the key, so a guarded binding reads as a
-decision rather than a dead key. Write the guard in `when` rather than
-at the top of the command: a guard inside the command fires after the
-question has already been answered, which is the wrong end of the
-interaction. The convention is the shell's own, the one `test` and
-`if` already use — zero runs it, non-zero does not.
+`when`, then `confirm`, then the prompts, then the command. A non-zero
+exit from `when` declines the binding — no question is asked, no
+command is spawned, and one status line names the key, so a guarded
+binding reads as a decision rather than a dead key. Write the guard in
+`when` rather than at the top of the command: a guard inside the
+command fires after the question has already been answered, which is
+the wrong end of the interaction — and with prompts declared it fires
+after everything the reader typed, and throws it away. The convention
+is the shell's own, the one `test` and `if` already use — zero runs
+it, non-zero does not.
+
+**A binding can ask before it runs.** A `prompt` child names a
+variable, a kind, and the question:
+
+```kdl
+key "a" {
+    description "assess this change"
+    prompt "verdict" choose="accepted,needs-changes"
+    prompt "summary" input="Summary"
+    command "./record.sh"
+}
+```
+
+Press `a` and the board hands the terminal over: the frame goes away,
+`rat choose` asks for a verdict, `rat input` takes the summary, and
+the board comes back to the view it left — same focus, same zoom, same
+scroll, same cursor. Then the command runs. Prompts run in the order
+they are declared, and the four kinds are four commands rat already
+ships:
+
+| | |
+|---|---|
+| `choose="a,b,c"` | pick one from a list written into the board |
+| `filter="<command>"` | fuzzy-find over what that command prints |
+| `input="<question>"` | type a line |
+| `confirm="<question>"` | a yes/no gate that has a name |
+
+**Two of the kinds carry their question and two carry their
+candidates.** `input` and `confirm` put the question in the value, so
+it is what you read on screen. `choose` and `filter` spend the value
+on the choices, so the prompt's **name** heads the picker — which is
+one more reason to name a prompt for what it asks, and why two prompts
+in one binding may not share a name.
+
+**`choose` and `filter` differ in where the candidates come from, not
+in how they look.** A short list you can write down is `choose`'s job.
+`filter` takes a *command*: it runs, and what it prints becomes the
+candidates — for the case where they have to be computed and there are
+too many to read, a branch list or a store with a few hundred entries.
+A source that fails, or that succeeds and prints nothing, cancels the
+action rather than opening a picker with nothing in it.
+
+**Cancel anywhere and nothing happens.** Escape out of any question,
+or interrupt it, or answer a `confirm` with no, and the binding stops
+there: no later question is asked, the command is never spawned, and
+the status row says the action was cancelled, naming the key. There is
+no partial application — someone who abandons the summary has not
+already recorded a verdict. An empty answer is not a cancellation: an
+`input` you submit without typing anything is an empty value, and the
+command runs with it.
+
+A prompt's name becomes an environment variable (below), so it is
+spelled like one: a name with a `-` in it is refused when the board
+loads rather than becoming a variable no shell can name.
+
+**Where the answers go.** Each answer reaches the command as
+`RAT_PROMPT_<NAME>` — the prompt's declared name, uppercased, so
+`prompt "verdict"` arrives as `RAT_PROMPT_VERDICT`. A binding's `when`
+never sees them: it runs first, before any question is asked, which is
+the point of running it first.
+
+A `confirm` prompt's value is the string `true`, and only ever `true`
+— never the label. A no is a cancellation, so no command ever runs
+with a negative one and there is no `false` to represent. Its value is
+rarely the interesting part; its *existence* is, and what it tells a
+command is which gate was passed. The `confirm` on the binding itself
+is the other half of that split: it asks, and nothing downstream can
+tell it was answered. For a genuine two-way answer that both branches
+consume, use a `choose` with two options rather than a `confirm`.
+
+The answers are also bound under their declared names, so a command
+written with `{{verdict}}` gets the answer substituted in when the
+action spawns — see Variables above for what that substitution is and
+when it happens. That works in the binding's own `command` or
+`script` and nowhere else: naming a prompt from a `when`, or from
+another prompt's own value, is refused when the board loads, because
+at neither of those points does an answer exist yet. Reach for
+`RAT_PROMPT_*` unless the other form saves you a shell. And a prompt
+may not take the name of a declared variable: the board is refused at
+load rather than deciding on your behalf which one `{{store}}` meant.
+
+**rat holds an answer for one moment.** It lives between the question
+being answered and the command being spawned, and nowhere else: not
+stored, not remembered between presses, not offered back as a default
+the next time you press the key. The dashboard never held the typing —
+the prompt is its own program, the way the pager is.
 
 **The cursor, if there is one.** When a pane has a line cursor (`s` —
 see Pane navigation above), the binding's command sees three more
@@ -847,6 +936,14 @@ The three are read once, when the key is pressed: a binding that asks
 a question first, or whose guard takes a moment, still acts on the
 line that was marked when you pressed it, even if the pane re-ran in
 between.
+
+That is also what makes the marked line safe to start a question with.
+An `input` prompt written `from-cursor=#true` opens with the marked
+line already in the field, editable — a default, not a requirement: if
+no cursor is up the question starts empty and the binding still runs.
+Only `input` takes it, because only `input` has a line to fill. A
+board that asks for the seed where no pane can hold a cursor is
+refused when it loads, since `selectable #true` is what feeds it.
 
 The text is what the pane shows, minus the styling — rat strips the
 escape sequences so a command does not have to, and the raw form is
@@ -879,10 +976,11 @@ handoff file the section below describes.
 **Actions are asynchronous unless they need the screen.** A binding's
 command runs on a worker, exactly the way a pane's child does, so the
 board keeps ticking and repainting while a slow one runs: a
-five-minute test run does not freeze the frame. The exception is the
-disposition that needs the terminal itself — `output "pager"`
-suspends the frame, runs, and resumes, because a pager and a
-dashboard cannot both own the screen. Everything else stays live.
+five-minute test run does not freeze the frame. The exceptions are the
+two things that need the terminal itself — `output "pager"`, and a
+binding with prompts — which suspend the frame, run, and resume,
+because a pager or a picker and a dashboard cannot both own the
+screen. Everything else stays live.
 
 **Keys exist only where a key can arrive.** A piped board, a `--once`
 board, and a board whose output is not a terminal have no bindings and
@@ -1208,7 +1306,9 @@ crash), the terminal can keep announcing changes to whatever runs next;
 
 ## Interactive prompts
 
-The gum staples, rendering to `/dev/tty` so stdout stays clean:
+The gum staples, rendering to `/dev/tty` so stdout stays clean — and a
+dashboard's own key bindings can ask these same questions before they
+run (see Key actions above):
 
 ```sh
 fruit=$(rat choose apple banana cherry)
