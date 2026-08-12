@@ -878,6 +878,20 @@ A prompt's name becomes an environment variable (below), so it is
 spelled like one: a name with a `-` in it is refused when the board
 loads rather than becoming a variable no shell can name.
 
+**Three of the four kinds speak.** With `RAT_ACCESSIBLE=1` set — the
+variable reaches a board's questions the way it reaches any other
+invocation — a `choose`, a `confirm` and a `filter` prompt run as a
+transcript rather than a painted frame, on the terminal's normal
+screen, and the answer prints as its own line before the question
+closes (`chose accepting`), so what was recorded is readable back. See
+Accessible mode below for what the transcript contains. `input` does
+not: that command paints its field in every mode, so a board that asks
+for typed text is asking for it visually. A question a
+board asks records something durable, which is why the confirmation of
+what was recorded matters more here than elsewhere — and the board's
+own answer to that, the status row saying an action ran or was
+cancelled, is an in-place repaint the way every other row is.
+
 **Where the answers go.** Each answer reaches the command as
 `RAT_PROMPT_<NAME>` — the prompt's declared name, uppercased, so
 `prompt "verdict"` arrives as `RAT_PROMPT_VERDICT`. A binding's `when`

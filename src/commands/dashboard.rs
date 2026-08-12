@@ -82,6 +82,10 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
         // It is also the reason the line cursor's mark reaches nobody
         // who cannot see it: the mark is visual only, and a linear mode
         // for boards is the missing piece, not a better mark.
+        //
+        // A binding's questions add a third consumer: a question can
+        // speak for itself, but whether the action it gated then ran or
+        // was cancelled is one more in-place repaint on the status row.
         append: false,
         variables,
         bindings,

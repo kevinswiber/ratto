@@ -6977,6 +6977,22 @@ fn prompt_answer(
 /// Any non-zero exit ends everything: no later question, no command, no
 /// partial application. `?` is the mechanism, deliberately, so the
 /// guarantee is the type's rather than each arm's to remember.
+///
+/// **What a linear reader gets from here, measured rather than
+/// assumed.** The children inherit this process's environment, so a
+/// session with the transcript mode enabled reaches three of the four
+/// kinds: a `choose`, a `confirm` and a `filter` question run as
+/// appended lines and print the answer as its own closing line. `input`
+/// is the exception, and the reason is upstream of this function — that
+/// command paints its field in every mode, so nothing this runner does
+/// changes what it says. The handoff leaves the alternate screen before
+/// any child spawns, so those lines land on the normal screen and stay
+/// in the scrollback after the board comes back.
+///
+/// A cosmetic change here is not the fix for the gap that remains. The
+/// missing piece is a transcript for the typed-text field itself; a
+/// louder caret or a brighter field is a visual improvement, and worth
+/// having as one.
 #[allow(clippy::too_many_arguments)]
 fn run_prompt_chain<W: std::io::Write>(
     binding: &KeyBinding,
