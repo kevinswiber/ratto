@@ -5274,7 +5274,7 @@ key "r" {{
              prompt \"verdict\" choose=\"accepting,requesting-changes\"\n\
              prompt \"summary\" input=\"Summary\"\n\
              prompt \"ship\" confirm=\"Record it?\"\n\
-             command \"pointbreak assessment add\"\n\
+             command \"record the verdict\"\n\
              }}\n{ONE_PANE}"
         ));
         let names: Vec<&str> = decls[0].prompts.iter().map(|p| p.name.as_str()).collect();
