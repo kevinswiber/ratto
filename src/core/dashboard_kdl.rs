@@ -5586,6 +5586,127 @@ key "r" {{
         }
     }
 
+    /// The one filter prompt a fixture declares, as its argv words.
+    fn source(text: &str) -> Vec<String> {
+        match &declared(text)[0].prompts[0].kind {
+            PromptKind::Filter(argv) => argv.iter().map(|w| w.as_str().to_string()).collect(),
+            other => panic!("not a filter prompt: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_filter_prompts_source_is_a_command_split_like_any_other() {
+        assert_eq!(
+            source(&format!(
+                "key \"a\" {{ description \"d\"\nprompt \"rev\" filter=\"pb revision list --limit 200\"\ncommand \"y\" }}\n{ONE_PANE}"
+            )),
+            ["pb", "revision", "list", "--limit", "200"]
+        );
+        // One word under a shell — the split consulted the binding's own
+        // verdict rather than a constant.
+        assert_eq!(
+            source(&format!(
+                "key \"a\" {{ description \"d\"\nshell #true\nprompt \"rev\" filter=\"pb revision list --limit 200\"\ncommand \"y\" }}\n{ONE_PANE}"
+            )),
+            ["pb revision list --limit 200"]
+        );
+        // …and the verdict a board inherits, which a prompt reading only
+        // its own binding's `shell` would get wrong while getting the
+        // row above right.
+        assert_eq!(
+            source(&format!(
+                "defaults {{ shell #true }}\nkey \"a\" {{ description \"d\"\nprompt \"rev\" filter=\"pb revision list\"\ncommand \"y\" }}\n{ONE_PANE}"
+            )),
+            ["pb revision list"]
+        );
+        // Quoted, so the split is a shell word split and not whitespace.
+        assert_eq!(
+            source(&format!(
+                "key \"a\" {{ description \"d\"\nprompt \"rev\" filter=\"pb list --title 'two words'\"\ncommand \"y\" }}\n{ONE_PANE}"
+            )),
+            ["pb", "list", "--title", "two words"]
+        );
+    }
+
+    #[test]
+    fn a_filter_source_keeps_its_flavor_and_never_gains_an_argument() {
+        let board = |value: &str| {
+            format!(
+                "variables {{\n    scope \"mine\"\n    listing \"pb list --limit 200\"\n}}\n\
+                 key \"a\" {{ description \"d\"\nprompt \"rev\" filter={value}\ncommand \"y\" }}\n{ONE_PANE}"
+            )
+        };
+        let decls = declared(&board("\"pb list {{scope}}\""));
+        let PromptKind::Filter(argv) = &decls[0].prompts[0].kind else {
+            panic!("a filter prompt")
+        };
+        assert_eq!(argv.len(), 3);
+        assert_eq!(argv[2].refs(), ["scope"]);
+        // A whole-command variable under no shell is ONE argv word: a
+        // program whose name contains spaces. That is what `command`
+        // already answers, and the board's fix is the shipped one —
+        // `shell #true`, where the expansion lands inside a shell line.
+        // Splitting again after expansion would reopen the argv
+        // boundary this grammar closed.
+        assert_eq!(source(&board("\"{{listing}}\"")).len(), 1);
+        // Raw: three words and no references at all.
+        let decls = declared(&board("#\"pb list {{scope}}\"#"));
+        let PromptKind::Filter(argv) = &decls[0].prompts[0].kind else {
+            panic!("a filter prompt")
+        };
+        assert_eq!(argv.len(), 3);
+        assert!(argv.iter().all(|word| word.refs().is_empty()));
+    }
+
+    #[test]
+    fn a_filter_prompt_needs_a_command() {
+        // Four spellings, two code paths: the shelled arm keeps one
+        // blank word and the unshelled arm produces none, so a check
+        // written for one passes the other by accident.
+        for (value, shell) in [
+            ("", ""),
+            ("   ", ""),
+            ("", "shell #true\n"),
+            ("   ", "shell #true\n"),
+        ] {
+            let err = binding_err(&format!(
+                "key \"a\" {{ description \"d\"\n{shell}prompt \"rev\" filter=\"{value}\"\ncommand \"y\" }}\n{ONE_PANE}"
+            ));
+            assert!(
+                err.starts_with("key \"a\" > prompt \"rev\": `filter` needs a command"),
+                "{value:?}/{shell:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unbalanced_filter_source_names_the_prompt_not_the_binding() {
+        let err = binding_err(&format!(
+            "key \"a\" {{ description \"d\"\nprompt \"rev\" filter=\"pb list --title 'x\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.starts_with("key \"a\" > prompt \"rev\": command has unbalanced quoting"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_loaded_filter_prompt_carries_something_the_builder_could_spawn() {
+        let loaded = resolved(&format!(
+            "key \"a\" {{ description \"d\"\nprompt \"rev\" filter=\"pb list\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        let PromptKind::Filter(argv) = &loaded[0].prompts[0].kind else {
+            panic!("a filter prompt")
+        };
+        // The promise the action builder already makes about a
+        // binding's own argv: never empty, so the first word is not a
+        // panic path.
+        assert!(!argv.is_empty());
+        // And the shell that will spawn it is the binding's own — no
+        // second field was needed.
+        assert_eq!(loaded[0].shell, ShellMode::Direct);
+    }
+
     #[test]
     fn prompts_keep_their_written_order_even_with_other_keys_between_them() {
         let decls = declared(&format!(

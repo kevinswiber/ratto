@@ -2227,6 +2227,27 @@ fn check_refuses_a_prompt_name_a_command_could_not_read() {
 }
 
 #[test]
+fn check_refuses_a_filter_prompt_with_no_command() {
+    // The refusal is raised in the walk deliberately. Its shipped
+    // sibling — the empty `command` on a binding — is raised while
+    // bindings resolve, and `check` never gets that far: it accepts a
+    // board the run then refuses. A rule a board author should learn
+    // here has to be raised where this route can see it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "key \"a\" {\n    description \"pick\"\n    prompt \"rev\" filter=\"\"\n    command \"true\"\n}\n\npane \"p\" {\n    height 3\n    command \"true\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "check", &file])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("`filter` needs a command"));
+}
+
+#[test]
 fn check_reports_a_variable_cycle_as_a_path() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = fixture(
