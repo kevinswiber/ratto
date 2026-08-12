@@ -48,6 +48,7 @@ use anyhow::{Context, anyhow, bail};
 
 use crate::core::dashboard_file::{
     BindingProgram, DashboardFile, KeyBindingDecl, LayoutDecl, PaneDecl, Prompt, PromptKind,
+    env_name, is_prompt_name,
 };
 use crate::core::key_spelling::parse_key;
 use crate::core::registry::ShellDecl;
@@ -534,6 +535,10 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
         text,
         colored,
         vars: &variables,
+        // Only a binding scopes prompt names; a pane, `defaults` and
+        // the title see the declared variables and nothing else.
+        prompts: &[],
+        answers_ready: false,
     };
     if let Some(node) = title_node {
         file.title = Some(title_field(node, &load)?);
@@ -592,6 +597,24 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
     }
     file.variables = variables;
     file.panes = panes;
+    // A seed with nothing to read is a knob that reads as live. The
+    // board's own answer decides it — the same one the claimed-key
+    // refusal asks — so there is no second rule here about which panes
+    // can hold a cursor. It runs here because it needs the panes, and
+    // it reports last for the reason the duplicate-key check does.
+    if !file.takes_a_cursor() {
+        for binding in &file.bindings {
+            if let Some(prompt) = binding.prompts.iter().find(|p| p.from_cursor) {
+                bail!(
+                    "key {:?} > prompt {:?}: `from-cursor` reads the marked line, and no \
+                     pane on this board asked for one — add `selectable #true` to the pane \
+                     whose lines this reads, or drop `from-cursor`",
+                    binding.spelling,
+                    prompt.name
+                );
+            }
+        }
+    }
     // Placement is STRUCTURAL, so the layout is never absent — the top
     // level IS the dashboard's column, and a file of bare panes states
     // that column explicitly (D-2). It resolves to what an absent layout
@@ -917,6 +940,30 @@ fn key_block(
             .as_ref()
             .map_or(default_shell, ShellDecl::runs_a_shell),
     };
+    // The names only — the real parse happens below, in document
+    // order, and reports its own errors there. A malformed name is
+    // SKIPPED here rather than reported, and skipping cannot hide a
+    // valid one, because this is the function that decides what a
+    // valid name is.
+    let declared_prompts: Vec<String> = node
+        .children()
+        .map(kdl::KdlDocument::nodes)
+        .unwrap_or_default()
+        .iter()
+        .filter(|child| child.name().value() == "prompt")
+        .filter_map(|child| prompt_name(child, &at).ok())
+        .collect();
+    // Two scopes, because a binding's own strings do not all run at the
+    // same moment: everything here may NAME a prompt, and only the
+    // program may read one.
+    let scoped = Load {
+        prompts: &declared_prompts,
+        ..*load
+    };
+    let spawn_scoped = Load {
+        answers_ready: true,
+        ..scoped
+    };
     let mut draft = BindingDraft::default();
     let mut seen: Vec<&'static str> = Vec::new();
     let mut prompts: Vec<Prompt> = Vec::new();
@@ -948,16 +995,17 @@ fn key_block(
             );
         };
         record(&mut seen, k, &at)?;
+        let site = site_scope(k.name, &scoped, &spawn_scoped);
         match k.set {
             Set::List(_) => bail!(
                 "{at}: `{}` holds a list, so it must be a child node — write `{}` inside the block",
                 k.name,
                 k.example
             ),
-            Set::Text(set) => set(&mut draft, prop_text(entry, k, &at, load)?),
+            Set::Text(set) => set(&mut draft, prop_text(entry, k, &at, site)?),
             Set::Count(set) => set(&mut draft, prop_count(entry.value(), k, &at)?, &ctx)?,
             Set::Flag(set) => set(&mut draft, prop_flag(entry.value(), k, &at)?),
-            Set::FlagOrText(set) => set(&mut draft, prop_mode(entry, k, &at, load)?),
+            Set::FlagOrText(set) => set(&mut draft, prop_mode(entry, k, &at, site)?),
         }
     }
 
@@ -968,7 +1016,37 @@ fn key_block(
     {
         let name = child.name().value();
         if name == "prompt" {
-            prompts.push(prompt_node(child, prompts.len(), &at, load)?);
+            // A prompt's own strings see the names and not the answers:
+            // a question built from an earlier answer would make a
+            // cancelled later prompt into partial application.
+            let prompt = prompt_node(child, prompts.len(), &at, &scoped)?;
+            let here = format!("{at} > prompt {:?}", prompt.name);
+            if load.vars.contains(&prompt.name) {
+                bail!(
+                    "{here}: `{}` is already a declared variable — `{{{{{}}}}}` would mean \
+                     the variable everywhere on this board and the answer inside this one \
+                     command. Rename the prompt, or rename the variable",
+                    prompt.name,
+                    prompt.name
+                );
+            }
+            // The comparison is the ENVIRONMENT name, not the declared
+            // one: `summary` and `SUMMARY` are two variables in a
+            // command body and one variable in its environment, where
+            // the second would silently win.
+            if let Some(clash) = prompts
+                .iter()
+                .find(|p| env_name(&p.name) == env_name(&prompt.name))
+            {
+                bail!(
+                    "{here}: `{}` and `{}` both reach the command as {} — one answer would \
+                     overwrite the other. Name them apart",
+                    clash.name,
+                    prompt.name,
+                    env_name(&prompt.name)
+                );
+            }
+            prompts.push(prompt);
             continue;
         }
         let Some(k) = lookup(BINDING_KEYS, name) else {
@@ -984,15 +1062,29 @@ fn key_block(
         };
         record(&mut seen, k, &at)?;
         only_a_value(child, k, &at)?;
+        let site = site_scope(k.name, &scoped, &spawn_scoped);
         match k.set {
-            Set::Text(set) => set(&mut draft, one_text(child, k, &at, load)?),
+            Set::Text(set) => set(&mut draft, one_text(child, k, &at, site)?),
             Set::Count(set) => set(&mut draft, one_count(child, k, &at)?, &ctx)?,
             Set::Flag(set) => set(&mut draft, one_flag(child, k, &at)?),
-            Set::List(set) => set(&mut draft, many_text(child, k, &at, load)?, &ctx)?,
-            Set::FlagOrText(set) => set(&mut draft, one_mode(child, k, &at, load)?),
+            Set::List(set) => set(&mut draft, many_text(child, k, &at, site)?, &ctx)?,
+            Set::FlagOrText(set) => set(&mut draft, one_mode(child, k, &at, site)?),
         }
     }
     checked(key, spelling, draft, prompts, &at)
+}
+
+/// Which scope a binding's key is recorded under. The program is the
+/// only rung that runs after the questions are asked, so it is the only
+/// one where an answer exists; everything else may name a prompt and be
+/// told when its answer arrives. Both spellings of both keys go through
+/// here, so the two passes cannot disagree about it.
+fn site_scope<'a, 'b>(key: &str, scoped: &'a Load<'b>, spawn_scoped: &'a Load<'b>) -> &'a Load<'b> {
+    if matches!(key, "command" | "script") {
+        spawn_scoped
+    } else {
+        scoped
+    }
 }
 
 /// One `prompt "verdict" choose="accepting,requesting-changes"` inside
@@ -1020,16 +1112,24 @@ fn prompt_node(
     let name = prompt_name(node, &here)?;
     here = format!("{at} > prompt {name:?}");
     let mut kinds: Vec<(&str, PromptKind)> = Vec::new();
+    let mut from_cursor = false;
     for entry in node.entries() {
         let Some(prop) = entry.name() else {
             continue; // positional: the prompt's own name
         };
         let prop = prop.value();
         refuse_annotation(entry.ty(), prop, &here)?;
+        if prop == "from-cursor" {
+            from_cursor = entry.value().as_bool().ok_or_else(|| {
+                anyhow!("{here}: `from-cursor` takes #true or #false — write `from-cursor=#true`")
+            })?;
+            continue;
+        }
         if !matches!(prop, "choose" | "confirm" | "input" | "filter") {
             bail!(
                 "{here}: unknown property {prop:?} — a prompt's kinds are \
-                 choose, confirm, input, filter"
+                 choose, confirm, input, filter, and `from-cursor` starts an \
+                 input from the marked line"
             );
         }
         let text = entry
@@ -1050,15 +1150,40 @@ fn prompt_node(
             },
         ));
     }
-    if kinds.len() != 1 {
+    let kind = match kinds.as_slice() {
+        [_] => kinds.remove(0),
+        [] => bail!(
+            "{here}: needs a kind — a prompt asks a question, and which one it asks is \
+             `choose`, `confirm`, `input`, or `filter`. Write \
+             `prompt {name:?} choose=\"accepting,requesting-changes\"`"
+        ),
+        [(first, _), (second, _), ..] => bail!(
+            "{here}: declares both `{first}` and `{second}` — a prompt asks one \
+             question. Keep the one you meant"
+        ),
+    };
+    if from_cursor && kind.0 != "input" {
+        // A knob that can never fire is worse than one that does not
+        // exist, because it reads as live. `choose` has no line to
+        // fill and `confirm`'s preselection is a boolean; `filter`'s
+        // own initial text is the sharp one — it is a QUERY that hides
+        // candidates, so seeding it would silently shrink the list a
+        // reader was meant to pick from.
         bail!(
-            "{here}: a prompt asks one question — give it exactly one of \
-             choose, confirm, input, or filter"
+            "{here}: `from-cursor` fills an input's first line, and `{}` has no line to \
+             fill{} — drop it, or make this an `input`",
+            kind.0,
+            if kind.0 == "filter" {
+                ": its own initial text is a query that hides candidates"
+            } else {
+                ""
+            }
         );
     }
     Ok(Prompt {
         name,
-        kind: kinds.remove(0).1,
+        kind: kind.1,
+        from_cursor,
     })
 }
 
@@ -1081,6 +1206,19 @@ fn prompt_name(node: &kdl::KdlNode, at: &str) -> anyhow::Result<String> {
                     "{at}: a prompt's name is not substitutable — it is the name \
                      the command reads the answer under. The question the reader \
                      sees belongs in the kind's own value"
+                );
+            }
+            if !is_prompt_name(text) {
+                bail!(
+                    "{at}: {text:?} is not a name a command can read — a prompt's name \
+                     starts with a letter or `_` and continues with letters, digits or \
+                     `_`, because the answer arrives as an environment variable and \
+                     `-` cannot be written in one{}",
+                    if text.contains('-') {
+                        format!(". Rename it `{}`", text.replace('-', "_"))
+                    } else {
+                        String::new()
+                    }
                 );
             }
             Ok(text.to_string())
@@ -1167,10 +1305,22 @@ fn checked(
 /// variables to hold its references to, the document text an error is
 /// placed into, and the caller's color verdict (never an env sniff —
 /// `--color` and `NO_COLOR` keep their one authority).
+#[derive(Clone, Copy)]
 struct Load<'a> {
     text: &'a str,
     colored: bool,
     vars: &'a VariableBlock,
+    /// The prompt names declared on the binding being walked — empty
+    /// for panes, `defaults`, and the title. Carried even where an
+    /// answer is NOT in scope, because telling a typo from a name that
+    /// exists at the wrong moment is the whole difference between a
+    /// useless error and a teaching one.
+    prompts: &'a [String],
+    /// Whether an answer exists yet at the site being recorded. A
+    /// binding asks its questions between the confirmation and the
+    /// command, so this is true for `command` and `script` and false
+    /// everywhere else.
+    answers_ready: bool,
 }
 
 fn prop_text<T>(
@@ -1253,16 +1403,40 @@ fn template_of(text: &str, entry: &kdl::KdlEntry, load: &Load<'_>) -> anyhow::Re
 /// callers, rather than two spellings that drift.
 fn validate_refs(refs: &[String], entry: &kdl::KdlEntry, load: &Load<'_>) -> anyhow::Result<()> {
     for name in refs {
-        if !load.vars.contains(name) {
-            let at = reference_offset(load.text, entry, name);
-            return Err(unknown_variable_err(
+        if load.vars.contains(name) {
+            continue;
+        }
+        let at = reference_offset(load.text, entry, name);
+        // A name the binding itself declares, read where its answer
+        // does not exist yet. Told as a moment rather than as a miss:
+        // the generic sentence would send an author hunting for a typo
+        // in a name written six lines up.
+        if load.prompts.iter().any(|declared| declared == name) {
+            if load.answers_ready {
+                continue;
+            }
+            return Err(placed_error(
                 load.text,
                 &(at..at + name.len() + 4),
-                name,
-                load.vars,
+                &format!(
+                    "`{{{{{name}}}}}` is this binding's prompt `{name}`, and its answer \
+                     does not exist here"
+                ),
+                Some(
+                    "a binding asks its questions after the precondition and the \
+                     confirmation, just before the command — reference it from \
+                     `command` or `script`",
+                ),
                 load.colored,
             ));
         }
+        return Err(unknown_variable_err(
+            load.text,
+            &(at..at + name.len() + 4),
+            name,
+            load.vars,
+            load.colored,
+        ));
     }
     Ok(())
 }
@@ -5351,7 +5525,9 @@ key "r" {{
             let body = if site.starts_with("description") {
                 format!("{site}\nprompt \"verdict\" choose=\"a,b\"\ncommand \"y\"")
             } else {
-                format!("description \"d\"\nprompt \"verdict\" choose=\"a,b\"\n{site}\ncommand \"y\"")
+                format!(
+                    "description \"d\"\nprompt \"verdict\" choose=\"a,b\"\n{site}\ncommand \"y\""
+                )
             };
             let err = binding_err(&format!("key \"a\" {{ {body} }}\n{ONE_PANE}"));
             assert!(err.contains("is this binding's prompt"), "{site}: {err}");

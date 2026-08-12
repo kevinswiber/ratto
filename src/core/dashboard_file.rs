@@ -269,6 +269,46 @@ pub enum BindingProgram {
 pub struct Prompt {
     pub name: String,
     pub kind: PromptKind,
+    /// Whether the question starts from the marked line. Only an
+    /// `input` has a line to fill, and only a board that can raise a
+    /// cursor may ask for it — both refused at load.
+    pub from_cursor: bool,
+}
+
+/// A prompt's name: `[A-Za-z_][A-Za-z0-9_]*` — the reference grammar
+/// minus the hyphen, and the minus is the whole of this function.
+///
+/// A prompt name has to satisfy two grammars at once. It is bound as
+/// `{{name}}`, which admits `-`; and it is uppercased into the
+/// environment variable below, which does not. A name like
+/// `code-review` passes the first and fails the second in the worst
+/// available way: `$RAT_PROMPT_CODE-REVIEW` is not an error in `sh`,
+/// it is an unset variable followed by the literal text `-REVIEW`.
+///
+/// Refused rather than rewritten. Mapping `-` to `_` would make
+/// `code-review` and `code_review` the same environment variable, so
+/// the collision check would need a case for it — a refusal here
+/// costs one sentence and leaves the file and the environment
+/// spelling the same name.
+pub(crate) fn is_prompt_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The environment name a command reads this answer under. The ONE
+/// derivation: the load-time uniqueness check compares these, and the
+/// action builder sets them, so a name that two prompts would share is
+/// refused by the same expression that would have written it.
+///
+/// ASCII uppercase, deliberately: the name grammar above admits only
+/// ASCII, and a locale-aware uppercasing of `ß` is `SS` — two bytes
+/// for one, and a name that is not the name.
+pub(crate) fn env_name(name: &str) -> String {
+    format!("RAT_PROMPT_{}", name.to_ascii_uppercase())
 }
 
 /// Which shipped picker asks the question. Four kinds, one per
