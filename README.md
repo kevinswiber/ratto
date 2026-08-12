@@ -886,11 +886,11 @@ screen, and the answer prints as its own line before the question
 closes (`chose accepting`), so what was recorded is readable back. See
 Accessible mode below for what the transcript contains. `input` does
 not: that command paints its field in every mode, so a board that asks
-for typed text is asking for it visually. A question a
-board asks records something durable, which is why the confirmation of
-what was recorded matters more here than elsewhere — and the board's
-own answer to that, the status row saying an action ran or was
-cancelled, is an in-place repaint the way every other row is.
+for typed text is asking for it visually. A question a board asks
+records something durable, which is why the confirmation of what was
+recorded matters more here than elsewhere — and the board's own answer
+to that, the status row saying an action ran or was cancelled, is an
+in-place repaint the way every other row is.
 
 **Where the answers go.** Each answer reaches the command as
 `RAT_PROMPT_<NAME>` — the prompt's declared name, uppercased, so
