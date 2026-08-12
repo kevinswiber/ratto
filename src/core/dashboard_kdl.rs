@@ -995,17 +995,17 @@ fn key_block(
             );
         };
         record(&mut seen, k, &at)?;
-        let site = site_scope(k.name, &scoped, &spawn_scoped);
+        let site = site_scope(k.name, scoped, spawn_scoped);
         match k.set {
             Set::List(_) => bail!(
                 "{at}: `{}` holds a list, so it must be a child node — write `{}` inside the block",
                 k.name,
                 k.example
             ),
-            Set::Text(set) => set(&mut draft, prop_text(entry, k, &at, site)?),
+            Set::Text(set) => set(&mut draft, prop_text(entry, k, &at, &site)?),
             Set::Count(set) => set(&mut draft, prop_count(entry.value(), k, &at)?, &ctx)?,
             Set::Flag(set) => set(&mut draft, prop_flag(entry.value(), k, &at)?),
-            Set::FlagOrText(set) => set(&mut draft, prop_mode(entry, k, &at, site)?),
+            Set::FlagOrText(set) => set(&mut draft, prop_mode(entry, k, &at, &site)?),
         }
     }
 
@@ -1062,13 +1062,13 @@ fn key_block(
         };
         record(&mut seen, k, &at)?;
         only_a_value(child, k, &at)?;
-        let site = site_scope(k.name, &scoped, &spawn_scoped);
+        let site = site_scope(k.name, scoped, spawn_scoped);
         match k.set {
-            Set::Text(set) => set(&mut draft, one_text(child, k, &at, site)?),
+            Set::Text(set) => set(&mut draft, one_text(child, k, &at, &site)?),
             Set::Count(set) => set(&mut draft, one_count(child, k, &at)?, &ctx)?,
             Set::Flag(set) => set(&mut draft, one_flag(child, k, &at)?),
-            Set::List(set) => set(&mut draft, many_text(child, k, &at, site)?, &ctx)?,
-            Set::FlagOrText(set) => set(&mut draft, one_mode(child, k, &at, site)?),
+            Set::List(set) => set(&mut draft, many_text(child, k, &at, &site)?, &ctx)?,
+            Set::FlagOrText(set) => set(&mut draft, one_mode(child, k, &at, &site)?),
         }
     }
     checked(key, spelling, draft, prompts, &at)
@@ -1079,7 +1079,7 @@ fn key_block(
 /// one where an answer exists; everything else may name a prompt and be
 /// told when its answer arrives. Both spellings of both keys go through
 /// here, so the two passes cannot disagree about it.
-fn site_scope<'a, 'b>(key: &str, scoped: &'a Load<'b>, spawn_scoped: &'a Load<'b>) -> &'a Load<'b> {
+fn site_scope<'a>(key: &str, scoped: Load<'a>, spawn_scoped: Load<'a>) -> Load<'a> {
     if matches!(key, "command" | "script") {
         spawn_scoped
     } else {
