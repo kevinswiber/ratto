@@ -41,6 +41,8 @@
 //! | binding `script`, `when`, `description`, `confirm`, `output` | `Text` | `prop_text` / `one_text` | yes |
 //! | binding `shell` | `FlagOrText` | `shell_decl` → `ShellDecl::Named(Template)` | yes, in its string arm |
 //! | binding key positional | — | `one_spelling` | **refused** — a key is identity (the pane-id argument) |
+//! | `prompt`'s `choose`, `confirm`, `input`, `filter` | — | `prompt_node` → `template_of` | yes |
+//! | `prompt` name positional | — | `prompt_name` | **refused** — the name a command reads the answer under is identity (the same argument) |
 
 use anyhow::{Context, anyhow, bail};
 
