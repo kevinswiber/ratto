@@ -16989,4 +16989,134 @@ mod tests {
             "since 18:47:53 · focus right"
         );
     }
+    // ─── The terminal handoff ───────────────────────────────────────
+
+    /// A `Write` two owners can share: the renderer keeps one handle
+    /// and the test keeps the other. `InlineRenderer` owns its writer
+    /// and returns it to nobody, so the alternative is asserting on
+    /// nothing.
+    #[derive(Clone, Default)]
+    struct Recorder(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Recorder {
+        fn take(&self) -> Vec<u8> {
+            std::mem::take(&mut self.0.borrow_mut())
+        }
+    }
+
+    impl std::io::Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn saw(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn a_handoff_with_no_reader_runs_its_payload_once_and_returns_its_value() {
+        let mut guard: Option<MouseGuard<Vec<u8>>> = None;
+        #[cfg(unix)]
+        let mut sub: Option<ThemeNotifyGuard<Vec<u8>>> = None;
+        #[cfg(unix)]
+        let mut verify = VerifyState::default();
+        let mut ran = 0;
+        let out = with_terminal_handoff(
+            &mut guard,
+            #[cfg(unix)]
+            None,
+            #[cfg(unix)]
+            &mut sub,
+            #[cfg(unix)]
+            &mut verify,
+            || {
+                ran += 1;
+                "answer"
+            },
+        );
+        assert_eq!(out, Some("answer"), "the payload's value is the handoff's");
+        assert_eq!(ran, 1, "the payload runs exactly once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_released_mouse_stays_released_across_a_handoff() {
+        // Unix only, and the reason is not squeamishness: on Windows
+        // the guard's enable is a console-mode syscall that ignores the
+        // writer entirely, so a guard over a vector is not the same
+        // object there and this would be measuring nothing.
+        let mut sub: Option<ThemeNotifyGuard<Vec<u8>>> = None;
+        let mut verify = VerifyState::default();
+        // An ACTIVE capture is suspended for the payload and restored.
+        let mut guard = Some(MouseGuard::enable(Vec::new()).expect("guard over a vec"));
+        let _ = with_terminal_handoff(&mut guard, None, &mut sub, &mut verify, || ());
+        assert!(
+            guard.as_ref().unwrap().active(),
+            "an active capture comes back"
+        );
+        // One the reader handed back must NOT come back.
+        let mut guard = Some(MouseGuard::enable(Vec::new()).expect("guard over a vec"));
+        guard.as_mut().unwrap().suspend().expect("release it");
+        let _ = with_terminal_handoff(&mut guard, None, &mut sub, &mut verify, || ());
+        assert!(
+            !guard.as_ref().unwrap().active(),
+            "a released mouse must stay released across the round trip"
+        );
+    }
+
+    #[test]
+    fn an_inline_resume_climbs_over_its_own_frame_and_a_fullscreen_one_does_not() {
+        // The `?1049` escapes go to the process's stdout, not to the
+        // renderer's writer, so this test structurally cannot see them
+        // — their witness is the pty round trip. What it can see is the
+        // difference between the two resume branches, which is the
+        // climb.
+        let frame: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_string()).collect();
+
+        let sink = Recorder::default();
+        let mut renderer = InlineRenderer::new(sink.clone());
+        renderer.draw(&frame, 80).expect("first frame");
+        sink.take();
+        assert_eq!(with_released_terminal(&mut renderer, false, || 7), 7);
+        renderer.draw(&frame, 80).expect("resumed frame");
+        assert!(
+            saw(&sink.take(), b"\x1b[3A"),
+            "inline resumes over its own frame"
+        );
+
+        // Fullscreen, configured as the loop configures it: the
+        // alternate screen we left was discarded, so there is nothing
+        // to climb over and the wipe re-homes the origin.
+        let sink = Recorder::default();
+        let mut renderer = InlineRenderer::new(sink.clone()).with_clear_screen(true);
+        renderer.draw(&frame, 80).expect("first frame");
+        sink.take();
+        with_released_terminal(&mut renderer, true, || ());
+        renderer.draw(&frame, 80).expect("resumed frame");
+        let bytes = sink.take();
+        assert!(
+            !saw(&bytes, b"\x1b[3A"),
+            "a discarded buffer has no frame of ours"
+        );
+        assert!(
+            saw(&bytes, b"\x1b[2J\x1b[H"),
+            "and the wipe re-homes the origin"
+        );
+    }
+
+    #[test]
+    fn the_pager_still_says_the_pager_sentence_when_the_reader_will_not_yield() {
+        // The one string this split moves. It is a caller's string now,
+        // and callers' strings drift, so it is pinned where a diff can
+        // see it.
+        assert_eq!(
+            pager_unavailable(),
+            "pager unavailable: the input reader did not yield; try again"
+        );
+    }
 }
