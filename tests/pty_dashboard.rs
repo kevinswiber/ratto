@@ -9244,3 +9244,444 @@ fn a_handoff_file_never_earns_the_looping_badge() {
         );
     }
 }
+
+// ─── A binding that asks before it acts ─────────────────────────────
+
+/// A one-pane board whose `r` binding asks `prompts` and then writes
+/// `out`. The command writes a FILE because the assertion for every
+/// cancel route is that file's absence.
+fn asking_board(out: &std::path::Path, prompts: &str) -> String {
+    format!(
+        "row-gap 0\n\ndefaults {{\n    height 3\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+         key \"r\" {{\n    description \"record\"\n{prompts}    output \"hide\"\n    command \"echo ran > {out}\"\n}}\n\n\
+         pane \"steady\" {{\n    interval \"1h\"\n    command \"echo steady-content\"\n}}\n",
+        out = out.display(),
+    )
+}
+
+fn asking_session(decl: &std::path::Path) -> (PtySession, FakeTerminal) {
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    (session, terminal)
+}
+
+const ONE_CHOOSE: &str = "    prompt \"verdict\" choose=\"accepting,requesting-changes\"\n";
+
+/// The board comes back to the offset it left, and the answer reaches
+/// the command. Pressed on a FRAME-SCROLLED board, because a fixture
+/// that only ever presses at live rest cannot see a resume that
+/// repainted a screen instead of restoring a state.
+#[test]
+fn a_prompt_asks_on_a_frame_scrolled_board_and_gives_it_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n}}\n\n\
+             key \"r\" {{\n    description \"record\"\n{ONE_CHOOSE}    output \"hide\"\n    command \"echo ran > {out}\"\n}}\n\n\
+             pane \"a\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n\
+             pane \"b\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}}\n",
+            out = out.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(3)),
+        "the frame never scrolled — the binding would press at live rest"
+    );
+    session.write_bytes(b"r");
+    // Wait for the picker before answering: firing into an unsettled
+    // handoff is how a fixture reports a contract failure it does not
+    // have.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"accepting",
+            Duration::from_secs(8)
+        ),
+        "the question never painted"
+    );
+    session.write_bytes(b"\r");
+    assert!(
+        wait_for(&session, &mut terminal, b"lines 2-", Duration::from_secs(8)),
+        "the board never came back to the offset it left"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Every cancel route a board can reach, each asserting the command did
+/// not run — with the two anchors that make the absences mean
+/// something.
+#[test]
+fn every_cancel_route_leaves_the_command_unrun() {
+    // 1 and 2: Esc and Ctrl-C at the only question.
+    for keys in [&b"\x1b"[..], &b"\x03"[..]] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out");
+        let decl = write_dashboard(dir.path(), &asking_board(&out, ONE_CHOOSE));
+        let (session, mut terminal) = asking_session(&decl);
+        session.write_bytes(b"r");
+        assert!(
+            wait_for(
+                &session,
+                &mut terminal,
+                b"accepting",
+                Duration::from_secs(8)
+            ),
+            "the question never painted"
+        );
+        session.write_bytes(keys);
+        assert!(
+            wait_for(&session, &mut terminal, b"cancelled", Duration::from_secs(8)),
+            "the cancel never reached the status row"
+        );
+        assert!(!out.exists(), "the command ran after a cancel");
+        session.write_bytes(b"q");
+        session.kill_if_alive(Duration::from_secs(2));
+    }
+
+    // 3: a `confirm` question answered No — the same wire code as Esc,
+    // and the route that proves there is no negative value to carry.
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out");
+        let decl = write_dashboard(
+            dir.path(),
+            &asking_board(&out, "    prompt \"sure\" confirm=\"Record it?\"\n"),
+        );
+        let (session, mut terminal) = asking_session(&decl);
+        session.write_bytes(b"r");
+        assert!(
+            wait_for(
+                &session,
+                &mut terminal,
+                b"Record it?",
+                Duration::from_secs(8)
+            ),
+            "the question never painted"
+        );
+        session.write_bytes(b"n");
+        assert!(
+            wait_for(&session, &mut terminal, b"cancelled", Duration::from_secs(8)),
+            "a negative answer never reached the status row"
+        );
+        assert!(!out.exists(), "the command ran after a negative answer");
+        session.write_bytes(b"q");
+        session.kill_if_alive(Duration::from_secs(2));
+    }
+
+    // 4: a cancel at a LATER question, with the second picker's own
+    // needle first so the arm cannot silently degrade into row 1.
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out");
+        let decl = write_dashboard(
+            dir.path(),
+            &asking_board(
+                &out,
+                "    prompt \"verdict\" choose=\"accepting,requesting-changes\"\n    \
+                 prompt \"reviewer\" choose=\"kim,sam\"\n",
+            ),
+        );
+        let (session, mut terminal) = asking_session(&decl);
+        session.write_bytes(b"r");
+        assert!(
+            wait_for(
+                &session,
+                &mut terminal,
+                b"accepting",
+                Duration::from_secs(8)
+            ),
+            "the first question never painted"
+        );
+        session.write_bytes(b"\r");
+        assert!(
+            wait_for(&session, &mut terminal, b"kim", Duration::from_secs(8)),
+            "the second question never painted"
+        );
+        session.write_bytes(b"\x1b");
+        assert!(
+            wait_for(&session, &mut terminal, b"cancelled", Duration::from_secs(8)),
+            "the later cancel never reached the status row"
+        );
+        assert!(!out.exists(), "the command ran after a later cancel");
+        session.write_bytes(b"q");
+        session.kill_if_alive(Duration::from_secs(2));
+    }
+
+    // 5: the anchor. Answer both and the file exists — without this,
+    // every absence above passes against a binding that does nothing.
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out");
+        let decl = write_dashboard(
+            dir.path(),
+            &asking_board(
+                &out,
+                "    prompt \"verdict\" choose=\"accepting,requesting-changes\"\n    \
+                 prompt \"reviewer\" choose=\"kim,sam\"\n",
+            ),
+        );
+        let (session, mut terminal) = asking_session(&decl);
+        session.write_bytes(b"r");
+        assert!(
+            wait_for(
+                &session,
+                &mut terminal,
+                b"accepting",
+                Duration::from_secs(8)
+            ),
+            "the first question never painted"
+        );
+        session.write_bytes(b"\r");
+        assert!(
+            wait_for(&session, &mut terminal, b"kim", Duration::from_secs(8)),
+            "the second question never painted"
+        );
+        session.write_bytes(b"\r");
+        wait_for_counter(&out, 1);
+        session.write_bytes(b"q");
+        session.kill_if_alive(Duration::from_secs(2));
+    }
+}
+
+/// A candidate source that fails, or that offers nothing, ends the
+/// action before a picker exists — an empty picker is never presented.
+#[test]
+fn a_candidate_source_that_offers_nothing_never_becomes_a_picker() {
+    for source in ["exit 3", "true"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out");
+        let decl = write_dashboard(
+            dir.path(),
+            &asking_board(&out, &format!("    prompt \"rev\" filter=\"{source}\"\n")),
+        );
+        let (session, mut terminal) = asking_session(&decl);
+        session.write_bytes(b"r");
+        // The positive anchor first: the status row speaks. Only then
+        // is the picker's absence a fact about this capture.
+        let seen = wait_for_in_order(
+            &session,
+            &mut terminal,
+            &[b"`r`"],
+            Duration::from_secs(8),
+        );
+        assert!(
+            !contains(&seen, b"rev"),
+            "a source that offered nothing still opened a picker: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(!out.exists(), "the command ran after a failed source");
+        session.write_bytes(b"q");
+        session.kill_if_alive(Duration::from_secs(2));
+    }
+
+    // The anchor: a source that DOES print makes a picker, and the
+    // command runs. Without it both rows above pass against a build
+    // where filter questions never work at all.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out");
+    let decl = write_dashboard(
+        dir.path(),
+        &asking_board(
+            &out,
+            "    prompt \"rev\" filter=\"printf 'r-one\\nr-two\\n'\"\n",
+        ),
+    );
+    let (session, mut terminal) = asking_session(&decl);
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(&session, &mut terminal, b"r-one", Duration::from_secs(8)),
+        "the candidates never reached the picker"
+    );
+    session.write_bytes(b"\r");
+    wait_for_counter(&out, 1);
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// A `when` that fails means no question was ever asked.
+#[test]
+fn a_declined_guard_never_shows_a_prompt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out");
+    let decl = write_dashboard(
+        dir.path(),
+        &asking_board(
+            &out,
+            &format!("    when \"false\"\n{ONE_CHOOSE}"),
+        ),
+    );
+    let (session, mut terminal) = asking_session(&decl);
+    session.write_bytes(b"r");
+    // In order: the decline first, then the picker's absence in that
+    // same capture — a negative assertion needs a positive anchor.
+    let seen = wait_for_in_order(&session, &mut terminal, &[b"`r`"], Duration::from_secs(8));
+    assert!(
+        !contains(&seen, b"accepting"),
+        "a declined guard still asked: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(!out.exists(), "the command ran behind a declined guard");
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// Focus, zoom and cursor are three separate view fields, and a resume
+/// that repainted a screen rather than restoring a state loses at least
+/// one of them.
+#[test]
+fn a_prompt_gives_back_a_focused_zoomed_pane_and_its_cursor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 8\n    border \"none\"\n    chrome #true\n    shell #true\n    selectable #true\n}}\n\n\
+             key \"r\" {{\n    description \"record\"\n{ONE_CHOOSE}    output \"hide\"\n    command \"echo ran > {out}\"\n}}\n\n\
+             pane \"a\" {{\n    interval \"1h\"\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n",
+            out = out.display(),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"A05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "focus never landed"
+    );
+    session.write_bytes(b"z");
+    assert!(
+        wait_for(&session, &mut terminal, b"zoomed 1/1", Duration::from_secs(3)),
+        "the pane never zoomed"
+    );
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(&session, &mut terminal, b"cursor 1/", Duration::from_secs(3)),
+        "the cursor never appeared"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"accepting",
+            Duration::from_secs(8)
+        ),
+        "the question never painted"
+    );
+    session.write_bytes(b"\r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"focus a", b"zoomed 1/1", b"cursor 1/"],
+        Duration::from_secs(8),
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// The fullscreen round trip: leave the alternate screen to ask, come
+/// back into it, repaint. The pager's twin does not cover this — a
+/// picker never takes the alternate screen itself, so a path that lost
+/// the leave would look completely correct inline.
+#[test]
+fn a_fullscreen_board_leaves_the_alternate_screen_to_ask_and_re_enters() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out");
+    let decl = write_dashboard(dir.path(), &asking_board(&out, ONE_CHOOSE));
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", "--fullscreen", &decl.display().to_string()],
+        &[],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-content",
+            Duration::from_secs(5)
+        ),
+        "the first frame never painted"
+    );
+    session.write_bytes(b"r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"accepting",
+            Duration::from_secs(8)
+        ),
+        "the question never painted"
+    );
+    session.write_bytes(b"\r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"\x1b[?1049h", b"steady-content"],
+        Duration::from_secs(8),
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+/// A cancel leaves no gate held: the reader may ask again, and the
+/// command still never runs. A gate a cancel forgot to drop turns the
+/// second press into `busy`, which is a wedge.
+#[test]
+fn a_cancelled_binding_asks_again_on_the_next_press_and_still_runs_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out");
+    let decl = write_dashboard(dir.path(), &asking_board(&out, ONE_CHOOSE));
+    let (session, mut terminal) = asking_session(&decl);
+    for round in 1..=2 {
+        session.write_bytes(b"r");
+        assert!(
+            wait_for(
+                &session,
+                &mut terminal,
+                b"accepting",
+                Duration::from_secs(8)
+            ),
+            "round {round}: the question never painted"
+        );
+        session.write_bytes(b"\x1b");
+        assert!(
+            wait_for(&session, &mut terminal, b"cancelled", Duration::from_secs(8)),
+            "round {round}: the cancel never reached the status row"
+        );
+    }
+    assert!(!out.exists(), "the command ran after two cancels");
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(2));
+}

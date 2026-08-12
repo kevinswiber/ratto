@@ -17248,7 +17248,16 @@ mod tests {
         // clause combination: a decline ends the activation, with no
         // exceptions — which is what the single `Declined(_) => None`
         // arm buys, and what a rung added later inherits for free.
-        for (when, confirm) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (when, confirm, asks) in [
+            (false, false, 0),
+            (true, false, 0),
+            (false, true, 0),
+            (true, true, 0),
+            (false, false, 1),
+            (true, false, 1),
+            (false, true, 1),
+            (true, true, 1),
+        ] {
             let mut binding = declared_binding(Key::Char('r'));
             if when {
                 binding = with_when(binding);
@@ -17256,13 +17265,283 @@ mod tests {
             if confirm {
                 binding = with_confirm(binding);
             }
-            for rung in [Rung::Prepare, Rung::When, Rung::Confirm, Rung::Command] {
+            binding = asking(binding, asks);
+            for rung in [
+                Rung::Prepare,
+                Rung::When,
+                Rung::Confirm,
+                Rung::Prompt,
+                Rung::Command,
+            ] {
                 assert_eq!(
                     next_step(&binding, GateOutcome::Declined(rung)),
                     None,
-                    "when={when} confirm={confirm} {rung:?}"
+                    "when={when} confirm={confirm} asks={asks} {rung:?}"
                 );
             }
+        }
+    }
+
+    /// A binding that asks `count` questions before it runs.
+    fn asking(
+        mut binding: crate::core::dashboard_file::KeyBinding,
+        count: usize,
+    ) -> crate::core::dashboard_file::KeyBinding {
+        binding.prompts = (0..count)
+            .map(|n| crate::core::dashboard_file::Prompt {
+                name: format!("q{n}"),
+                kind: crate::core::dashboard_file::PromptKind::Input(Template::extract("Q")),
+                from_cursor: false,
+            })
+            .collect();
+        binding
+    }
+
+    #[test]
+    fn the_ladder_asks_the_prompts_after_the_confirm_and_before_the_command() {
+        let base = || declared_binding(Key::Char('r'));
+        assert_eq!(
+            walk(&asking(with_confirm(with_when(base())), 2)),
+            [
+                GateStep::Prepare,
+                GateStep::Guard,
+                GateStep::Confirm,
+                GateStep::Prompt,
+                GateStep::Command
+            ]
+        );
+        // Each of the three rows that can precede the questions, alone.
+        assert_eq!(
+            walk(&asking(base(), 1)),
+            [GateStep::Prepare, GateStep::Prompt, GateStep::Command]
+        );
+        assert_eq!(
+            walk(&asking(with_when(base()), 1)),
+            [
+                GateStep::Prepare,
+                GateStep::Guard,
+                GateStep::Prompt,
+                GateStep::Command
+            ]
+        );
+        assert_eq!(
+            walk(&asking(with_confirm(base()), 1)),
+            [
+                GateStep::Prepare,
+                GateStep::Confirm,
+                GateStep::Prompt,
+                GateStep::Command
+            ]
+        );
+        // No questions is the shipped ladder, unchanged.
+        assert_eq!(
+            walk(&with_confirm(with_when(base()))),
+            [
+                GateStep::Prepare,
+                GateStep::Guard,
+                GateStep::Confirm,
+                GateStep::Command
+            ]
+        );
+    }
+
+    /// The pieces `advance` needs that say nothing about these tests.
+    fn advance_fixture() -> (ScriptFiles, std::sync::mpsc::Sender<TickEvent>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The receiver is kept alive deliberately: a dropped one turns
+        // every send into an error, which is not the failure any of
+        // these tests is about.
+        std::mem::forget(rx);
+        (ScriptFiles::default(), tx)
+    }
+
+    fn activation_for(binding: usize) -> Activation {
+        Activation {
+            id: ActivationId(1),
+            binding,
+            vars: Bindings::new(),
+            selection: None,
+            prompts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_declined_rung_never_reaches_the_prompts() {
+        // A guard that cannot spawn has authorized nothing, so nothing
+        // may be asked — the property the injected runner exists to
+        // make assertable at all.
+        let (scripts, tx) = advance_fixture();
+        let mut binding = asking(with_when(declared_binding(Key::Char('a'))), 1);
+        binding.when = Some(Template::extract("/rat-no-such-guard-xyz"));
+        binding.when_shell = Some(crate::core::registry::ShellMode::Direct);
+        let asked = std::cell::Cell::new(0);
+        let mut running = Vec::new();
+        let (gate, line) = advance(
+            GateStep::Guard,
+            &binding,
+            0,
+            activation_for(0),
+            &scripts,
+            Appearance::Dark,
+            &tx,
+            80,
+            &mut running,
+            |_, _| {
+                asked.set(asked.get() + 1);
+                Ok(Vec::new())
+            },
+        );
+        assert_eq!(asked.get(), 0, "a guard that could not run asks nothing");
+        assert!(gate.is_none());
+        assert!(line.unwrap().contains("declined (when)"));
+    }
+
+    #[test]
+    fn a_cancelled_prompt_drops_the_gate_and_says_so_once() {
+        let (scripts, tx) = advance_fixture();
+        let binding = asking(declared_binding(Key::Char('a')), 1);
+        let mut running = Vec::new();
+        let (gate, line) = advance(
+            GateStep::Prompt,
+            &binding,
+            0,
+            activation_for(0),
+            &scripts,
+            Appearance::Dark,
+            &tx,
+            80,
+            &mut running,
+            |_, _| Err(PromptStop::Cancelled),
+        );
+        assert!(
+            gate.is_none(),
+            "a cancel ends the activation; there is nothing to resume"
+        );
+        assert_eq!(line.as_deref(), Some("`a` cancelled"));
+
+        let (gate, line) = advance(
+            GateStep::Prompt,
+            &binding,
+            0,
+            activation_for(0),
+            &scripts,
+            Appearance::Dark,
+            &tx,
+            80,
+            &mut running,
+            |_, _| Err(PromptStop::Unavailable("no such file".to_string())),
+        );
+        assert!(gate.is_none());
+        let line = line.expect("a decline always speaks");
+        assert!(line.starts_with("`a` declined (prompt)"), "{line}");
+        assert!(line.contains("no such file"), "{line}");
+        assert!(running.is_empty(), "neither route launched anything");
+    }
+
+    #[test]
+    fn answers_ride_the_activation_to_the_command() {
+        let (scripts, tx) = advance_fixture();
+        let binding = asking(declared_binding(Key::Char('a')), 2);
+        let mut running = Vec::new();
+        let answers = vec![
+            PromptAnswer {
+                name: "verdict".to_string(),
+                value: "accepting".to_string(),
+            },
+            PromptAnswer {
+                name: "summary".to_string(),
+                value: "looks right".to_string(),
+            },
+        ];
+        let (gate, line) = advance(
+            GateStep::Prompt,
+            &binding,
+            0,
+            activation_for(0),
+            &scripts,
+            Appearance::Dark,
+            &tx,
+            80,
+            &mut running,
+            |_, _| Ok(answers.clone()),
+        );
+        assert!(
+            gate.is_none(),
+            "the command rung leaves the gate — launched and forgotten"
+        );
+        assert!(line.is_none());
+        assert_eq!(running.len(), 1, "the command ran after the questions");
+        // The ORDER the answers keep is asserted one layer down, in the
+        // chain's own test: reaching the activation the command arm
+        // consumed would mean reshaping production code to be
+        // observable, which changes the thing being measured.
+    }
+
+    #[test]
+    fn the_chain_stops_at_the_first_non_zero_and_asks_nothing_after_it() {
+        let question = |name: &str| crate::core::dashboard_file::Prompt {
+            name: name.to_string(),
+            kind: crate::core::dashboard_file::PromptKind::Input(Template::extract("Q")),
+            from_cursor: false,
+        };
+        let answer = |name: &str| PromptAnswer {
+            name: name.to_string(),
+            value: format!("{name}-value"),
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let out = chain_over(&[question("a"), question("b"), question("c")], |prompt| {
+            asked.borrow_mut().push(prompt.name.clone());
+            if prompt.name == "b" {
+                Err(PromptStop::Cancelled)
+            } else {
+                Ok(answer(&prompt.name))
+            }
+        });
+        assert!(matches!(out, Err(PromptStop::Cancelled)));
+        assert_eq!(
+            *asked.borrow(),
+            ["a", "b"],
+            "the third question is never asked"
+        );
+
+        let out = chain_over(&[question("a"), question("b")], |prompt| {
+            Ok(answer(&prompt.name))
+        })
+        .expect("all answered");
+        assert_eq!(
+            out.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b"],
+            "declaration order, not map order"
+        );
+    }
+
+    #[test]
+    fn a_prompts_variable_reaches_the_activations_map() {
+        // Every template a question can hold, because a fix that only
+        // pushed the single-template kinds would lose a name written
+        // inside an option list or a candidate command.
+        for kind in [
+            crate::core::dashboard_file::PromptKind::Input(Template::extract("Summary {{head}}")),
+            crate::core::dashboard_file::PromptKind::Confirm(Template::extract("Record {{head}}?")),
+            crate::core::dashboard_file::PromptKind::Choose(vec![
+                Template::extract("keep"),
+                Template::extract("{{head}}"),
+            ]),
+            crate::core::dashboard_file::PromptKind::Filter(vec![
+                Template::extract("pb"),
+                Template::extract("{{head}}"),
+            ]),
+        ] {
+            let mut binding = declared_binding(Key::Char('a'));
+            binding.prompts = vec![crate::core::dashboard_file::Prompt {
+                name: "q".to_string(),
+                kind: kind.clone(),
+                from_cursor: false,
+            }];
+            assert!(
+                needed_names(&binding).contains(&"head"),
+                "{kind:?} lost its variable"
+            );
         }
     }
 
