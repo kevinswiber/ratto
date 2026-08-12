@@ -1019,7 +1019,7 @@ fn key_block(
             // A prompt's own strings see the names and not the answers:
             // a question built from an earlier answer would make a
             // cancelled later prompt into partial application.
-            let prompt = prompt_node(child, prompts.len(), &at, &scoped)?;
+            let prompt = prompt_node(child, prompts.len(), &ctx, &scoped)?;
             let here = format!("{at} > prompt {:?}", prompt.name);
             if load.vars.contains(&prompt.name) {
                 bail!(
@@ -1098,9 +1098,10 @@ fn site_scope<'a>(key: &str, scoped: Load<'a>, spawn_scoped: Load<'a>) -> Load<'
 fn prompt_node(
     node: &kdl::KdlNode,
     index: usize,
-    at: &str,
+    ctx: &Ctx<'_>,
     load: &Load<'_>,
 ) -> anyhow::Result<Prompt> {
+    let at = ctx.at;
     let mut here = format!("{at} > prompt #{}", index + 1);
     refuse_annotation(node.ty(), "prompt", &here)?;
     if node.children().is_some() {
@@ -1146,7 +1147,17 @@ fn prompt_node(
                 "choose" => PromptKind::Choose(choose_options(&template, &here)?),
                 "confirm" => PromptKind::Confirm(template),
                 "input" => PromptKind::Input(template),
-                _ => PromptKind::Filter(template),
+                _ => {
+                    // The PLACE is the prompt's and the shell verdict is
+                    // the binding's: the line an author edits is this
+                    // one, and the shell in force where the value was
+                    // written is the binding's declaration.
+                    let source_ctx = Ctx {
+                        at: &here,
+                        shell: ctx.shell,
+                    };
+                    PromptKind::Filter(filter_source(&template, &source_ctx)?)
+                }
             },
         ));
     }
@@ -1242,6 +1253,34 @@ fn prompt_name(node: &kdl::KdlNode, at: &str) -> anyhow::Result<String> {
 /// still changing the string a command branches on. An empty option
 /// is refused for the same reason from the other side: a row that
 /// names nothing, whose value is the empty string.
+/// A `filter` prompt's candidate source: a command, split exactly as a
+/// pane's or a binding's is — one word under a shell, `shell_words`
+/// otherwise, each word re-recorded under the value's own flavor. A
+/// third caller for the one rule rather than a second rule, so a source
+/// inherits the argv-boundary promise and the unbalanced-quoting
+/// refusal without either being written again.
+///
+/// A source is command-shaped rather than condition-shaped, and that is
+/// why it needs no shell of its own: it is a program that prints lines,
+/// and a program execs with or without a shell. A precondition is a
+/// different animal — it has no meaning without one — which is why that
+/// key carries a resolved shell and this one does not.
+fn filter_source(value: &Template, ctx: &Ctx<'_>) -> anyhow::Result<Vec<Template>> {
+    let words = split_command(vec![value.clone()], ctx)?;
+    // One check for four spellings: empty and blank, shelled and not.
+    // `all` is vacuously true for the empty split, which is what keeps
+    // this from growing a branch per spelling.
+    if words.iter().all(|word| word.as_str().trim().is_empty()) {
+        bail!(
+            "{}: `filter` needs a command — its output is the list the reader picks from, \
+             and there is nothing to run. Write \
+             `filter=\"git branch --format %(refname:short)\"`",
+            ctx.at
+        );
+    }
+    Ok(words)
+}
+
 fn choose_options(value: &Template, at: &str) -> anyhow::Result<Vec<Template>> {
     let options: Vec<String> = value
         .as_str()

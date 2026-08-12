@@ -318,17 +318,24 @@ pub(crate) fn env_name(name: &str) -> String {
 ///
 /// `Choose` and `Filter` both select, and they differ in where the
 /// candidates come from — which is why one holds a list and the other
-/// a single value. A `choose`'s options are split at LOAD, on the
-/// template's own bytes, and re-recorded under its flavor: an
-/// expansion lands inside the option that held it and can never add
-/// one, exactly as a command's argv words behave. So a static short
-/// list is `choose`'s job, and a computed one is `filter`'s.
+/// a program.
+///
+/// A `choose`'s options are argv the picker receives directly, split
+/// at LOAD on the template's own bytes and re-recorded under its
+/// flavor: an expansion lands inside the option that held it and can
+/// never add one, exactly as a command's argv words behave. That is a
+/// list which is short, known, and written down. A `filter`'s value is
+/// a COMMAND, split the same way a pane's or a binding's is, whose
+/// STDOUT becomes the candidates — for the case where the list has to
+/// be computed and there are too many to read. The picker that filters
+/// takes no candidates as arguments at all, which is the fact the two
+/// shapes come from.
 #[derive(Clone, PartialEq, Debug)]
 pub enum PromptKind {
     Choose(Vec<Template>),
     Confirm(Template),
     Input(Template),
-    Filter(Template),
+    Filter(Vec<Template>),
 }
 
 /// What the board does with an action's output.
