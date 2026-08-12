@@ -10208,3 +10208,400 @@ fn a_prompt_with_no_cursor_opens_empty_rather_than_declining() {
     session.write_bytes(b"q");
     session.kill_if_alive(Duration::from_secs(2));
 }
+
+// ─── The screen contracts a board can be in ─────────────────────────
+
+const ONE_QUESTION: &str = "    prompt \"verdict\" choose=\"accepting,requesting-changes\"\n";
+const TWO_QUESTIONS: &str = "    prompt \"verdict\" choose=\"accepting,requesting-changes\"\n    \
+     prompt \"reviewer\" choose=\"kim,sam\"\n";
+
+/// The one board every screen-contract arm uses: two panes with more
+/// rows than the window holds (so the frame can be scrolled), a pane
+/// that can carry a cursor, and a binding that asks before it counts.
+///
+/// One helper rather than six copies: six inline fixtures is six
+/// chances to pin a different height and make a needle drift.
+fn screen_board(counter: &std::path::Path, questions: &str, rows: usize) -> String {
+    format!(
+        "row-gap 0\n\ndefaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n    \
+         selectable #true\n    interval \"1h\"\n}}\n\n\
+         key \"x\" {{\n    description \"assess\"\n{questions}    output \"hide\"\n    command \"{counter_cmd}\"\n}}\n\n\
+         pane \"a\" {{\n    command \"for i in $(seq -w 1 {rows}); do echo A$i; done\"\n}}\n\
+         pane \"b\" {{\n    command \"for i in $(seq -w 1 {rows}); do echo B$i; done\"\n}}\n",
+        counter_cmd = counter_cmd(counter),
+    )
+}
+
+/// Enough rows that the frame must scroll, for the arms whose non-rest
+/// state is the scroll offset.
+const TALL: usize = 20;
+/// Few enough that a ZOOMED pane still shows its own chrome row — which
+/// is where the zoom badge lives, and a fullscreen board zooming twenty
+/// rows pushes that row off the window. Still two digits, because
+/// `seq -w` pads to the width of its largest value and the fixtures
+/// wait on `B05`.
+const SHORT: usize = 12;
+
+/// A session on that board, already painted. `RAT_APPEARANCE` is
+/// pinned: the prompt child is a second rat process that would
+/// otherwise probe the terminal on startup, and its probe bytes would
+/// land in a capture that is asserting on escapes.
+fn screen_session(
+    decl: &std::path::Path,
+    fullscreen: bool,
+    env: &[(&str, &str)],
+) -> (PtySession, FakeTerminal) {
+    let path = decl.display().to_string();
+    let args: Vec<&str> = if fullscreen {
+        vec!["dashboard", &path, "--fullscreen"]
+    } else {
+        vec!["dashboard", &path]
+    };
+    let mut vars = vec![("RAT_APPEARANCE", "dark")];
+    vars.extend_from_slice(env);
+    let session =
+        PtySession::spawn(&rat_bin(), &args, &vars).expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    (session, terminal)
+}
+
+fn quit(session: &PtySession) {
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+#[test]
+fn an_inline_board_comes_back_to_its_frame_scroll_after_a_prompt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &screen_board(&counter, ONE_QUESTION, TALL));
+    let (session, mut terminal) = screen_session(&decl, false, &[]);
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"lines 2-23 of 30",
+            Duration::from_secs(3)
+        ),
+        "the frame never scrolled — the key would press at live rest"
+    );
+    session.write_bytes(b"x");
+    assert!(
+        wait_for(&session, &mut terminal, b"verdict", Duration::from_secs(8)),
+        "the question never painted"
+    );
+    session.write_bytes(b"\r");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"lines 2-23 of 30",
+            Duration::from_secs(8)
+        ),
+        "the board came back to a different offset"
+    );
+    wait_for_counter(&counter, 1);
+    quit(&session);
+}
+
+/// A cancel resumes too, and it is the arm most likely to be written
+/// once and never for the second contract: an implementation that
+/// returns early on a non-zero exit passes every answer arm and
+/// corrupts the terminal on every Esc.
+#[test]
+fn a_cancelled_prompt_gives_an_inline_board_back_its_focus_and_its_cursor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &screen_board(&counter, ONE_QUESTION, TALL));
+    let (session, mut terminal) = screen_session(&decl, false, &[]);
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "focus never landed"
+    );
+    session.write_bytes(b"s");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"cursor 1/20",
+            Duration::from_secs(3)
+        ),
+        "the cursor never appeared"
+    );
+    session.write_bytes(b"x");
+    assert!(
+        wait_for(&session, &mut terminal, b"verdict", Duration::from_secs(8)),
+        "the question never painted"
+    );
+    // Ctrl-C rather than a bare Esc: a lone escape byte is what the
+    // reader has to disambiguate after its timeout, and this arm is
+    // about the screen rather than about that.
+    session.write_bytes(b"\x03");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"focus a", b"cursor 1/20"],
+        Duration::from_secs(8),
+    );
+    // The anchor: an arm that never fired the binding at all would pass
+    // its screen assertions alone.
+    assert_counter_settled_at(&counter, 0);
+    quit(&session);
+}
+
+/// A cancel at the SECOND question. A resume written into the first
+/// question's exit path is a plausible and wrong implementation — it
+/// would flicker the board between questions and pass the arm above.
+#[test]
+fn a_cancel_at_the_second_prompt_returns_a_zoomed_board_zoomed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &screen_board(&counter, TWO_QUESTIONS, SHORT));
+    let (session, mut terminal) = screen_session(&decl, false, &[]);
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "focus never landed"
+    );
+    session.write_bytes(b"z");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"zoomed 1/2",
+            Duration::from_secs(3)
+        ),
+        "the pane never zoomed"
+    );
+    session.write_bytes(b"x");
+    assert!(
+        wait_for(&session, &mut terminal, b"verdict", Duration::from_secs(8)),
+        "the first question never painted"
+    );
+    session.write_bytes(b"\r");
+    assert!(
+        wait_for(&session, &mut terminal, b"reviewer", Duration::from_secs(8)),
+        "the second question never painted"
+    );
+    session.write_bytes(b"\x03");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"zoomed 1/2",
+            Duration::from_secs(8)
+        ),
+        "the board came back unzoomed"
+    );
+    assert_counter_settled_at(&counter, 0);
+    quit(&session);
+}
+
+/// The escape order, in ONE capture: left before the child, re-entered
+/// after it, repainted from scratch at the same offset. A picker never
+/// takes the alternate screen itself, so a path that lost the leave
+/// looks completely correct inline.
+#[test]
+fn a_fullscreen_board_leaves_and_re_enters_the_alternate_screen_around_a_prompt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &screen_board(&counter, ONE_QUESTION, TALL));
+    let (session, mut terminal) = screen_session(&decl, true, &[]);
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"lines 2-23 of 30",
+            Duration::from_secs(3)
+        ),
+        "the frame never scrolled — the key would press at live rest"
+    );
+    session.write_bytes(b"x");
+    assert!(
+        wait_for(&session, &mut terminal, b"verdict", Duration::from_secs(8)),
+        "the question never painted"
+    );
+    session.write_bytes(b"\r");
+    // One capture, never two waits: the repaint can share a read chunk
+    // with the re-entry escape on a slow runner, and a consumed paint
+    // is never repainted.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"\x1b[?1049h", b"lines 2-23 of 30"],
+        Duration::from_secs(10),
+    );
+    wait_for_counter(&counter, 1);
+    quit(&session);
+}
+
+#[test]
+fn a_cancelled_prompt_returns_a_fullscreen_board_to_its_focus_and_zoom() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &screen_board(&counter, ONE_QUESTION, SHORT));
+    let (session, mut terminal) = screen_session(&decl, true, &[]);
+    session.write_bytes(b"\t");
+    assert!(
+        wait_for(&session, &mut terminal, b"focus a", Duration::from_secs(3)),
+        "focus never landed"
+    );
+    session.write_bytes(b"z");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"zoomed 1/2",
+            Duration::from_secs(3)
+        ),
+        "the pane never zoomed"
+    );
+    session.write_bytes(b"x");
+    assert!(
+        wait_for(&session, &mut terminal, b"verdict", Duration::from_secs(8)),
+        "the question never painted"
+    );
+    session.write_bytes(b"\x03");
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"\x1b[?1049h", b"focus a"],
+        Duration::from_secs(10),
+    );
+    // The zoom badge is not the witness here: a fullscreen board zooms
+    // the pane to fill the screen, which pushes the pane's own chrome
+    // row — where the badge lives — one line past the window. What a
+    // zoomed board shows instead is one pane's content and not the
+    // other's, anchored on the focus needle above.
+    assert!(
+        !contains(&seen, b"B01"),
+        "the board came back unzoomed: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert_counter_settled_at(&counter, 0);
+    quit(&session);
+}
+
+/// A handover that never happened needs no resume, and the board must
+/// not be left suspended: the notice and a live needle in one capture.
+#[test]
+fn a_prompt_that_cannot_launch_leaves_the_board_on_its_feet() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // `shell #false` on the binding is what makes the source
+    // unlaunchable rather than merely failing: under a shell the shell
+    // launches fine and exits non-zero, which is a cancel.
+    let ran = dir.path().join("ran");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "row-gap 0\n\ndefaults {{\n    height 15\n    border \"none\"\n    chrome #true\n    shell #true\n    \
+             interval \"1h\"\n}}\n\n\
+             key \"x\" {{\n    description \"assess\"\n    prompt \"rev\" filter=\"/rat-no-such-source-xyz\"\n    \
+             shell #false\n    output \"hide\"\n    command \"touch {ran}\"\n}}\n\n\
+             pane \"a\" {{\n    command \"for i in $(seq -w 1 20); do echo A$i; done\"\n}}\n\
+             pane \"b\" {{\n    command \"for i in $(seq -w 1 20); do echo B$i; done\"\n}}\n",
+            ran = ran.display(),
+        ),
+    );
+    let (session, mut terminal) = screen_session(&decl, false, &[]);
+    session.write_bytes(b"x");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        // The frame first, then the notice: one repaint carries both,
+        // and the status row is its last line — so a board that came
+        // back painting is what this order encodes.
+        &[b"B05", b"`x` declined (prompt)"],
+        Duration::from_secs(8),
+    );
+    assert!(
+        !ran.exists(),
+        "the command ran behind a question nobody asked"
+    );
+    quit(&session);
+}
+
+/// A spoken question runs on the PRIMARY screen, by construction: the
+/// handoff leaves the alternate screen before any child spawns, so the
+/// transcript rows land in real scrollback rather than in a buffer the
+/// restore discards. A cell that pins what the mechanism gives is
+/// cheap; an unpinned gift regresses.
+#[test]
+fn a_spoken_question_writes_its_transcript_before_the_board_re_enters() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &screen_board(&counter, ONE_QUESTION, TALL));
+    let (session, mut terminal) = screen_session(&decl, true, &[("RAT_ACCESSIBLE", "1")]);
+    session.write_bytes(b"x");
+    // Two captures, because the key that answers has to be sent between
+    // them — each one an ordered sequence. The alternate screen is left
+    // BEFORE the child, so every row the child speaks is on the primary
+    // screen…
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"\x1b[?1049l", b"enter chooses"],
+        Duration::from_secs(8),
+    );
+    session.write_bytes(b"\r");
+    // …and the board's re-entry comes after the closing row, which is
+    // what keeps the transcript in scrollback.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"chose accepting\r\n", b"\x1b[?1049h", b"B05"],
+        Duration::from_secs(10),
+    );
+    wait_for_counter(&counter, 1);
+    quit(&session);
+}
+
+/// The same discipline inline, where there is no alternate screen at
+/// all: the transcript is simply on the terminal, and the board
+/// repaints under it.
+#[test]
+fn a_spoken_question_leaves_its_transcript_above_an_inline_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &screen_board(&counter, ONE_QUESTION, TALL));
+    let (session, mut terminal) = screen_session(&decl, false, &[("RAT_ACCESSIBLE", "1")]);
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"lines 2-23 of 30",
+            Duration::from_secs(3)
+        ),
+        "the frame never scrolled — the key would press at live rest"
+    );
+    session.write_bytes(b"x");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"enter chooses",
+            Duration::from_secs(8)
+        ),
+        "the spoken question never opened"
+    );
+    session.write_bytes(b"\r");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"chose accepting\r\n", b"lines 2-23 of 30"],
+        Duration::from_secs(10),
+    );
+    wait_for_counter(&counter, 1);
+    quit(&session);
+}
