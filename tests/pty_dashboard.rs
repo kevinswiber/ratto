@@ -10605,3 +10605,42 @@ fn a_spoken_question_leaves_its_transcript_above_an_inline_board() {
     wait_for_counter(&counter, 1);
     quit(&session);
 }
+
+/// The third non-interactive route: a terminal, but `--once`. The key
+/// is pressed twice — before the frame and after it — and no question
+/// appears; the run ends on its own without a `q`.
+///
+/// Anchored rather than byte-compared: a `--once` run never enables raw
+/// mode, so the terminal's own line discipline echoes the keystroke
+/// into the capture. The claim is an absence inside a capture plus an
+/// exit, and neither is affected by that echo.
+#[test]
+fn a_once_board_on_a_terminal_asks_nothing_with_the_prompt_key_pressed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("counter");
+    let decl = write_dashboard(dir.path(), &screen_board(&counter, ONE_QUESTION, TALL));
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string(), "--once"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    session.write_bytes(b"x");
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the once frame never painted"
+    );
+    session.write_bytes(b"x");
+    let tail = drain_for(&session, Duration::from_millis(500));
+    assert!(
+        !contains(&tail, b"verdict"),
+        "a question opened on a board with no keyboard: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(5)),
+        "a once board exits on its own"
+    );
+    assert_counter_settled_at(&counter, 0);
+}

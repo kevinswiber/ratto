@@ -2985,6 +2985,128 @@ fn a_piped_once_board_is_byte_identical_with_and_without_bindings() {
     assert_eq!(a.stderr, b.stderr, "stderr moved");
 }
 
+/// The `key` block the questioning half of every pair declares. The
+/// questions can never run on these routes — nothing can press the key
+/// — but a real picker and a real candidate source keep the fixture
+/// honest: an inert route must be inert against the shapes that DO
+/// something everywhere else.
+///
+/// The source names a file that does not exist, and that is the
+/// evidence channel: a source that ever ran would put its complaint on
+/// stderr, which these witnesses compare. Sh-free, because this suite
+/// is, and it needs no helper the tree does not already ship.
+fn prompting_keys(missing: &std::path::Path) -> String {
+    format!(
+        "key \"x\" {{\n    description \"never reachable here\"\n    \
+         prompt \"verdict\" choose=\"accepting,requesting-changes\"\n    \
+         prompt \"rev\" filter=\"{bin} __cat {missing}\"\n    \
+         command \"true\"\n}}\n\n",
+        bin = rat_bin().escape_default(),
+        missing = missing.display().to_string().escape_default(),
+    )
+}
+
+/// Inertness's byte-level half with QUESTIONS declared, piped live.
+///
+/// The usual green-before measurement is unavailable, and the reason is
+/// structural: a questioning board does not load at all on a tree
+/// without this grammar, so there is no earlier point at which both
+/// halves of the comparison exist. The substitute is a two-point run —
+/// at the commit that landed the grammar and nothing that could run a
+/// question (`5d093e4`), and again with the whole path in the tree —
+/// and both were green. A witness whose green has been observed
+/// exactly once, after the change, is an assertion.
+#[test]
+fn a_piped_live_board_is_byte_identical_with_and_without_prompts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("no-such-source");
+    let (plain, bound) = board_pair(dir.path(), &prompting_keys(&missing));
+    let (out_plain, err_plain) = piped_live_capture(&plain);
+    let (out_bound, err_bound) = piped_live_capture(&bound);
+    assert_eq!(out_plain, out_bound, "stdout moved");
+    assert_eq!(err_plain, err_bound, "stderr moved");
+}
+
+/// The same, piped `--once` — two complete runs, compared byte for
+/// byte.
+#[test]
+fn a_piped_once_board_is_byte_identical_with_and_without_prompts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("no-such-source");
+    let (plain, bound) = board_pair(dir.path(), &prompting_keys(&missing));
+    let run = |decl: &str| {
+        rat()
+            .env("NO_COLOR", "1")
+            .env("RAT_WIDTH", "60")
+            .env("RAT_HEIGHT", "12")
+            .args(["dashboard", decl, "--once"])
+            .output()
+            .expect("run rat dashboard --once")
+    };
+    let (a, b) = (run(&plain), run(&bound));
+    assert!(a.status.success(), "plain board failed: {a:?}");
+    assert!(b.status.success(), "bound board failed: {b:?}");
+    assert_eq!(a.stdout, b.stdout, "stdout moved");
+    assert_eq!(a.stderr, b.stderr, "stderr moved");
+}
+
+/// The arm with teeth. Every other assertion here is a comparison a
+/// never-fired feature passes trivially; this one has a failure mode a
+/// plausible implementation produces — a candidate source validated or
+/// pre-warmed at LOAD, which is where a reader would naturally want to
+/// catch a broken command, and which would let a board with no keyboard
+/// spawn a process.
+///
+/// The presence anchor is not optional: a board that failed to load
+/// satisfies "stderr is empty" perfectly.
+#[test]
+fn a_piped_board_never_runs_a_prompts_candidate_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("no-such-source");
+    let (_, bound) = board_pair(dir.path(), &prompting_keys(&missing));
+    let (out, err) = piped_live_capture(&bound);
+    assert!(
+        out.contains("inert-needle"),
+        "the board never painted: {out}"
+    );
+    assert!(
+        err.is_empty(),
+        "a candidate source ran and complained: {err}"
+    );
+}
+
+/// Validation accepts a questioning board and runs nothing it
+/// declares — the half that stops inertness from being satisfied by the
+/// board failing.
+///
+/// Both board-validating routes, for the reason the claimed-key refusal
+/// gives: behaving differently on one route than on the other is the
+/// failure the shared prefix exists to close.
+#[test]
+fn dashboard_check_accepts_a_prompt_and_runs_nothing_it_declares() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("no-such-source");
+    let (_, bound) = board_pair(dir.path(), &prompting_keys(&missing));
+    for args in [
+        vec!["dashboard", &bound, "--once"],
+        vec!["dashboard", "check", &bound],
+    ] {
+        let out = rat()
+            .env("NO_COLOR", "1")
+            .env("RAT_WIDTH", "60")
+            .env("RAT_HEIGHT", "12")
+            .args(&args)
+            .output()
+            .expect("run rat");
+        assert!(out.status.success(), "{args:?} refused the board: {out:?}");
+        assert!(
+            out.stderr.is_empty(),
+            "{args:?} said something: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// Two stacked panes over constant bodies, with every input the frame's
 /// bytes depend on declared rather than defaulted. `row-gap` is spelled
 /// out so the literal below does not rest on a default anyone may later
