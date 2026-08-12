@@ -2301,17 +2301,23 @@ pane "nested" {
     /// is what survives of 3.1's characterization pins — they compared
     /// each example against the text it replaced, and that comparison
     /// lost its second side when the old parser went.)
+    /// Every board the repository ships, listed once: a second list
+    /// somewhere else would go stale the day an example is added, and
+    /// go stale silently — a test that reads six of seven files still
+    /// passes.
+    const SHIPPED_EXAMPLES: [&str; 7] = [
+        include_str!("../../examples/panes.kdl"),
+        include_str!("../../examples/panes-nested.kdl"),
+        include_str!("../../examples/follow.kdl"),
+        include_str!("../../examples/script.kdl"),
+        include_str!("../../examples/variables.kdl"),
+        include_str!("../../examples/keys.kdl"),
+        include_str!("../../examples/review.kdl"),
+    ];
+
     #[test]
     fn the_shipped_examples_declare_real_dashboards() {
-        for text in [
-            include_str!("../../examples/panes.kdl"),
-            include_str!("../../examples/panes-nested.kdl"),
-            include_str!("../../examples/follow.kdl"),
-            include_str!("../../examples/script.kdl"),
-            include_str!("../../examples/variables.kdl"),
-            include_str!("../../examples/keys.kdl"),
-            include_str!("../../examples/review.kdl"),
-        ] {
+        for text in SHIPPED_EXAMPLES {
             let file = parse(text).expect("the example parses");
             // A stub runner, not the real one: this is a unit test, and
             // what is under test is that every LOAD-TIME site validates
@@ -4938,5 +4944,168 @@ key "r" {{
         // the parse fails first and the refusal never runs.
         let err = binding_err(&format!("key \"j\" {{ command \"x\" }}\n{ONE_PANE}"));
         assert!(err.contains("needs a `description`"), "{err}");
+    }
+
+    // ─── The `prompt` node ──────────────────────────────────────────
+
+    use crate::core::dashboard_file::PromptKind;
+
+    #[test]
+    fn a_binding_declares_its_prompts_in_the_order_they_are_written() {
+        let decls = declared(&format!(
+            "key \"a\" {{\n\
+             description \"assess this change\"\n\
+             prompt \"verdict\" choose=\"accepting,requesting-changes\"\n\
+             prompt \"summary\" input=\"Summary\"\n\
+             prompt \"ship\" confirm=\"Record it?\"\n\
+             command \"pointbreak assessment add\"\n\
+             }}\n{ONE_PANE}"
+        ));
+        let names: Vec<&str> = decls[0].prompts.iter().map(|p| p.name.as_str()).collect();
+        // Written order, and the fixture is ordered so that a sort, a
+        // reverse, or a map would each produce a different answer.
+        assert_eq!(names, ["verdict", "summary", "ship"]);
+        assert!(matches!(decls[0].prompts[1].kind, PromptKind::Input(_)));
+    }
+
+    #[test]
+    fn a_prompt_carries_two_values_so_it_is_a_child_node() {
+        let err = binding_err(&format!(
+            "key \"a\" prompt=\"x\" {{ description \"d\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.starts_with("key \"a\": a `prompt` carries a name and a kind"),
+            "{err}"
+        );
+        assert!(err.contains("child node"), "{err}");
+    }
+
+    #[test]
+    fn a_prompts_name_is_not_substitutable() {
+        let err = binding_err(&format!(
+            "key \"a\" {{ description \"d\"\nprompt \"{{{{who}}}}\" input=\"?\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("not substitutable"), "{err}");
+    }
+
+    /// A `choose` prompt's options, off the walk. The value is written
+    /// with its quotes so a raw spelling can be handed in whole.
+    fn choose_options_of(value: &str) -> Vec<Template> {
+        let decls = declared(&format!(
+            "variables {{\n    verdicts \"x,y\"\n    a \"1\"\n    b \"2\"\n}}\n\
+             key \"k\" {{ description \"d\"\nprompt \"v\" choose={value}\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        match &decls[0].prompts[0].kind {
+            PromptKind::Choose(options) => options.clone(),
+            other => panic!("expected a choose prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_choose_prompts_options_split_at_load_and_an_expansion_never_adds_one() {
+        for (value, texts, refs) in [
+            ("\"a,b\"", vec!["a", "b"], vec![vec![], vec![]]),
+            (
+                "\"a, b , c\"",
+                vec!["a", "b", "c"],
+                vec![vec![], vec![], vec![]],
+            ),
+            // The row that matters: an expansion lands INSIDE the
+            // option that held it, so a computed comma cannot add a
+            // row. A board that needs a computed list wants `filter`.
+            (
+                "\"{{verdicts}}\"",
+                vec!["{{verdicts}}"],
+                vec![vec!["verdicts"]],
+            ),
+            (
+                "\"{{a}},{{b}}\"",
+                vec!["{{a}}", "{{b}}"],
+                vec![vec!["a"], vec!["b"]],
+            ),
+            // And the row a hand-rolled split fails: re-recording each
+            // option under the whole value's flavor is what keeps a raw
+            // string's braces from becoming a reference.
+            ("#\"a,{{b}}\"#", vec!["a", "{{b}}"], vec![vec![], vec![]]),
+        ] {
+            let options = choose_options_of(value);
+            assert_eq!(
+                options.iter().map(Template::as_str).collect::<Vec<_>>(),
+                texts,
+                "{value}"
+            );
+            assert_eq!(
+                options.iter().map(Template::refs).collect::<Vec<_>>(),
+                refs,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_choose_prompt_has_no_empty_option() {
+        for value in ["", "a,,b", "a,"] {
+            let err = binding_err(&format!(
+                "key \"a\" {{ description \"d\"\nprompt \"v\" choose=\"{value}\"\ncommand \"y\" }}\n{ONE_PANE}"
+            ));
+            assert!(err.contains("empty option"), "{value:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_node_carries_a_name_and_a_kind_and_nothing_else() {
+        for (written, refused) in [
+            ("prompt input=\"?\"", "needs a name"),
+            ("prompt \"a\" \"b\" input=\"?\"", "names one variable"),
+            ("prompt \"a\" input=\"?\" { }", "holds no block"),
+            ("prompt (u8)\"a\" input=\"?\"", "no meaning here"),
+            ("prompt \"a\" header=\"?\"", "unknown property"),
+            ("prompt \"a\" input=7", "takes one string"),
+        ] {
+            let err = binding_err(&format!(
+                "key \"a\" {{ description \"d\"\n{written}\ncommand \"y\" }}\n{ONE_PANE}"
+            ));
+            assert!(err.contains(refused), "{written}: {err}");
+        }
+        // The prefix only: the tail of this sentence grows when a
+        // prompt gains an attribute that is not a kind.
+        let err = binding_err(&format!(
+            "key \"a\" {{ description \"d\"\nprompt \"a\" header=\"?\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert!(
+            err.starts_with("key \"a\" > prompt \"a\": unknown property \"header\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_binding_key_is_told_the_set_including_prompt() {
+        let err = binding_err(&format!(
+            "key \"a\" {{ description \"d\"\npromt \"v\" input=\"?\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert!(err.contains("unknown node \"promt\""), "{err}");
+        assert!(err.contains("`prompt` asks a question"), "{err}");
+    }
+
+    #[test]
+    fn the_loaded_binding_carries_the_prompts_it_declared() {
+        let loaded = resolved(&format!(
+            "key \"a\" {{ description \"d\"\nprompt \"v\" input=\"?\"\ncommand \"y\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(loaded[0].prompts.len(), 1);
+        assert!(matches!(loaded[0].prompts[0].kind, PromptKind::Input(_)));
+    }
+
+    #[test]
+    fn no_shipped_board_asks_a_question_yet() {
+        // The default path: every board that ships today declares no
+        // prompts, so the grammar's arrival changes nothing a reader
+        // can see — and the day one of them does ask, this is where the
+        // change is announced.
+        for text in SHIPPED_EXAMPLES {
+            for binding in parse(text).expect("the example parses").bindings {
+                assert!(binding.prompts.is_empty(), "{}", binding.spelling);
+            }
+        }
     }
 }
