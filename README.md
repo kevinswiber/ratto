@@ -1395,6 +1395,17 @@ else finds your terminal's colours: `rat table`, `rat watch` and `rat
 doctor` still ask, and still paint, exactly as they did. `rat doctor`
 reports which mode a session resolved to and what decided it.
 
+What the reader hears also depends on the terminal, more than on
+anything rat writes. Measured under VoiceOver: macOS Terminal.app
+announces each appended line as it arrives, and is the reference for
+spoken use; Ghostty currently announces nothing as it arrives and reads
+the screen only when focus returns to it. A screen reader's typing-echo
+setting does not apply inside the pickers either — they hold the
+terminal in raw mode, so no character is ever echoed as typed, and the
+settled query line is the echo. And a dashboard built for spoken use
+should turn its borders off (`chrome #false` on its panes): box-drawing
+characters are read out one by one, at any punctuation verbosity.
+
 This mode exists for linear readers, the same bargain `--append` makes,
 for the three commands that used to erase what they said.
 

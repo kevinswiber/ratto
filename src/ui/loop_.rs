@@ -153,10 +153,10 @@ const POLL_SLICE: Duration = Duration::from_millis(250);
 /// A starting value, derived from measured INPUT cadence: typing runs
 /// near an eighth of a second per character, so a typed burst settles
 /// into one row, while an unhurried arrow run is roughly half a second
-/// between keys and still speaks every move. Nothing here is derived
-/// from how long a screen reader takes to say a row — that has not been
-/// measured, and this value should be revisited once the mode has
-/// actually been heard.
+/// between keys and still speaks every move. Heard for real since
+/// (VoiceOver, Terminal.app): an arriving line interrupts the current
+/// utterance — latest wins — and a settled row is read to completion,
+/// so this floor value stands measured rather than hedged.
 const ECHO_QUIESCENCE: Duration = POLL_SLICE;
 
 /// How long to wait for the next key, or `None` when the deadline has

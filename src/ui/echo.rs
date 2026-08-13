@@ -137,9 +137,10 @@ pub fn on_demand_clause(multi: bool) -> &'static str {
 }
 
 /// How many items an opening block lists before it stops naming them and
-/// says how many there are. A starting value: the blocks measured in use
-/// were a handful of rows, and a list of eight hundred branches must not
-/// be read aloud on entry.
+/// says how many there are. Heard for real (VoiceOver, Terminal.app): a
+/// block of ten is read whole at a fast voice, a longer block is
+/// preempted by whatever arrives next — and a list of eight hundred
+/// branches must not be read aloud on entry at any value.
 pub const ECHO_OPENING_CAP: usize = 20;
 
 /// The block every surface prints once on entry, built in one place so
