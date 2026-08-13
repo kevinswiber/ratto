@@ -1307,6 +1307,7 @@ fn resolve_binding(
             Some(named) => named.resolve(bindings).with_context(|| at.clone())?,
         }),
     };
+    let prompts = resolve_prompts(&decl.prompts, &shell, &at)?;
     Ok(KeyBinding {
         key: decl.key,
         spelling: decl.spelling.clone(),
@@ -1317,8 +1318,70 @@ fn resolve_binding(
         when_shell,
         output,
         confirm,
-        prompts: decl.prompts.clone(),
+        prompts,
     })
+}
+
+/// A filter source's split, under the binding's FINAL shell verdict.
+/// The parse records the author's bytes untouched because a
+/// shebang-less `script` promotes an absent shell after the prompt was
+/// written (`script_ladder`) — a split taken at parse and re-joined for
+/// the promoted shell would re-open quoted argument boundaries. Under a
+/// shell the bytes go to it verbatim; direct, they word-split exactly
+/// as a `command` does. Every other kind rides through unchanged.
+fn resolve_prompts(
+    prompts: &[Prompt],
+    shell: &ShellMode,
+    binding_at: &str,
+) -> anyhow::Result<Vec<Prompt>> {
+    prompts
+        .iter()
+        .map(|prompt| {
+            let kind = match &prompt.kind {
+                PromptKind::Filter(raw) => {
+                    let here = format!("{binding_at} > prompt {:?}", prompt.name);
+                    PromptKind::Filter(split_filter_source(raw, shell, &here)?)
+                }
+                other => other.clone(),
+            };
+            Ok(Prompt {
+                kind,
+                ..prompt.clone()
+            })
+        })
+        .collect()
+}
+
+fn split_filter_source(
+    raw: &[Template],
+    shell: &ShellMode,
+    here: &str,
+) -> anyhow::Result<Vec<Template>> {
+    let [line] = raw else {
+        return Ok(raw.to_vec());
+    };
+    if !matches!(shell, ShellMode::Direct) {
+        return Ok(vec![line.clone()]);
+    }
+    // The split happens at LOAD, on TEMPLATE text, and each word is
+    // re-recorded under the whole value's flavor — an expansion lands
+    // INSIDE the word that held it and never creates a new argv
+    // element, same as a `command`'s.
+    let words = line.reslice(
+        shell_words::split(line.as_str())
+            .map_err(|err| anyhow!("{here}: command has unbalanced quoting ({err})"))?,
+    );
+    // `''` survives the parse's blank check (the quotes are ink) and
+    // splits to nothing a spawn could index — the same refusal, one
+    // step later.
+    if words.iter().all(|word| word.as_str().trim().is_empty()) {
+        bail!(
+            "{here}: `filter` needs a command — its output is the list the reader picks from, \
+             and there is nothing to run. Write \
+             `filter=\"git branch --format %(refname:short)\"`"
+        );
+    }
+    Ok(words)
 }
 
 /// Whether a pane asked for a line cursor — the ONE place the rule is

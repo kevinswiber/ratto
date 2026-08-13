@@ -1149,10 +1149,11 @@ fn prompt_node(
                 "confirm" => PromptKind::Confirm(template),
                 "input" => PromptKind::Input(template),
                 _ => {
-                    // The PLACE is the prompt's and the shell verdict is
-                    // the binding's: the line an author edits is this
-                    // one, and the shell in force where the value was
-                    // written is the binding's declaration.
+                    // The PLACE is the prompt's; the shell verdict is
+                    // the binding's FINAL one, which a shebang-less
+                    // `script` can still change after this node — so
+                    // the source rides raw and `resolve_binding` splits
+                    // it once the ladder has spoken.
                     let source_ctx = Ctx {
                         at: &here,
                         shell: ctx.shell,
@@ -1267,11 +1268,15 @@ fn prompt_name(node: &kdl::KdlNode, at: &str) -> anyhow::Result<String> {
 /// different animal — it has no meaning without one — which is why that
 /// key carries a resolved shell and this one does not.
 fn filter_source(value: &Template, ctx: &Ctx<'_>) -> anyhow::Result<Vec<Template>> {
-    let words = split_command(vec![value.clone()], ctx)?;
-    // One check for four spellings: empty and blank, shelled and not.
-    // `all` is vacuously true for the empty split, which is what keeps
-    // this from growing a branch per spelling.
-    if words.iter().all(|word| word.as_str().trim().is_empty()) {
+    // Recorded RAW, one element. A shebang-less `script` promotes an
+    // absent shell to the platform shell AFTER this line runs
+    // (`script_ladder`), and the split's shape follows the FINAL
+    // verdict — a split taken here and re-joined for a promoted shell
+    // would re-open quoted argument boundaries. So the split waits for
+    // the ladder (`resolve_binding`), where that verdict exists. The
+    // blank check cannot wait: an author reads this refusal against
+    // the line they wrote.
+    if value.as_str().trim().is_empty() {
         bail!(
             "{}: `filter` needs a command — its output is the list the reader picks from, \
              and there is nothing to run. Write \
@@ -1279,7 +1284,7 @@ fn filter_source(value: &Template, ctx: &Ctx<'_>) -> anyhow::Result<Vec<Template
             ctx.at
         );
     }
-    Ok(words)
+    Ok(vec![value.clone()])
 }
 
 fn choose_options(value: &Template, at: &str) -> anyhow::Result<Vec<Template>> {
@@ -5626,9 +5631,12 @@ key "r" {{
         }
     }
 
-    /// The one filter prompt a fixture declares, as its argv words.
+    /// The one filter prompt a fixture declares, as its argv words —
+    /// read RESOLVED, because that is where the split now happens (the
+    /// parse records raw bytes; `resolve_binding` splits under the
+    /// ladder's final shell verdict).
     fn source(text: &str) -> Vec<String> {
-        match &declared(text)[0].prompts[0].kind {
+        match &resolved(text)[0].prompts[0].kind {
             PromptKind::Filter(argv) => argv.iter().map(|w| w.as_str().to_string()).collect(),
             other => panic!("not a filter prompt: {other:?}"),
         }
@@ -5676,8 +5684,8 @@ key "r" {{
                  key \"a\" {{ description \"d\"\nprompt \"rev\" filter={value}\ncommand \"y\" }}\n{ONE_PANE}"
             )
         };
-        let decls = declared(&board("\"pb list {{scope}}\""));
-        let PromptKind::Filter(argv) = &decls[0].prompts[0].kind else {
+        let loaded = resolved(&board("\"pb list {{scope}}\""));
+        let PromptKind::Filter(argv) = &loaded[0].prompts[0].kind else {
             panic!("a filter prompt")
         };
         assert_eq!(argv.len(), 3);
@@ -5690,8 +5698,8 @@ key "r" {{
         // boundary this grammar closed.
         assert_eq!(source(&board("\"{{listing}}\"")).len(), 1);
         // Raw: three words and no references at all.
-        let decls = declared(&board("#\"pb list {{scope}}\"#"));
-        let PromptKind::Filter(argv) = &decls[0].prompts[0].kind else {
+        let loaded = resolved(&board("#\"pb list {{scope}}\"#"));
+        let PromptKind::Filter(argv) = &loaded[0].prompts[0].kind else {
             panic!("a filter prompt")
         };
         assert_eq!(argv.len(), 3);
@@ -5721,7 +5729,9 @@ key "r" {{
 
     #[test]
     fn an_unbalanced_filter_source_names_the_prompt_not_the_binding() {
-        let err = binding_err(&format!(
+        // At LOAD rather than parse since the split moved behind the
+        // ladder — the reader still sees one refusal on one load.
+        let err = resolve_err(&format!(
             "key \"a\" {{ description \"d\"\nprompt \"rev\" filter=\"pb list --title 'x\"\ncommand \"y\" }}\n{ONE_PANE}"
         ));
         assert!(
@@ -5745,6 +5755,36 @@ key "r" {{
         // And the shell that will spawn it is the binding's own — no
         // second field was needed.
         assert_eq!(loaded[0].shell, ShellMode::Direct);
+    }
+
+    #[test]
+    fn a_script_promoted_shell_keeps_the_filter_sources_bytes() {
+        // A shebang-less `script` promotes a binding's absent shell to
+        // the platform shell AFTER the prompt was written. The source's
+        // syntax belongs to the shell that will run it, so the promoted
+        // verdict must see the author's bytes — a split-then-rejoin
+        // would hand `'two words'` to the shell as two arguments.
+        let loaded = resolved(&format!(
+            "key \"a\" {{ description \"d\"\nscript \"true\"\nprompt \"rev\" filter=\"pb list --title 'two words'\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(loaded[0].shell, ShellMode::Platform);
+        let PromptKind::Filter(argv) = &loaded[0].prompts[0].kind else {
+            panic!("a filter prompt")
+        };
+        let words: Vec<&str> = argv.iter().map(|w| w.as_str()).collect();
+        assert_eq!(words, ["pb list --title 'two words'"]);
+        // The unpromoted twin still splits, quoting honored: the two
+        // verdicts disagree on shape exactly here, which is why the
+        // split waits for the ladder.
+        let loaded = resolved(&format!(
+            "key \"a\" {{ description \"d\"\ncommand \"true\"\nprompt \"rev\" filter=\"pb list --title 'two words'\" }}\n{ONE_PANE}"
+        ));
+        assert_eq!(loaded[0].shell, ShellMode::Direct);
+        let PromptKind::Filter(argv) = &loaded[0].prompts[0].kind else {
+            panic!("a filter prompt")
+        };
+        let words: Vec<&str> = argv.iter().map(|w| w.as_str()).collect();
+        assert_eq!(words, ["pb", "list", "--title", "two words"]);
     }
 
     #[test]
