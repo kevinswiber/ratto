@@ -2,6 +2,49 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.21.0](https://github.com/kevinswiber/ratto/compare/46d31fe0cd594f18e90371e8ff267374cc9ea237..v0.21.0) - 2026-08-13
+#### Features
+- open an input on the line the reader marked - ([1362e2f](https://github.com/kevinswiber/ratto/commit/1362e2f4682e28a744a722f930b59781fcb52f8b)) - [@kevinswiber](https://github.com/kevinswiber)
+- hand each prompt answer to the command as a variable - ([807648a](https://github.com/kevinswiber/ratto/commit/807648a60bcb0ff99a64f5985f505872e8832cfe)) - [@kevinswiber](https://github.com/kevinswiber)
+- let a binding ask before it acts - ([402ffb8](https://github.com/kevinswiber/ratto/commit/402ffb80bc7cf69385c196a335d3861c1232d97a)) - [@kevinswiber](https://github.com/kevinswiber)
+- ask one question by running the picker that already ships - ([b356631](https://github.com/kevinswiber/ratto/commit/b3566311702919e5f7892efb4de1fb71522f7a7d)) - [@kevinswiber](https://github.com/kevinswiber)
+- split a filter prompt's source the way every command is split - ([741f7b2](https://github.com/kevinswiber/ratto/commit/741f7b246e2b49b379826cdb362f5770532c06fa)) - [@kevinswiber](https://github.com/kevinswiber)
+- hold a prompt's name, its kind, and where its answer can be read - ([eb1ef91](https://github.com/kevinswiber/ratto/commit/eb1ef9195aa6044486757da3e1397c0759cabec3)) - [@kevinswiber](https://github.com/kevinswiber)
+- let a binding declare the questions it asks first - ([ee155ed](https://github.com/kevinswiber/ratto/commit/ee155ed0c700426ed8da9e6457bf9d7f0a327337)) - [@kevinswiber](https://github.com/kevinswiber)
+- stop asking the terminal a question a spoken session never reads - ([7494e0f](https://github.com/kevinswiber/ratto/commit/7494e0fa6d7c0865d697fcc1f5d8f711ba142cc6)) - [@kevinswiber](https://github.com/kevinswiber)
+- answer where you are and what you tagged, on demand - ([c39fbd0](https://github.com/kevinswiber/ratto/commit/c39fbd0b990e8de919cdd7ded32fdc0290d92f04)) - [@kevinswiber](https://github.com/kevinswiber)
+- name two control chords the pickers can hear - ([bf4a840](https://github.com/kevinswiber/ratto/commit/bf4a840370e7ee222ce4b5ab37ce43ec813fd269)) - [@kevinswiber](https://github.com/kevinswiber)
+- say what filter chose, from the list it prints - ([e303357](https://github.com/kevinswiber/ratto/commit/e3033577cd77dd789a410659d97589e969058b4c)) - [@kevinswiber](https://github.com/kevinswiber)
+- speak a filter query once it settles - ([e124694](https://github.com/kevinswiber/ratto/commit/e124694df1bf11ccee400126920182d0e47bc273)) - [@kevinswiber](https://github.com/kevinswiber)
+- announce the filter list after a piped candidate stream - ([cc53b41](https://github.com/kevinswiber/ratto/commit/cc53b412ce308c1142d249307b1ac7bd605c4458)) - [@kevinswiber](https://github.com/kevinswiber)
+- say the confirm answer from the string it prints - ([8e946d9](https://github.com/kevinswiber/ratto/commit/8e946d9c412ce245380d481e4f6767d896a16130)) - [@kevinswiber](https://github.com/kevinswiber)
+- announce the confirm question and its answers - ([1de98fb](https://github.com/kevinswiber/ratto/commit/1de98fbc031682b99919e2534b804ec9b924aacd)) - [@kevinswiber](https://github.com/kevinswiber)
+- say what choose chose, from the list stdout prints - ([26c28a8](https://github.com/kevinswiber/ratto/commit/26c28a86aed429d5217498455fc56c42ae106776)) - [@kevinswiber](https://github.com/kevinswiber)
+- say what a choose keystroke did - ([594396a](https://github.com/kevinswiber/ratto/commit/594396a10c19398a3e19f03484305100fd01cb98)) - [@kevinswiber](https://github.com/kevinswiber)
+- announce the choose list on entry - ([0b94d11](https://github.com/kevinswiber/ratto/commit/0b94d110a9b497af7e6b83c0460804f9850bdb5f)) - [@kevinswiber](https://github.com/kevinswiber)
+- coalesce a burst of transitions into one row - ([991cd7c](https://github.com/kevinswiber/ratto/commit/991cd7c8c6f6611f2f602d013a4a4109fb0098d1)) - [@kevinswiber](https://github.com/kevinswiber)
+- add the transcript writer and its opening block - ([b06f290](https://github.com/kevinswiber/ratto/commit/b06f290d0bccaeb71951ca07e2dce2121c135edc)) - [@kevinswiber](https://github.com/kevinswiber)
+- thread a ui mode to a sink that cannot paint - ([c552c28](https://github.com/kevinswiber/ratto/commit/c552c288016a67c34ebb2898d85894fcdc76b04a)) - [@kevinswiber](https://github.com/kevinswiber)
+- add the accessible flag and its environment variable - ([901bf83](https://github.com/kevinswiber/ratto/commit/901bf83a20b61fe9b944bb5cf1b4a733c46c3ce7)) - [@kevinswiber](https://github.com/kevinswiber)
+- resolve one ui mode and share one poll slice - ([46d31fe](https://github.com/kevinswiber/ratto/commit/46d31fe0cd594f18e90371e8ff267374cc9ea237)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- split a filter source under the binding's final shell - ([722a29a](https://github.com/kevinswiber/ratto/commit/722a29a1f5f33710f836ec4b5609723565603493)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- say which terminal speaks, and pin the two heard constants - ([0555e37](https://github.com/kevinswiber/ratto/commit/0555e37484e3ba138021005a2c330ef32fe48d45)) - [@kevinswiber](https://github.com/kevinswiber)
+- even out one paragraph's wrap - ([431f908](https://github.com/kevinswiber/ratto/commit/431f908512391d30cd2aaff467aa2864e50935fd)) - [@kevinswiber](https://github.com/kevinswiber)
+- say which of a board's questions speak, and which does not - ([ca78eb9](https://github.com/kevinswiber/ratto/commit/ca78eb9cb05d68eb6aaa50efc42416f6509e22d5)) - [@kevinswiber](https://github.com/kevinswiber)
+- teach the reference, the readme, and the review console to ask - ([b951f11](https://github.com/kevinswiber/ratto/commit/b951f11e3860c28ca9b7ee5064febf95697c7075)) - [@kevinswiber](https://github.com/kevinswiber)
+- name the split's third caller - ([5d093e4](https://github.com/kevinswiber/ratto/commit/5d093e4e1f235f1346034366dcf1461f25485e4e)) - [@kevinswiber](https://github.com/kevinswiber)
+- account for the question node's string sites - ([2d7e8f3](https://github.com/kevinswiber/ratto/commit/2d7e8f3a2c717719e494228a629cb03f6d6fbcd6)) - [@kevinswiber](https://github.com/kevinswiber)
+- describe the accessible mode and report it in the diagnostic - ([65560f3](https://github.com/kevinswiber/ratto/commit/65560f38f423cbd241875635e77f7d3ee874bcc0)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Refactoring
+- write the answer family's prefix once - ([65bcc2b](https://github.com/kevinswiber/ratto/commit/65bcc2b241da6d32996028b17da20075c043c5c3)) - [@kevinswiber](https://github.com/kevinswiber)
+- let the terminal handoff carry any child, not only the pager - ([b427aa7](https://github.com/kevinswiber/ratto/commit/b427aa79da3575eed3ce3c2b4a389a8a5dfde7fe)) - [@kevinswiber](https://github.com/kevinswiber)
+- hand the site scope around by value, not by reference - ([73c53fe](https://github.com/kevinswiber/ratto/commit/73c53fe99f509cc672acee5fe11235561bec058c)) - [@kevinswiber](https://github.com/kevinswiber)
+- share the picker suites' terminal helpers - ([a4726e6](https://github.com/kevinswiber/ratto/commit/a4726e64475f31a36ee28afc4dec44ba80a3d8b1)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.20.0](https://github.com/kevinswiber/ratto/compare/f35f93c5189bc1a3f25496d36325f072643ae473..v0.20.0) - 2026-08-11
 #### Features
 - give the cursor key back to boards that have no cursor - ([2f731cc](https://github.com/kevinswiber/ratto/commit/2f731cc05c189665c9b0466e77c6471d403e1645)) - [@kevinswiber](https://github.com/kevinswiber)
